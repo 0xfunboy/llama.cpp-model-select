@@ -68,7 +68,7 @@ evaluation/benchmark jobs. The upstream README continues below this section.
 - Replaces the Fit Advisor download path with background `aria2c` jobs for visible,
   resumable, high-throughput Hugging Face downloads.
 - Downloads GGUF files into the router models directory, defaulting to
-  `/home/cooper/models/<model-name>/` when no `--models-dir` is set.
+  `$HOME/models/<model-name>/` when no `--models-dir` is set.
 - Reads Hugging Face auth from `HF_TOKEN` or `~/.cache/huggingface/token`.
 - Resolves the target GGUF file from the Hugging Face repo and selected quant,
   including sharded GGUF sets.

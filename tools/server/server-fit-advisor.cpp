@@ -122,7 +122,9 @@ static std::string home_dir() {
     if (home && home[0] != '\0') {
         return home;
     }
-    return "/home/cooper";
+    std::error_code ec;
+    const auto cwd = std::filesystem::current_path(ec);
+    return ec ? std::string(".") : cwd.string();
 }
 
 static std::filesystem::path models_root_dir(const server_models_routes & router) {

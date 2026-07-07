@@ -297,7 +297,6 @@ static std::vector<ds4_case> load_eval_cases() {
     std::vector<std::filesystem::path> candidates = {
         std::filesystem::path(LLAMA_DS4_EVAL_CASES_PATH),
         std::filesystem::current_path() / "tools/server/ds4-eval-cases.json",
-        std::filesystem::path("/home/cooper/llama.cpp-model-select/tools/server/ds4-eval-cases.json"),
     };
 
     std::string raw;
@@ -884,8 +883,8 @@ static stream_chat_result stream_child_chat(
 
 static std::string read_bench_prompt() {
     std::vector<std::filesystem::path> candidates = {
-        std::filesystem::path("/home/cooper/ds4/speed-bench/promessi_sposi.txt"),
         std::filesystem::current_path() / "ds4/speed-bench/promessi_sposi.txt",
+        std::filesystem::current_path() / "../ds4/speed-bench/promessi_sposi.txt",
     };
     for (const auto & path : candidates) {
         std::error_code ec;
