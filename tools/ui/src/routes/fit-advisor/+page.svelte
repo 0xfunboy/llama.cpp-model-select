@@ -3,6 +3,7 @@
 	import { Download, Gauge, RefreshCw, SlidersHorizontal, Zap } from '@lucide/svelte';
 	import {
 		FitAdvisorService,
+		type FitAdvisorDownloadJob,
 		type FitAdvisorModel,
 		type FitAdvisorModelsResponse
 	} from '$lib/services/fit-advisor.service';
@@ -10,6 +11,9 @@
 
 	let response = $state<FitAdvisorModelsResponse | null>(null);
 	let selectedModel = $state<FitAdvisorModel | null>(null);
+	let downloadJobs = $state<FitAdvisorDownloadJob[]>([]);
+	let downloadStreamController: AbortController | null = null;
+	let downloadLastSeq = 0;
 	let isLoading = $state(false);
 	let isRefreshing = $state(false);
 	let isDownloading = $state(false);
@@ -31,7 +35,62 @@
 
 	onMount(() => {
 		void loadModels(true);
+		void loadDownloads();
+		startDownloadStream();
+		return () => {
+			downloadStreamController?.abort();
+		};
 	});
+
+	async function loadDownloads() {
+		try {
+			const result = await FitAdvisorService.listDownloads();
+			downloadJobs = result.data;
+			downloadLastSeq = Math.max(downloadLastSeq, ...result.data.map((job) => job.seq ?? 0), 0);
+		} catch (e) {
+			console.warn('Fit Advisor downloads list failed', e);
+		}
+	}
+
+	function upsertDownloadJob(job: FitAdvisorDownloadJob) {
+		downloadLastSeq = Math.max(downloadLastSeq, job.seq ?? 0);
+		const index = downloadJobs.findIndex((item) => item.id === job.id);
+		downloadJobs = index === -1
+			? [job, ...downloadJobs]
+			: downloadJobs.map((item, itemIndex) => itemIndex === index ? job : item);
+
+		if (selectedModel && (job.model_id === selectedModel.id || job.hf_ref === selectedModel.download?.hf_ref)) {
+			selectedModel = {
+				...selectedModel,
+				local_path: job.local_path ?? selectedModel.local_path,
+				target_dir: job.target_dir ?? selectedModel.target_dir,
+				download_progress: job,
+				download_status: job.status === 'downloaded' ? 'downloaded' : job.status === 'failed' ? 'failed' : 'downloading',
+				downloaded: job.status === 'downloaded'
+			};
+		}
+		if (job.status === 'downloaded' || job.status === 'failed') {
+			void loadModels(false);
+		}
+	}
+
+	function startDownloadStream() {
+		downloadStreamController?.abort();
+		const controller = new AbortController();
+		downloadStreamController = controller;
+		const run = async () => {
+			while (!controller.signal.aborted) {
+				try {
+					await FitAdvisorService.streamDownloads((event) => upsertDownloadJob(event.data), controller.signal, downloadLastSeq);
+				} catch (e) {
+					if (controller.signal.aborted) break;
+					console.warn('Fit Advisor download stream disconnected', e);
+					await new Promise((resolve) => setTimeout(resolve, 2000));
+				}
+			}
+		};
+		void run();
+	}
 
 	async function loadModels(refresh = false) {
 		isLoading = true;
@@ -84,9 +143,12 @@
 		message = `Starting download for ${model.download.hf_ref}...`;
 		try {
 			const result = await FitAdvisorService.download(model);
+			if (result.job) {
+				upsertDownloadJob(result.job);
+			}
 			message = result.already_present
 				? `${result.model} is already present.`
-				: `Download started for ${result.model}. Progress is visible in the model selector/SSE feed.`;
+				: `Download started for ${result.model}.`;
 			await modelsStore.fetchRouterModels();
 			await loadModels(false);
 		} catch (e) {
@@ -101,7 +163,14 @@
 		error = '';
 		message = `Writing preset for ${model.id}...`;
 		try {
-			const result = await FitAdvisorService.configure(model, loadNow);
+			const job = downloadJobFor(model);
+			const enrichedModel: FitAdvisorModel = {
+				...model,
+				local_path: model.local_path ?? job?.local_path ?? null,
+				target_dir: model.target_dir ?? job?.target_dir,
+				download_progress: job ?? model.download_progress
+			};
+			const result = await FitAdvisorService.configure(enrichedModel, loadNow);
 			message = result.loaded
 				? `Configured and loading ${result.model}.`
 				: `Configured ${result.model} in ${result.models_preset}.`;
@@ -124,6 +193,23 @@
 		return value.toFixed(digits);
 	}
 
+	function fmtBytes(value: number | undefined): string {
+		if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return 'n/a';
+		const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+		let scaled = value;
+		let index = 0;
+		while (scaled >= 1024 && index < units.length - 1) {
+			scaled /= 1024;
+			index += 1;
+		}
+		return `${scaled.toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
+	}
+
+	function fmtSpeed(value: number | undefined): string {
+		if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return 'idle';
+		return `${fmtBytes(value)}/s`;
+	}
+
 	function fitClass(level: string): string {
 		if (level === 'perfect') return 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30';
 		if (level === 'good') return 'bg-cyan-500/15 text-cyan-300 border-cyan-500/30';
@@ -133,6 +219,40 @@
 
 	function argsText(model: FitAdvisorModel): string {
 		return model.recommended_args.join(' ');
+	}
+
+	function downloadJobFor(model: FitAdvisorModel): FitAdvisorDownloadJob | null {
+		return downloadJobs.find((job) => job.model_id === model.id || job.hf_ref === model.download?.hf_ref) ?? model.download_progress ?? null;
+	}
+
+	function statusFor(model: FitAdvisorModel): string {
+		if (model.configured || model.installed) return 'configured';
+		const job = downloadJobFor(model);
+		if (job) {
+			if (job.status === 'queued' || job.status === 'resolving' || job.status === 'downloading') return job.status;
+			return job.status;
+		}
+		if (model.download_status) return model.download_status;
+		return model.downloaded ? 'downloaded' : 'available';
+	}
+
+	function statusClass(status: string): string {
+		if (status === 'configured') return 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30';
+		if (status === 'downloaded') return 'bg-cyan-500/15 text-cyan-300 border-cyan-500/30';
+		if (status === 'downloading' || status === 'resolving' || status === 'queued') return 'bg-amber-500/15 text-amber-300 border-amber-500/30';
+		if (status === 'failed') return 'bg-red-500/15 text-red-300 border-red-500/30';
+		return 'bg-muted text-muted-foreground border-border';
+	}
+
+	function canDownload(model: FitAdvisorModel): boolean {
+		const status = statusFor(model);
+		return Boolean(model.download) && !['queued', 'resolving', 'downloading', 'downloaded', 'configured'].includes(status);
+	}
+
+	function canFit(model: FitAdvisorModel): boolean {
+		const status = statusFor(model);
+		const job = downloadJobFor(model);
+		return status === 'downloaded' || status === 'configured' || Boolean(model.local_path ?? job?.local_path);
 	}
 </script>
 
@@ -284,11 +404,13 @@
 								<th class="px-3 py-2">Mem</th>
 								<th class="px-3 py-2">Tok/s</th>
 								<th class="px-3 py-2">Ctx</th>
-								<th class="px-3 py-2">Installed</th>
+								<th class="px-3 py-2">State</th>
 							</tr>
 						</thead>
 						<tbody>
 							{#each models as model (model.id + model.quant)}
+								{@const status = statusFor(model)}
+								{@const job = downloadJobFor(model)}
 								<tr
 									class="cursor-pointer border-b transition-colors hover:bg-muted/50 {selectedModel?.id === model.id ? 'bg-muted' : ''}"
 									onclick={() => (selectedModel = model)}
@@ -305,7 +427,16 @@
 									<td class="px-3 py-2">{fmtGb(model.memory_required_gb)}</td>
 									<td class="px-3 py-2">{fmtNum(model.estimated_tps)}</td>
 									<td class="px-3 py-2">{model.effective_context_length.toLocaleString()}</td>
-									<td class="px-3 py-2">{model.installed ? 'yes' : 'no'}</td>
+									<td class="px-3 py-2">
+										<div class="flex min-w-32 flex-col gap-1">
+											<span class="w-fit rounded-full border px-2 py-0.5 text-xs {statusClass(status)}">{status}</span>
+											{#if job && (status === 'queued' || status === 'resolving' || status === 'downloading')}
+												<div class="h-1.5 w-28 overflow-hidden rounded-full bg-muted">
+													<div class="h-full bg-amber-400" style={`width: ${Math.max(1, Math.min(100, job.percent || 0))}%`}></div>
+												</div>
+											{/if}
+										</div>
+									</td>
 								</tr>
 							{/each}
 						</tbody>
@@ -322,6 +453,8 @@
 					<div class="text-xs text-muted-foreground">Memory estimates are advisory, not a replacement for a real bench.</div>
 				</div>
 				{#if selectedModel}
+					{@const selectedJob = downloadJobFor(selectedModel)}
+					{@const selectedStatus = statusFor(selectedModel)}
 					<div class="space-y-4 p-4">
 						<div>
 							<div class="text-lg font-semibold">{selectedModel.name}</div>
@@ -352,7 +485,40 @@
 								<div class="text-xs text-muted-foreground">Available Pool</div>
 								<div class="mt-1 font-medium">{fmtGb(selectedModel.memory_available_gb)}</div>
 							</div>
+							<div class="rounded-md border p-2">
+								<div class="text-xs text-muted-foreground">State</div>
+								<div class="mt-1 font-medium">{selectedStatus}</div>
+							</div>
+							<div class="rounded-md border p-2">
+								<div class="text-xs text-muted-foreground">Target</div>
+								<div class="mt-1 truncate font-medium">{selectedModel.target_dir || selectedModel.download?.target_dir || selectedJob?.target_dir || 'n/a'}</div>
+							</div>
 						</div>
+
+						{#if selectedJob}
+							<div class="rounded-md border p-3">
+								<div class="mb-2 flex items-center justify-between gap-3 text-xs text-muted-foreground">
+									<span>Download Progress</span>
+									<span>{fmtSpeed(selectedJob.speed_bps)}</span>
+								</div>
+								<div class="h-2 overflow-hidden rounded-full bg-muted">
+									<div
+										class="h-full bg-primary transition-[width]"
+										style={`width: ${Math.max(selectedJob.percent > 0 ? 1 : 0, Math.min(100, selectedJob.percent || 0))}%`}
+									></div>
+								</div>
+								<div class="mt-2 flex flex-wrap justify-between gap-2 text-xs text-muted-foreground">
+									<span>{fmtBytes(selectedJob.downloaded_bytes)} / {fmtBytes(selectedJob.total_bytes)}</span>
+									<span>{fmtNum(selectedJob.percent, 1)}%</span>
+								</div>
+								{#if selectedJob.local_path}
+									<div class="mt-2 break-all text-xs text-muted-foreground">{selectedJob.local_path}</div>
+								{/if}
+								{#if selectedJob.error}
+									<div class="mt-2 rounded border border-red-500/30 bg-red-500/10 p-2 text-xs text-red-200">{selectedJob.error}</div>
+								{/if}
+							</div>
+						{/if}
 
 						<div>
 							<div class="mb-2 text-xs font-medium uppercase text-muted-foreground">Notes</div>
@@ -372,7 +538,7 @@
 							<button
 								type="button"
 								class="inline-flex h-10 items-center gap-2 rounded-md border px-3 text-sm hover:bg-muted disabled:opacity-50"
-								disabled={!selectedModel.download || selectedModel.installed || isDownloading}
+								disabled={!canDownload(selectedModel) || isDownloading}
 								onclick={() => downloadModel(selectedModel!)}
 							>
 								<Download class="h-4 w-4" />
@@ -381,11 +547,11 @@
 							<button
 								type="button"
 								class="inline-flex h-10 items-center gap-2 rounded-md bg-primary px-3 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-								disabled={isConfiguring || (!selectedModel.local_path && !selectedModel.download)}
+								disabled={isConfiguring || !canFit(selectedModel)}
 								onclick={() => configureModel(selectedModel!)}
 							>
 								<Zap class="h-4 w-4" />
-								Fit / Configure
+								FIT
 							</button>
 						</div>
 					</div>

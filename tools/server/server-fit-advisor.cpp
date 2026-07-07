@@ -9,13 +9,18 @@
 #include <chrono>
 #include <cmath>
 #include <cctype>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <optional>
+#include <regex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -24,12 +29,61 @@
 
 #if defined(__linux__)
 #include <sys/sysinfo.h>
+#include <sys/wait.h>
 #endif
 
 namespace {
 
 static constexpr const char * FIT_CATALOG_URL =
     "https://raw.githubusercontent.com/AlexsJones/llmfit/main/llmfit-core/data/hf_models.json";
+static constexpr size_t FIT_MAX_DOWNLOAD_EVENTS = 2000;
+
+struct fit_download_file {
+    std::string filename;
+    std::string url;
+    std::filesystem::path local_path;
+    uint64_t total_bytes = 0;
+};
+
+struct fit_download_job {
+    std::string id;
+    std::string model_id;
+    std::string repo;
+    std::string quant;
+    std::string hf_ref;
+    std::filesystem::path target_dir;
+    std::string requested_filename;
+    std::vector<fit_download_file> files;
+    std::vector<uint64_t> file_downloaded;
+    size_t active_file_index = 0;
+    std::string status = "queued";
+    std::string error;
+    std::string started_at;
+    std::string updated_at;
+    std::string finished_at;
+    std::string local_path;
+    uint64_t downloaded_bytes = 0;
+    uint64_t total_bytes = 0;
+    double speed_bps = 0.0;
+    double percent = 0.0;
+    int exit_code = 0;
+    int64_t last_progress_ms = 0;
+    uint64_t last_progress_bytes = 0;
+
+    mutable std::mutex mutex;
+};
+
+struct fit_download_event {
+    uint64_t seq = 0;
+    std::string event;
+    json data;
+};
+
+static std::mutex g_fit_download_mutex;
+static std::condition_variable g_fit_download_cv;
+static std::map<std::string, std::shared_ptr<fit_download_job>> g_fit_download_jobs;
+static std::deque<fit_download_event> g_fit_download_events;
+static uint64_t g_fit_download_next_seq = 0;
 
 static void fit_res_ok(std::unique_ptr<server_http_res> & res, const json & response_data) {
     res->status = 200;
@@ -51,6 +105,76 @@ static std::string trim_copy(const std::string & in) {
         end--;
     }
     return in.substr(start, end - start);
+}
+
+static std::string lower_copy(std::string text);
+static std::string read_text_file(const std::filesystem::path & path);
+
+static bool ends_with_ci(const std::string & text, const std::string & suffix) {
+    if (suffix.size() > text.size()) {
+        return false;
+    }
+    return lower_copy(text.substr(text.size() - suffix.size())) == lower_copy(suffix);
+}
+
+static std::string home_dir() {
+    const char * home = std::getenv("HOME");
+    if (home && home[0] != '\0') {
+        return home;
+    }
+    return "/home/cooper";
+}
+
+static std::filesystem::path models_root_dir(const server_models_routes & router) {
+    if (!router.params.models_dir.empty()) {
+        return router.params.models_dir;
+    }
+    return std::filesystem::path(home_dir()) / "models";
+}
+
+static std::string shell_quote(const std::string & value) {
+    std::string out = "'";
+    for (char c : value) {
+        if (c == '\'') {
+            out += "'\\''";
+        } else {
+            out.push_back(c);
+        }
+    }
+    out += "'";
+    return out;
+}
+
+static std::string url_encode_path(const std::string & value) {
+    static const char * hex = "0123456789ABCDEF";
+    std::string out;
+    for (unsigned char c : value) {
+        if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~' || c == '/') {
+            out.push_back((char) c);
+        } else {
+            out.push_back('%');
+            out.push_back(hex[c >> 4]);
+            out.push_back(hex[c & 15]);
+        }
+    }
+    return out;
+}
+
+static std::string read_hf_token() {
+    const char * env = std::getenv("HF_TOKEN");
+    if (env && env[0] != '\0') {
+        return trim_copy(env);
+    }
+    const std::filesystem::path token_path = std::filesystem::path(home_dir()) / ".cache/huggingface/token";
+    std::error_code ec;
+    if (!std::filesystem::exists(token_path, ec)) {
+        return "";
+    }
+    try {
+        return trim_copy(read_text_file(token_path));
+    } catch (...) {
+        return "";
+    }
 }
 
 static std::string lower_copy(std::string text) {
@@ -418,6 +542,625 @@ static std::string slugify(std::string input) {
     return out;
 }
 
+static int64_t steady_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static std::string normalize_token(std::string input) {
+    std::string out;
+    for (char c : input) {
+        const unsigned char uc = (unsigned char) c;
+        if (std::isalnum(uc)) {
+            out.push_back((char) std::toupper(uc));
+        }
+    }
+    return out;
+}
+
+static bool filename_matches_quant(const std::string & filename, const std::string & quant) {
+    if (quant.empty()) {
+        return true;
+    }
+    return normalize_token(filename).find(normalize_token(quant)) != std::string::npos;
+}
+
+static bool parse_shard_filename(const std::string & filename, std::string & prefix, int & index, int & total) {
+    static const std::regex shard_re(R"((.*)-([0-9]{5})-of-([0-9]{5})\.gguf$)", std::regex_constants::icase);
+    std::smatch match;
+    const std::string base = std::filesystem::path(filename).filename().string();
+    if (!std::regex_match(base, match, shard_re)) {
+        return false;
+    }
+    prefix = match[1].str();
+    index = std::stoi(match[2].str());
+    total = std::stoi(match[3].str());
+    return true;
+}
+
+static bool is_auxiliary_gguf(const std::string & filename) {
+    const std::string lower = lower_copy(filename);
+    return lower.find("mmproj") != std::string::npos ||
+           lower.find("mmvec") != std::string::npos ||
+           lower.find("projector") != std::string::npos ||
+           lower.find("tokenizer") != std::string::npos;
+}
+
+static std::string download_dir_name(const std::string & repo, const std::string & model_id) {
+    std::string base = repo.empty() ? model_id : std::filesystem::path(repo).filename().string();
+    if (base.empty()) {
+        base = "fit-model";
+    }
+    if (ends_with_ci(base, "-GGUF")) {
+        base = base.substr(0, base.size() - 5);
+    }
+    return slugify(base);
+}
+
+static std::filesystem::path default_download_dir(const server_models_routes & router, const std::string & repo, const std::string & model_id) {
+    return models_root_dir(router) / download_dir_name(repo, model_id);
+}
+
+static std::optional<std::filesystem::path> find_local_gguf(const std::filesystem::path & dir, const std::string & quant) {
+    std::error_code ec;
+    if (dir.empty() || !std::filesystem::exists(dir, ec)) {
+        return std::nullopt;
+    }
+
+    struct candidate {
+        int score = 0;
+        std::string path;
+    };
+
+    std::vector<candidate> candidates;
+    for (std::filesystem::recursive_directory_iterator it(dir, std::filesystem::directory_options::skip_permission_denied, ec), end;
+         !ec && it != end; it.increment(ec)) {
+        if (ec || !it->is_regular_file(ec)) {
+            continue;
+        }
+        const std::filesystem::path path = it->path();
+        if (!ends_with_ci(path.filename().string(), ".gguf")) {
+            continue;
+        }
+        const std::string filename = path.filename().string();
+        std::string prefix;
+        int shard_index = 0;
+        int shard_total = 0;
+        const bool sharded = parse_shard_filename(filename, prefix, shard_index, shard_total);
+        int score = 0;
+        if (filename_matches_quant(filename, quant)) score += 1000;
+        if (!is_auxiliary_gguf(filename)) score += 200;
+        if (!sharded) score += 100;
+        if (sharded && shard_index == 1) score += 80;
+        if (sharded && shard_index > 1) score -= 100;
+        candidates.push_back({score, path.string()});
+    }
+
+    if (candidates.empty()) {
+        return std::nullopt;
+    }
+    std::sort(candidates.begin(), candidates.end(), [](const candidate & a, const candidate & b) {
+        if (a.score != b.score) return a.score > b.score;
+        return a.path < b.path;
+    });
+    return std::filesystem::path(candidates.front().path);
+}
+
+static uint64_t parse_u64_header_value(const std::string & line) {
+    auto pos = line.find(':');
+    if (pos == std::string::npos) {
+        return 0;
+    }
+    const std::string raw = trim_copy(line.substr(pos + 1));
+    try {
+        return (uint64_t) std::stoull(raw);
+    } catch (...) {
+        return 0;
+    }
+}
+
+static uint64_t remote_file_size(const std::string & url, const std::string & token) {
+    std::string command = "curl -fsSIL -L --max-time 30 --connect-timeout 15";
+    if (!token.empty()) {
+        command += " -H " + shell_quote("Authorization: Bearer " + token);
+    }
+    command += " " + shell_quote(url) + " 2>/dev/null";
+
+    uint64_t content_length = 0;
+    for (const auto & line : shell_lines(command)) {
+        const std::string lower = lower_copy(line);
+        if (lower.rfind("x-linked-size:", 0) == 0) {
+            const uint64_t linked = parse_u64_header_value(line);
+            if (linked > 0) {
+                return linked;
+            }
+        }
+        if (lower.rfind("content-length:", 0) == 0) {
+            const uint64_t size = parse_u64_header_value(line);
+            if (size > 0) {
+                content_length = size;
+            }
+        }
+    }
+    return content_length;
+}
+
+struct fit_hf_remote_file {
+    std::string filename;
+    uint64_t size = 0;
+};
+
+static uint64_t json_file_size(const json & file) {
+    if (file.contains("size") && file["size"].is_number_unsigned()) {
+        return file["size"].get<uint64_t>();
+    }
+    if (file.contains("size") && file["size"].is_number_integer()) {
+        return (uint64_t) std::max<int64_t>(0, file["size"].get<int64_t>());
+    }
+    if (file.contains("lfs") && file["lfs"].is_object()) {
+        const json & lfs = file["lfs"];
+        if (lfs.contains("size") && lfs["size"].is_number()) {
+            return (uint64_t) std::max<double>(0.0, lfs["size"].get<double>());
+        }
+    }
+    return 0;
+}
+
+static std::vector<fit_hf_remote_file> list_hf_gguf_files(const std::string & repo, const std::string & token) {
+    common_remote_params params;
+    params.timeout = 30;
+    params.max_size = 32 * 1024 * 1024;
+    if (!token.empty()) {
+        params.headers.push_back({"Authorization", "Bearer " + token});
+    }
+
+    const std::string api_url = "https://huggingface.co/api/models/" + url_encode_path(repo);
+    const auto [code, body] = common_remote_get_content(api_url, params);
+    if (code < 200 || code >= 300 || body.empty()) {
+        throw std::runtime_error(string_format("Hugging Face model metadata request failed for %s (HTTP %ld)", repo.c_str(), code));
+    }
+
+    const std::string raw(body.begin(), body.end());
+    const json meta = json::parse(raw);
+    std::vector<fit_hf_remote_file> files;
+    if (meta.contains("siblings") && meta["siblings"].is_array()) {
+        for (const auto & item : meta["siblings"]) {
+            const std::string filename = json_value(item, "rfilename", std::string());
+            if (!filename.empty() && ends_with_ci(filename, ".gguf")) {
+                files.push_back({filename, json_file_size(item)});
+            }
+        }
+    }
+    std::sort(files.begin(), files.end(), [](const fit_hf_remote_file & a, const fit_hf_remote_file & b) {
+        return a.filename < b.filename;
+    });
+    return files;
+}
+
+static int hf_file_candidate_score(const fit_hf_remote_file & file, const std::string & quant, const std::string & requested_filename) {
+    if (!requested_filename.empty()) {
+        if (file.filename == requested_filename || std::filesystem::path(file.filename).filename().string() == requested_filename) {
+            return 100000;
+        }
+        return -100000;
+    }
+
+    std::string prefix;
+    int shard_index = 0;
+    int shard_total = 0;
+    const bool sharded = parse_shard_filename(file.filename, prefix, shard_index, shard_total);
+    int score = 0;
+    if (filename_matches_quant(file.filename, quant)) score += 2000;
+    if (!is_auxiliary_gguf(file.filename)) score += 400;
+    if (!sharded) score += 200;
+    if (sharded && shard_index == 1) score += 150;
+    if (sharded && shard_index > 1) score -= 200;
+    score += std::min<int>(50, (int) (file.size / (1024ull * 1024ull * 1024ull)));
+    return score;
+}
+
+static std::vector<fit_download_file> resolve_hf_download_files(
+        const std::string & repo,
+        const std::string & quant,
+        const std::string & requested_filename,
+        const std::filesystem::path & target_dir,
+        const std::string & token) {
+    const auto remote_files = list_hf_gguf_files(repo, token);
+    if (remote_files.empty()) {
+        throw std::runtime_error("no .gguf files found in Hugging Face repo " + repo);
+    }
+
+    auto best = remote_files.end();
+    int best_score = std::numeric_limits<int>::min();
+    for (auto it = remote_files.begin(); it != remote_files.end(); ++it) {
+        const int score = hf_file_candidate_score(*it, quant, requested_filename);
+        if (score > best_score) {
+            best = it;
+            best_score = score;
+        }
+    }
+    if (best == remote_files.end() || best_score < -1000) {
+        throw std::runtime_error("requested GGUF file was not found in Hugging Face repo " + repo);
+    }
+
+    std::vector<fit_hf_remote_file> selected;
+    std::string prefix;
+    int shard_index = 0;
+    int shard_total = 0;
+    if (parse_shard_filename(best->filename, prefix, shard_index, shard_total) && shard_total > 1) {
+        for (const auto & file : remote_files) {
+            std::string file_prefix;
+            int file_index = 0;
+            int file_total = 0;
+            if (parse_shard_filename(file.filename, file_prefix, file_index, file_total) &&
+                file_prefix == prefix && file_total == shard_total) {
+                selected.push_back(file);
+            }
+        }
+        std::sort(selected.begin(), selected.end(), [](const fit_hf_remote_file & a, const fit_hf_remote_file & b) {
+            std::string pa, pb;
+            int ia = 0, ib = 0, ta = 0, tb = 0;
+            parse_shard_filename(a.filename, pa, ia, ta);
+            parse_shard_filename(b.filename, pb, ib, tb);
+            return ia < ib;
+        });
+        if ((int) selected.size() != shard_total) {
+            throw std::runtime_error("could not resolve all GGUF shard files for " + best->filename);
+        }
+    } else {
+        selected.push_back(*best);
+    }
+
+    std::vector<fit_download_file> out;
+    for (const auto & file : selected) {
+        fit_download_file item;
+        item.filename = file.filename;
+        item.url = "https://huggingface.co/" + repo + "/resolve/main/" + url_encode_path(file.filename);
+        item.local_path = target_dir / file.filename;
+        item.total_bytes = file.size > 0 ? file.size : remote_file_size(item.url, token);
+        out.push_back(std::move(item));
+    }
+    return out;
+}
+
+static double aria2_unit_multiplier(std::string unit) {
+    unit = lower_copy(unit);
+    if (unit.empty() || unit == "b") return 1.0;
+    if (unit == "k" || unit == "kb") return 1000.0;
+    if (unit == "m" || unit == "mb") return 1000.0 * 1000.0;
+    if (unit == "g" || unit == "gb") return 1000.0 * 1000.0 * 1000.0;
+    if (unit == "t" || unit == "tb") return 1000.0 * 1000.0 * 1000.0 * 1000.0;
+    if (unit == "kib") return 1024.0;
+    if (unit == "mib") return 1024.0 * 1024.0;
+    if (unit == "gib") return 1024.0 * 1024.0 * 1024.0;
+    if (unit == "tib") return 1024.0 * 1024.0 * 1024.0 * 1024.0;
+    return 1.0;
+}
+
+static uint64_t aria2_to_bytes(const std::string & value, const std::string & unit) {
+    try {
+        return (uint64_t) std::llround(std::stod(value) * aria2_unit_multiplier(unit));
+    } catch (...) {
+        return 0;
+    }
+}
+
+static bool parse_aria2_progress(const std::string & line, uint64_t & done, uint64_t & total, double & speed) {
+    static const std::regex amount_re(R"(([0-9]+(?:\.[0-9]+)?)\s*([KMGT]?i?B?)\s*/\s*([0-9]+(?:\.[0-9]+)?)\s*([KMGT]?i?B?)\s*\(\s*([0-9]+)%\s*\))", std::regex_constants::icase);
+    static const std::regex speed_re(R"(DL:\s*([0-9]+(?:\.[0-9]+)?)\s*([KMGT]?i?B?))", std::regex_constants::icase);
+    std::smatch amount_match;
+    if (!std::regex_search(line, amount_match, amount_re)) {
+        return false;
+    }
+    done = aria2_to_bytes(amount_match[1].str(), amount_match[2].str());
+    total = aria2_to_bytes(amount_match[3].str(), amount_match[4].str());
+
+    std::smatch speed_match;
+    if (std::regex_search(line, speed_match, speed_re)) {
+        speed = (double) aria2_to_bytes(speed_match[1].str(), speed_match[2].str());
+    } else {
+        speed = 0.0;
+    }
+    return true;
+}
+
+static void recompute_download_progress_locked(fit_download_job & job) {
+    uint64_t total = 0;
+    for (const auto & file : job.files) {
+        total += file.total_bytes;
+    }
+    if (total > 0) {
+        job.total_bytes = total;
+    }
+
+    uint64_t downloaded = 0;
+    for (uint64_t value : job.file_downloaded) {
+        downloaded += value;
+    }
+    job.downloaded_bytes = downloaded;
+    job.percent = job.total_bytes > 0 ? std::min(100.0, (double) job.downloaded_bytes * 100.0 / (double) job.total_bytes) : 0.0;
+}
+
+static json download_job_snapshot_locked(const std::shared_ptr<fit_download_job> & job) {
+    json files = json::array();
+    for (size_t i = 0; i < job->files.size(); ++i) {
+        const auto & file = job->files[i];
+        const uint64_t downloaded = i < job->file_downloaded.size() ? job->file_downloaded[i] : 0;
+        files.push_back({
+            {"filename", file.filename},
+            {"url", file.url},
+            {"local_path", file.local_path.string()},
+            {"downloaded_bytes", downloaded},
+            {"total_bytes", file.total_bytes},
+        });
+    }
+
+    return {
+        {"id", job->id},
+        {"model_id", job->model_id},
+        {"repo", job->repo},
+        {"quant", job->quant},
+        {"hf_ref", job->hf_ref},
+        {"status", job->status},
+        {"error", job->error.empty() ? nullptr : json(job->error)},
+        {"target_dir", job->target_dir.string()},
+        {"requested_filename", job->requested_filename.empty() ? nullptr : json(job->requested_filename)},
+        {"local_path", job->local_path.empty() ? nullptr : json(job->local_path)},
+        {"downloaded_bytes", job->downloaded_bytes},
+        {"total_bytes", job->total_bytes},
+        {"speed_bps", job->speed_bps},
+        {"percent", job->percent},
+        {"exit_code", job->exit_code},
+        {"started_at", job->started_at.empty() ? nullptr : json(job->started_at)},
+        {"updated_at", job->updated_at.empty() ? nullptr : json(job->updated_at)},
+        {"finished_at", job->finished_at.empty() ? nullptr : json(job->finished_at)},
+        {"active_file_index", job->active_file_index},
+        {"files", files},
+    };
+}
+
+static json download_job_snapshot(const std::shared_ptr<fit_download_job> & job) {
+    std::lock_guard<std::mutex> lock(job->mutex);
+    return download_job_snapshot_locked(job);
+}
+
+static void publish_download_snapshot(const std::shared_ptr<fit_download_job> & job) {
+    json data = download_job_snapshot(job);
+    {
+        std::lock_guard<std::mutex> lock(g_fit_download_mutex);
+        fit_download_event event;
+        event.seq = ++g_fit_download_next_seq;
+        event.event = "download";
+        data["seq"] = event.seq;
+        event.data = data;
+        g_fit_download_events.push_back(std::move(event));
+        while (g_fit_download_events.size() > FIT_MAX_DOWNLOAD_EVENTS) {
+            g_fit_download_events.pop_front();
+        }
+    }
+    g_fit_download_cv.notify_all();
+}
+
+static void update_download_job(const std::shared_ptr<fit_download_job> & job, const std::function<void(fit_download_job &)> & fn) {
+    {
+        std::lock_guard<std::mutex> lock(job->mutex);
+        fn(*job);
+        job->updated_at = isoish_timestamp();
+        recompute_download_progress_locked(*job);
+    }
+    publish_download_snapshot(job);
+}
+
+static bool download_status_active(const std::string & status) {
+    return status == "queued" || status == "resolving" || status == "downloading";
+}
+
+static std::shared_ptr<fit_download_job> find_download_job(const std::string & model_id, const std::string & hf_ref) {
+    std::shared_ptr<fit_download_job> fallback;
+    std::string fallback_updated_at;
+    std::lock_guard<std::mutex> lock(g_fit_download_mutex);
+    for (const auto & [_, job] : g_fit_download_jobs) {
+        std::lock_guard<std::mutex> job_lock(job->mutex);
+        const bool matches = (!model_id.empty() && job->model_id == model_id) || (!hf_ref.empty() && job->hf_ref == hf_ref);
+        if (!matches) {
+            continue;
+        }
+        if (download_status_active(job->status)) {
+            return job;
+        }
+        if (!fallback || job->updated_at > fallback_updated_at) {
+            fallback = job;
+            fallback_updated_at = job->updated_at;
+        }
+    }
+    return fallback;
+}
+
+static json download_snapshot_for_model(const std::string & model_id, const std::string & hf_ref) {
+    auto job = find_download_job(model_id, hf_ref);
+    return job ? download_job_snapshot(job) : json(nullptr);
+}
+
+static json all_download_snapshots() {
+    std::vector<std::shared_ptr<fit_download_job>> jobs;
+    {
+        std::lock_guard<std::mutex> lock(g_fit_download_mutex);
+        for (const auto & [_, job] : g_fit_download_jobs) {
+            jobs.push_back(job);
+        }
+    }
+    std::sort(jobs.begin(), jobs.end(), [](const auto & a, const auto & b) {
+        std::lock_guard<std::mutex> la(a->mutex);
+        std::lock_guard<std::mutex> lb(b->mutex);
+        return a->updated_at > b->updated_at;
+    });
+
+    json out = json::array();
+    for (const auto & job : jobs) {
+        out.push_back(download_job_snapshot(job));
+    }
+    return out;
+}
+
+static int run_aria2c_for_file(const std::shared_ptr<fit_download_job> & job, size_t index, const std::string & token) {
+    fit_download_file file;
+    {
+        std::lock_guard<std::mutex> lock(job->mutex);
+        file = job->files.at(index);
+        job->active_file_index = index;
+        job->updated_at = isoish_timestamp();
+    }
+    publish_download_snapshot(job);
+
+    std::filesystem::create_directories(file.local_path.parent_path());
+    std::string command =
+        "aria2c"
+        " --continue=true"
+        " --max-connection-per-server=8"
+        " --split=8"
+        " --min-split-size=64M"
+        " --summary-interval=1"
+        " --console-log-level=notice"
+        " --auto-file-renaming=false"
+        " --allow-overwrite=true"
+        " --file-allocation=none";
+    if (!token.empty()) {
+        command += " --header=" + shell_quote("Authorization: Bearer " + token);
+    }
+    command += " --dir=" + shell_quote(file.local_path.parent_path().string());
+    command += " -o " + shell_quote(file.local_path.filename().string());
+    command += " " + shell_quote(file.url);
+    command += " 2>&1";
+
+#if defined(_WIN32)
+    FILE * pipe = _popen(command.c_str(), "r");
+#else
+    FILE * pipe = popen(command.c_str(), "r");
+#endif
+    if (!pipe) {
+        return 127;
+    }
+
+    char buffer[4096];
+    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+        std::string chunk(buffer);
+        std::replace(chunk.begin(), chunk.end(), '\r', '\n');
+        std::istringstream in(chunk);
+        std::string line;
+        while (std::getline(in, line)) {
+            line = trim_copy(line);
+            if (line.empty()) {
+                continue;
+            }
+            uint64_t done = 0;
+            uint64_t total = 0;
+            double speed = 0.0;
+            if (parse_aria2_progress(line, done, total, speed)) {
+                update_download_job(job, [&](fit_download_job & j) {
+                    if (index < j.file_downloaded.size()) {
+                        j.file_downloaded[index] = done;
+                    }
+                    if (total > 0 && index < j.files.size()) {
+                        j.files[index].total_bytes = total;
+                    }
+                    j.speed_bps = speed;
+                    j.last_progress_ms = steady_ms();
+                    j.last_progress_bytes = j.downloaded_bytes;
+                });
+            }
+        }
+    }
+
+#if defined(_WIN32)
+    const int raw_status = _pclose(pipe);
+    return raw_status;
+#else
+    const int raw_status = pclose(pipe);
+    if (WIFEXITED(raw_status)) {
+        return WEXITSTATUS(raw_status);
+    }
+    if (WIFSIGNALED(raw_status)) {
+        return 128 + WTERMSIG(raw_status);
+    }
+    return raw_status;
+#endif
+}
+
+static void run_download_job(const std::shared_ptr<fit_download_job> & job) {
+    const std::string token = read_hf_token();
+    try {
+        if (shell_lines("command -v aria2c 2>/dev/null").empty()) {
+            throw std::runtime_error("aria2c is not installed or is not in PATH");
+        }
+
+        update_download_job(job, [](fit_download_job & j) {
+            j.status = "resolving";
+            j.started_at = isoish_timestamp();
+            j.error.clear();
+        });
+
+        auto files = resolve_hf_download_files(job->repo, job->quant, job->requested_filename, job->target_dir, token);
+        uint64_t total = 0;
+        for (const auto & file : files) {
+            total += file.total_bytes;
+        }
+        update_download_job(job, [&](fit_download_job & j) {
+            j.files = files;
+            j.file_downloaded.assign(files.size(), 0);
+            j.total_bytes = total;
+            j.status = "downloading";
+        });
+
+        for (size_t i = 0; i < files.size(); ++i) {
+            const int rc = run_aria2c_for_file(job, i, token);
+            if (rc != 0) {
+                update_download_job(job, [&](fit_download_job & j) {
+                    j.exit_code = rc;
+                });
+                throw std::runtime_error(string_format("aria2c failed for %s with exit code %d", files[i].filename.c_str(), rc));
+            }
+            update_download_job(job, [&](fit_download_job & j) {
+                if (i < j.file_downloaded.size()) {
+                    uint64_t size = i < j.files.size() ? j.files[i].total_bytes : 0;
+                    if (size == 0) {
+                        std::error_code ec;
+                        size = std::filesystem::file_size(files[i].local_path, ec);
+                        if (ec) {
+                            size = j.file_downloaded[i];
+                        }
+                    }
+                    j.file_downloaded[i] = size;
+                }
+            });
+        }
+
+        update_download_job(job, [&](fit_download_job & j) {
+            j.status = "downloaded";
+            j.finished_at = isoish_timestamp();
+            j.speed_bps = 0.0;
+            j.local_path = j.files.empty() ? "" : j.files.front().local_path.string();
+            if (j.local_path.empty()) {
+                auto local = find_local_gguf(j.target_dir, j.quant);
+                if (local) {
+                    j.local_path = local->string();
+                }
+            }
+            recompute_download_progress_locked(j);
+            if (j.total_bytes > 0) {
+                j.downloaded_bytes = j.total_bytes;
+                j.percent = 100.0;
+            }
+        });
+    } catch (const std::exception & e) {
+        update_download_job(job, [&](fit_download_job & j) {
+            j.status = "failed";
+            j.error = e.what();
+            j.finished_at = isoish_timestamp();
+            j.speed_bps = 0.0;
+        });
+    }
+}
+
 static std::string tensor_split_from_system(const json & system) {
     if (!system.contains("gpus") || !system["gpus"].is_array() || system["gpus"].empty()) {
         return "";
@@ -597,7 +1340,12 @@ static json preset_from_plan(const json & system, const std::string & run_mode, 
     return preset;
 }
 
-static json analyze_catalog_model(const json & model, const json & system, const json & installed, int target_ctx) {
+static json analyze_catalog_model(
+        const json & model,
+        const json & system,
+        const json & installed,
+        const server_models_routes & router,
+        int target_ctx) {
     const std::string id = json_value(model, "name", std::string());
     const std::string quant = json_value(model, "quantization", std::string("Q4_K_M"));
     const double params_b = params_b_from_json(model);
@@ -675,7 +1423,35 @@ static json analyze_catalog_model(const json & model, const json & system, const
     const std::string repo = json_value(source, "repo", std::string());
     const std::string download_ref = repo.empty() ? "" : repo + ":" + quant;
     const json installed_match = find_installed(installed, model, repo, quant);
-    const std::string local_path = json_value(installed_match, "path", std::string());
+    const bool configured = installed_match.is_object() && !installed_match.empty();
+    const std::filesystem::path target_dir = default_download_dir(router, repo, id);
+    const json download_job = download_snapshot_for_model(id, download_ref);
+    const std::string job_status = download_job.is_object() ? json_value(download_job, "status", std::string()) : std::string();
+    const bool active_download = download_status_active(job_status);
+
+    std::string local_path = json_value(installed_match, "path", std::string());
+    if (local_path.empty() && download_job.is_object() && job_status == "downloaded") {
+        local_path = json_value(download_job, "local_path", std::string());
+    }
+    if (local_path.empty() && !active_download) {
+        auto found = find_local_gguf(target_dir, quant);
+        if (found) {
+            local_path = found->string();
+        }
+    }
+
+    const bool downloaded = configured || local_file_exists(local_path);
+    std::string download_status = "available";
+    if (configured) {
+        download_status = "configured";
+    } else if (active_download) {
+        download_status = "downloading";
+    } else if (job_status == "failed") {
+        download_status = "failed";
+    } else if (downloaded) {
+        download_status = "downloaded";
+    }
+
     const std::string model_ref = !local_path.empty() ? local_path : download_ref;
     const int threads = json_value(system, "cpu_cores", 8);
     const json preset = preset_from_plan(system, run_mode, model_ref, ctx, threads);
@@ -704,9 +1480,14 @@ static json analyze_catalog_model(const json & model, const json & system, const
         {"utilization_pct", available_gb > 0.0 ? required_gb / available_gb * 100.0 : 0.0},
         {"gpu_mode", run_mode},
         {"runtime", "llama.cpp"},
-        {"installed", installed_match.is_object() && !installed_match.empty()},
+        {"installed", configured},
+        {"configured", configured},
+        {"downloaded", downloaded},
+        {"download_status", download_status},
         {"installed_model_id", json_value(installed_match, "id", std::string())},
         {"local_path", local_path.empty() ? nullptr : json(local_path)},
+        {"target_dir", target_dir.string()},
+        {"download_progress", download_job},
         {"notes", notes},
         {"download", repo.empty() ? json(nullptr) : json({
             {"repo", repo},
@@ -714,13 +1495,19 @@ static json analyze_catalog_model(const json & model, const json & system, const
             {"hf_ref", download_ref},
             {"provider", json_value(source, "provider", std::string())},
             {"url", std::string("https://huggingface.co/") + repo},
+            {"target_dir", target_dir.string()},
         })},
         {"recommended_args", make_recommendation_args(system, run_mode, model_ref, ctx, threads)},
         {"preset", preset},
     };
 }
 
-static json sorted_filtered_models(const json & catalog, const json & system, const json & installed, const server_http_req & req) {
+static json sorted_filtered_models(
+        const json & catalog,
+        const json & system,
+        const json & installed,
+        const server_models_routes & router,
+        const server_http_req & req) {
     const bool include_too_tight = req.get_param("include_too_tight", "") == "true";
     const std::string use_case_filter = lower_copy(req.get_param("use_case", "all"));
     const std::string fit_filter = lower_copy(req.get_param("min_fit", "marginal"));
@@ -740,7 +1527,7 @@ static json sorted_filtered_models(const json & catalog, const json & system, co
         if (!model.is_object()) continue;
         const std::string format = lower_copy(json_value(model, "format", std::string("gguf")));
         if (format != "gguf") continue;
-        const json row = analyze_catalog_model(model, system, installed, target_ctx);
+        const json row = analyze_catalog_model(model, system, installed, router, target_ctx);
         const std::string row_use_case = json_value(row, "use_case", std::string());
         const std::string row_fit = json_value(row, "fit_level", std::string());
         const std::string row_quant = json_value(row, "quant", std::string());
@@ -863,7 +1650,7 @@ struct server_fit_advisor_routes::impl {
         }
         const json system = detect_system_json();
         const json installed = router_installed_index(router);
-        const json models = sorted_filtered_models(catalog, system, installed, req);
+        const json models = sorted_filtered_models(catalog, system, installed, router, req);
         fit_res_ok(res, {
             {"object", "list"},
             {"system", system},
@@ -889,33 +1676,152 @@ struct server_fit_advisor_routes::impl {
     server_http_res_ptr handle_download(const server_http_req & req) {
         auto res = std::make_unique<server_http_res>();
         json body = req.body.empty() ? json::object() : json::parse(req.body);
+        const std::string model_id = json_value(body, "model_id", json_value(body, "id", std::string()));
         std::string hf_ref = json_value(body, "hf_ref", std::string());
+        std::string repo = json_value(body, "repo", std::string());
+        std::string quant = json_value(body, "quant", std::string());
         if (hf_ref.empty()) {
-            const std::string repo = json_value(body, "repo", std::string());
-            const std::string quant = json_value(body, "quant", std::string());
             if (!repo.empty()) {
                 hf_ref = quant.empty() ? repo : repo + ":" + quant;
+            }
+        }
+        if (!hf_ref.empty() && repo.empty()) {
+            auto split = common_download_split_repo_tag(hf_ref);
+            repo = split.first;
+            if (quant.empty()) {
+                quant = split.second;
             }
         }
         if (hf_ref.empty()) {
             fit_res_err(res, format_error_response("download request must include hf_ref or repo", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
-        if (router.models.has_model(hf_ref)) {
-            fit_res_ok(res, {{"success", true}, {"model", hf_ref}, {"already_present", true}});
+        if (repo.empty()) {
+            fit_res_err(res, format_error_response("download request could not resolve a Hugging Face repo", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
+
+        std::filesystem::path target_dir = json_value(body, "target_dir", std::string());
+        if (target_dir.empty()) {
+            target_dir = default_download_dir(router, repo, model_id.empty() ? hf_ref : model_id);
+        }
+        const std::string requested_filename = json_value(body, "filename", std::string());
+
         try {
-            server_models::load_options load_opts;
-            load_opts.mode = SERVER_CHILD_MODE_DOWNLOAD;
-            load_opts.custom_meta = server_model_meta{};
-            load_opts.custom_meta->source = SERVER_MODEL_SOURCE_CACHE;
-            load_opts.custom_meta->name = hf_ref;
-            router.models.load(hf_ref, load_opts);
-            fit_res_ok(res, {{"success", true}, {"model", hf_ref}, {"status", "downloading"}});
+            auto local = find_local_gguf(target_dir, quant);
+            if (local && local_file_exists(local->string())) {
+                fit_res_ok(res, {
+                    {"success", true},
+                    {"model", hf_ref},
+                    {"status", "downloaded"},
+                    {"already_present", true},
+                    {"local_path", local->string()},
+                    {"target_dir", target_dir.string()},
+                });
+                return res;
+            }
+
+            if (auto existing = find_download_job(model_id, hf_ref)) {
+                const json snapshot = download_job_snapshot(existing);
+                const std::string status = json_value(snapshot, "status", std::string());
+                if (download_status_active(status) || status == "downloaded") {
+                    fit_res_ok(res, {
+                        {"success", true},
+                        {"model", hf_ref},
+                        {"status", status},
+                        {"already_present", status == "downloaded"},
+                        {"job", snapshot},
+                    });
+                    return res;
+                }
+            }
+
+            auto job = std::make_shared<fit_download_job>();
+            job->id = slugify((model_id.empty() ? hf_ref : model_id) + "-" + quant) + "-" + std::to_string(steady_ms());
+            job->model_id = model_id;
+            job->repo = repo;
+            job->quant = quant;
+            job->hf_ref = hf_ref;
+            job->target_dir = target_dir;
+            job->requested_filename = requested_filename;
+            job->status = "queued";
+            job->started_at = isoish_timestamp();
+            job->updated_at = job->started_at;
+
+            {
+                std::lock_guard<std::mutex> lock(g_fit_download_mutex);
+                g_fit_download_jobs[job->id] = job;
+            }
+            publish_download_snapshot(job);
+            std::thread([job]() {
+                run_download_job(job);
+            }).detach();
+
+            fit_res_ok(res, {
+                {"success", true},
+                {"model", hf_ref},
+                {"status", "queued"},
+                {"job", download_job_snapshot(job)},
+            });
         } catch (const std::exception & e) {
             fit_res_err(res, format_error_response(e.what(), ERROR_TYPE_SERVER));
         }
+        return res;
+    }
+
+    server_http_res_ptr handle_downloads(const server_http_req &) {
+        auto res = std::make_unique<server_http_res>();
+        fit_res_ok(res, {
+            {"object", "list"},
+            {"data", all_download_snapshots()},
+        });
+        return res;
+    }
+
+    server_http_res_ptr handle_download_events(const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        uint64_t since = 0;
+        try {
+            since = req.get_param("since").empty() ? 0 : (uint64_t) std::stoull(req.get_param("since"));
+        } catch (...) {
+            since = 0;
+        }
+
+        res->status = 200;
+        res->content_type = "text/event-stream";
+        res->headers["Cache-Control"] = "no-cache";
+        res->headers["X-Accel-Buffering"] = "no";
+        res->next = [since, &req](std::string & output) mutable -> bool {
+            std::unique_lock<std::mutex> lock(g_fit_download_mutex);
+            g_fit_download_cv.wait_for(lock, std::chrono::seconds(2), [&]() {
+                if (req.should_stop()) {
+                    return true;
+                }
+                for (const auto & event : g_fit_download_events) {
+                    if (event.seq > since) {
+                        return true;
+                    }
+                }
+                return false;
+            });
+
+            if (req.should_stop()) {
+                return false;
+            }
+
+            for (const auto & event : g_fit_download_events) {
+                if (event.seq <= since) {
+                    continue;
+                }
+                since = event.seq;
+                output = "event: " + event.event + "\n";
+                output += "data: " + safe_json_to_str(event.data) + "\n\n";
+                return true;
+            }
+
+            output = ": keepalive\n\n";
+            return true;
+        };
         return res;
     }
 
@@ -945,6 +1851,35 @@ struct server_fit_advisor_routes::impl {
             const std::string quant = json_value(body, "quant", std::string());
             if (!repo.empty()) {
                 hf_ref = quant.empty() ? repo : repo + ":" + quant;
+            }
+        }
+        if (local_path.empty()) {
+            std::string repo = json_value(body, "repo", std::string());
+            std::string quant = json_value(body, "quant", std::string());
+            if (repo.empty() && !hf_ref.empty()) {
+                auto split = common_download_split_repo_tag(hf_ref);
+                repo = split.first;
+                if (quant.empty()) {
+                    quant = split.second;
+                }
+            }
+
+            const std::filesystem::path target_dir = json_value(
+                body,
+                "target_dir",
+                repo.empty() ? std::string() : default_download_dir(router, repo, model_id.empty() ? hf_ref : model_id).string());
+            if (!target_dir.empty()) {
+                auto found = find_local_gguf(target_dir, quant);
+                if (found) {
+                    local_path = found->string();
+                }
+            }
+
+            if (local_path.empty()) {
+                const json snapshot = download_snapshot_for_model(model_id, hf_ref);
+                if (snapshot.is_object() && json_value(snapshot, "status", std::string()) == "downloaded") {
+                    local_path = json_value(snapshot, "local_path", std::string());
+                }
             }
         }
         if (model_id.empty() && local_path.empty() && hf_ref.empty()) {
@@ -1046,6 +1981,12 @@ void server_fit_advisor_routes::init_routes() {
     };
     post_download = [p = pimpl](const server_http_req & req) {
         return p->handle_download(req);
+    };
+    get_downloads = [p = pimpl](const server_http_req & req) {
+        return p->handle_downloads(req);
+    };
+    get_download_events = [p = pimpl](const server_http_req & req) {
+        return p->handle_download_events(req);
     };
     post_configure = [p = pimpl](const server_http_req & req) {
         return p->handle_configure(req);

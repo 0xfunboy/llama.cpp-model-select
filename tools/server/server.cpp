@@ -232,6 +232,8 @@ int llama_server(int argc, char ** argv) {
         ctx_http.get ("/api/fit-advisor/models",          ex_wrapper(fit_advisor_routes->get_models));
         ctx_http.post("/api/fit-advisor/catalog/refresh", ex_wrapper(fit_advisor_routes->post_catalog_refresh));
         ctx_http.post("/api/fit-advisor/download",        ex_wrapper(fit_advisor_routes->post_download));
+        ctx_http.get ("/api/fit-advisor/downloads",       ex_wrapper(fit_advisor_routes->get_downloads));
+        ctx_http.get ("/api/fit-advisor/downloads/sse",   ex_wrapper(fit_advisor_routes->get_download_events));
         ctx_http.post("/api/fit-advisor/configure",       ex_wrapper(fit_advisor_routes->post_configure));
     }
 

@@ -17,6 +17,8 @@ struct server_fit_advisor_routes {
     server_http_context::handler_t get_models;
     server_http_context::handler_t post_catalog_refresh;
     server_http_context::handler_t post_download;
+    server_http_context::handler_t get_downloads;
+    server_http_context::handler_t get_download_events;
     server_http_context::handler_t post_configure;
 
 private:

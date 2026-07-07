@@ -1,4 +1,6 @@
+import { base } from '$app/paths';
 import { apiFetch, apiPost } from '$lib/utils';
+import { getAuthHeaders } from '$lib/utils/api-headers';
 
 export interface FitAdvisorGpu {
 	name: string;
@@ -38,6 +40,49 @@ export interface FitAdvisorDownload {
 	hf_ref: string;
 	provider?: string;
 	url: string;
+	target_dir?: string;
+}
+
+export interface FitAdvisorDownloadFile {
+	filename: string;
+	url: string;
+	local_path: string;
+	downloaded_bytes: number;
+	total_bytes: number;
+}
+
+export interface FitAdvisorDownloadJob {
+	id: string;
+	model_id: string;
+	repo: string;
+	quant: string;
+	hf_ref: string;
+	status: 'queued' | 'resolving' | 'downloading' | 'downloaded' | 'failed';
+	error?: string | null;
+	target_dir: string;
+	requested_filename?: string | null;
+	local_path?: string | null;
+	downloaded_bytes: number;
+	total_bytes: number;
+	speed_bps: number;
+	percent: number;
+	exit_code?: number;
+	started_at?: string | null;
+	updated_at?: string | null;
+	finished_at?: string | null;
+	active_file_index?: number;
+	files?: FitAdvisorDownloadFile[];
+	seq?: number;
+}
+
+export interface FitAdvisorDownloadsResponse {
+	object: 'list';
+	data: FitAdvisorDownloadJob[];
+}
+
+export interface FitAdvisorDownloadEvent {
+	event: string;
+	data: FitAdvisorDownloadJob;
 }
 
 export interface FitAdvisorModel {
@@ -70,8 +115,13 @@ export interface FitAdvisorModel {
 	gpu_mode: string;
 	runtime: string;
 	installed: boolean;
+	configured?: boolean;
+	downloaded?: boolean;
+	download_status?: 'available' | 'downloading' | 'downloaded' | 'configured' | 'failed';
 	installed_model_id?: string;
 	local_path?: string | null;
+	target_dir?: string;
+	download_progress?: FitAdvisorDownloadJob | null;
 	notes: string[];
 	download?: FitAdvisorDownload | null;
 	recommended_args: string[];
@@ -106,6 +156,7 @@ export interface FitAdvisorConfigureRequest {
 	hf_ref?: string;
 	repo?: string;
 	quant?: string;
+	target_dir?: string;
 	gpu_mode?: string;
 	ctx_size?: number;
 	alias?: string;
@@ -127,6 +178,28 @@ export interface FitAdvisorDownloadResponse {
 	model: string;
 	status?: string;
 	already_present?: boolean;
+	local_path?: string;
+	target_dir?: string;
+	job?: FitAdvisorDownloadJob;
+}
+
+function parseSseBlock(block: string): FitAdvisorDownloadEvent | null {
+	let event = 'message';
+	let data = '';
+	for (const line of block.split('\n')) {
+		if (line.startsWith('event:')) {
+			event = line.slice(6).trim();
+		} else if (line.startsWith('data:')) {
+			data += line.slice(5).trim();
+		}
+	}
+	if (!data) {
+		return null;
+	}
+	return {
+		event,
+		data: JSON.parse(data) as FitAdvisorDownloadJob
+	};
 }
 
 function queryString(query: FitAdvisorModelsQuery): string {
@@ -162,8 +235,66 @@ export class FitAdvisorService {
 			model_id: model.id,
 			hf_ref: model.download?.hf_ref,
 			repo: model.download?.repo,
-			quant: model.quant
+			quant: model.quant,
+			target_dir: model.download?.target_dir ?? model.target_dir
 		});
+	}
+
+	static listDownloads(): Promise<FitAdvisorDownloadsResponse> {
+		return apiFetch<FitAdvisorDownloadsResponse>('/api/fit-advisor/downloads', { authOnly: true });
+	}
+
+	static async streamDownloads(
+		onEvent: (event: FitAdvisorDownloadEvent) => void,
+		signal?: AbortSignal,
+		since = 0
+	): Promise<void> {
+		const response = await fetch(
+			base + `/api/fit-advisor/downloads/sse${since > 0 ? `?since=${since}` : ''}`,
+			{
+				headers: getAuthHeaders(),
+				signal
+			}
+		);
+
+		if (!response.ok) {
+			throw new Error('Fit Advisor download stream failed: ' + response.status + ' ' + response.statusText);
+		}
+		if (!response.body) {
+			throw new Error('Fit Advisor download stream is empty');
+		}
+
+		const reader = response.body.getReader();
+		const decoder = new TextDecoder();
+		let buffer = '';
+
+		for (;;) {
+			const { done, value } = await reader.read();
+			if (done) {
+				break;
+			}
+			buffer += decoder.decode(value, { stream: true });
+			for (;;) {
+				const index = buffer.indexOf('\n\n');
+				if (index === -1) {
+					break;
+				}
+				const block = buffer.slice(0, index);
+				buffer = buffer.slice(index + 2);
+				const parsed = parseSseBlock(block);
+				if (parsed) {
+					onEvent(parsed);
+				}
+			}
+		}
+
+		const tail = buffer.trim();
+		if (tail) {
+			const parsed = parseSseBlock(tail);
+			if (parsed) {
+				onEvent(parsed);
+			}
+		}
 	}
 
 	static configure(
@@ -174,10 +305,11 @@ export class FitAdvisorService {
 			'/api/fit-advisor/configure',
 			{
 				model_id: model.id,
-				local_path: model.local_path,
+				local_path: model.local_path ?? model.download_progress?.local_path ?? null,
 				hf_ref: model.download?.hf_ref,
 				repo: model.download?.repo,
 				quant: model.quant,
+				target_dir: model.download?.target_dir ?? model.target_dir,
 				gpu_mode: model.gpu_mode,
 				ctx_size: model.effective_context_length,
 				alias: model.name,
