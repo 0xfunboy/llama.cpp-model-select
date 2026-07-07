@@ -200,6 +200,8 @@ int llama_server(int argc, char ** argv) {
         ctx_http.post("/models/unload",        ex_wrapper(models_routes->post_router_models_unload));
         ctx_http.get ("/models/sse",           ex_wrapper(models_routes->get_router_models_sse));
         ctx_http.del ("/models",               ex_wrapper(models_routes->del_router_models));
+        ctx_http.get ("/admin/models",         ex_wrapper(models_routes->get_admin_models));
+        ctx_http.post("/admin/switch",         ex_wrapper(models_routes->post_admin_switch));
     }
 
     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)

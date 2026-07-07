@@ -201,6 +201,11 @@ bool server_http_context::init(const common_params & params) {
             return true;
         }
 
+        // Admin endpoints use a separate key path in their route handlers.
+        if (req.path.rfind("/admin/", 0) == 0) {
+            return true;
+        }
+
         // Check for API key in the Authorization header
         std::string req_api_key = req.get_header_value("Authorization");
         if (req_api_key.empty()) {

@@ -65,6 +65,9 @@ struct common_preset_context {
     // load presets from INI file
     common_presets load_from_ini(const std::string & path, common_preset & global) const;
 
+    // load presets from JSON file
+    common_presets load_from_json(const std::string & path, common_preset & global) const;
+
     // generate presets from cached models
     common_presets load_from_cache() const;
 

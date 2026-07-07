@@ -4,10 +4,14 @@
 #include "log.h"
 #include "download.h"
 
+#include <nlohmann/json.hpp>
+
 #include <fstream>
 #include <sstream>
 #include <filesystem>
 #include <regex>
+
+using json = nlohmann::ordered_json;
 
 static std::string rm_leading_dashes(const std::string & str) {
     size_t pos = 0;
@@ -336,6 +340,192 @@ common_presets common_preset_context::load_from_ini(const std::string & path, co
         } else {
             out[preset.name] = preset;
         }
+    }
+
+    return out;
+}
+
+static std::string json_preset_key(std::string key) {
+    for (char & c : key) {
+        if (c == '_') {
+            c = '-';
+        }
+    }
+    if (key == "id")               return "name";
+    if (key == "path")             return "model";
+    if (key == "ctx")              return "ctx-size";
+    if (key == "n-ctx")            return "ctx-size";
+    if (key == "ctx-size")         return "ctx-size";
+    if (key == "context")          return "ctx-size";
+    if (key == "context-size")     return "ctx-size";
+    if (key == "ngl")              return "n-gpu-layers";
+    if (key == "gpu-layers")       return "n-gpu-layers";
+    if (key == "flash-attn")       return "flash-attn";
+    if (key == "fa")               return "flash-attn";
+    if (key == "cmoe")             return "cpu-moe";
+    if (key == "ncmoe")            return "n-cpu-moe";
+    if (key == "load-on-startup")  return "load-on-startup";
+    if (key == "load-on-start")    return "load-on-startup";
+    if (key == "autoload")         return "load-on-startup";
+    return key;
+}
+
+template <typename T>
+static T json_get_value(const json & body, const std::string & key, const T & default_value) {
+    if (body.contains(key) && !body.at(key).is_null()) {
+        return body.at(key).get<T>();
+    }
+    return default_value;
+}
+
+static std::string json_preset_value(const json & value) {
+    if (value.is_string()) {
+        return value.get<std::string>();
+    }
+    if (value.is_boolean()) {
+        return value.get<bool>() ? "true" : "false";
+    }
+    if (value.is_number_integer()) {
+        return std::to_string(value.get<int64_t>());
+    }
+    if (value.is_number_unsigned()) {
+        return std::to_string(value.get<uint64_t>());
+    }
+    if (value.is_number_float()) {
+        std::ostringstream out;
+        out << value.get<double>();
+        return out.str();
+    }
+    if (value.is_array()) {
+        std::string out;
+        for (const auto & item : value) {
+            if (!out.empty()) {
+                out += ",";
+            }
+            out += json_preset_value(item);
+        }
+        return out;
+    }
+    throw std::runtime_error("JSON preset values must be strings, booleans, numbers, or arrays");
+}
+
+static void load_json_options(
+        const common_preset_context & ctx,
+        common_preset & preset,
+        const json & object,
+        const std::string & origin) {
+    static const std::set<std::string> skipped = {
+        "id", "name", "version", "description", "display_name", "display-name", "comment", "args", "options"
+    };
+
+    if (!object.is_object()) {
+        throw std::runtime_error(origin + " must be a JSON object");
+    }
+
+    auto apply_one = [&](const std::string & raw_key, const json & value) {
+        std::string key = json_preset_key(raw_key);
+        if (skipped.count(key)) {
+            return;
+        }
+        if (ctx.filter_allowed_keys && ctx.allowed_keys.find(key) == ctx.allowed_keys.end()) {
+            throw std::runtime_error(string_format(
+                "option '%s' is not allowed in remote presets",
+                raw_key.c_str()
+            ));
+        }
+        if (ctx.key_to_opt.find(key) == ctx.key_to_opt.end()) {
+            throw std::runtime_error(string_format(
+                "option '%s' not recognized in JSON preset '%s'",
+                raw_key.c_str(), preset.name.c_str()
+            ));
+        }
+        const auto & opt = ctx.key_to_opt.at(key);
+        std::string str_value = json_preset_value(value);
+        if (is_bool_arg(opt)) {
+            preset.options[opt] = parse_bool_arg(opt, key, str_value);
+        } else {
+            preset.options[opt] = str_value;
+        }
+    };
+
+    for (auto it = object.begin(); it != object.end(); ++it) {
+        apply_one(it.key(), it.value());
+    }
+    for (const char * nested_key : {"options", "args"}) {
+        if (!object.contains(nested_key)) {
+            continue;
+        }
+        const json & nested = object.at(nested_key);
+        if (!nested.is_object()) {
+            throw std::runtime_error(origin + "." + nested_key + " must be a JSON object");
+        }
+        for (auto it = nested.begin(); it != nested.end(); ++it) {
+            apply_one(it.key(), it.value());
+        }
+    }
+}
+
+common_presets common_preset_context::load_from_json(const std::string & path, common_preset & global) const {
+    std::ifstream in(path);
+    if (!in) {
+        throw std::runtime_error("failed to open JSON preset file: " + path);
+    }
+
+    json root = json::parse(in);
+    common_presets out;
+
+    auto load_global = [&](const json & object) {
+        global.name = "*";
+        load_json_options(*this, global, object, "global preset");
+    };
+
+    if (root.is_array()) {
+        for (const auto & item : root) {
+            common_preset preset;
+            preset.name = json_get_value(item, "id", json_get_value(item, "name", std::string()));
+            if (preset.name.empty()) {
+                throw std::runtime_error("every JSON model preset must have 'id' or 'name'");
+            }
+            load_json_options(*this, preset, item, "model preset " + preset.name);
+            out[preset.name] = preset;
+        }
+        return out;
+    }
+
+    if (!root.is_object()) {
+        throw std::runtime_error("JSON preset file must be an object or an array");
+    }
+
+    if (root.contains("global")) {
+        load_global(root.at("global"));
+    } else if (root.contains("defaults")) {
+        load_global(root.at("defaults"));
+    }
+
+    if (!root.contains("models")) {
+        throw std::runtime_error("JSON preset object must contain a 'models' array or object");
+    }
+
+    const json & models = root.at("models");
+    if (models.is_array()) {
+        for (const auto & item : models) {
+            common_preset preset;
+            preset.name = json_get_value(item, "id", json_get_value(item, "name", std::string()));
+            if (preset.name.empty()) {
+                throw std::runtime_error("every JSON model preset must have 'id' or 'name'");
+            }
+            load_json_options(*this, preset, item, "model preset " + preset.name);
+            out[preset.name] = preset;
+        }
+    } else if (models.is_object()) {
+        for (auto it = models.begin(); it != models.end(); ++it) {
+            common_preset preset;
+            preset.name = it.key();
+            load_json_options(*this, preset, it.value(), "model preset " + preset.name);
+            out[preset.name] = preset;
+        }
+    } else {
+        throw std::runtime_error("'models' must be an array or object");
     }
 
     return out;

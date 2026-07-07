@@ -3100,6 +3100,34 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_API_KEY_FILE"));
     add_opt(common_arg(
+        {"--admin-api-key"}, "KEY",
+        "admin API key for privileged server management endpoints, multiple keys can be provided as a comma-separated list (default: falls back to --api-key)",
+        [](common_params & params, const std::string & value) {
+            for (const auto & key : parse_csv_row(value)) {
+                if (!key.empty()) {
+                    params.admin_api_keys.push_back(key);
+                }
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ADMIN_API_KEY"));
+    add_opt(common_arg(
+        {"--admin-api-key-file"}, "FNAME",
+        "path to file containing admin API keys, one per line; lines starting with a hash are treated as comments (default: falls back to --api-key-file)",
+        [](common_params & params, const std::string & value) {
+            std::ifstream key_file(value);
+            if (!key_file) {
+                throw std::runtime_error(string_format("error: failed to open file '%s'\n", value.c_str()));
+            }
+            std::string key;
+            while (std::getline(key_file, key)) {
+                if (!key.empty() && key[0] != '#') {
+                    params.admin_api_keys.push_back(key);
+                }
+            }
+            key_file.close();
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ADMIN_API_KEY_FILE"));
+    add_opt(common_arg(
         {"--ssl-key-file"}, "FNAME",
         "path to file a PEM-encoded SSL private key",
         [](common_params & params, const std::string & value) {
@@ -3226,7 +3254,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_DIR"));
     add_opt(common_arg(
         {"--models-preset"}, "PATH",
-        "path to INI file containing model presets for the router server (default: disabled)",
+        "path to INI or JSON file containing model presets for the router server (default: disabled)",
         [](common_params & params, const std::string & value) {
             params.models_preset = value;
         }

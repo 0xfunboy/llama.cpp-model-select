@@ -284,6 +284,9 @@ struct server_models_routes {
     common_params params;
     json ui_settings = json::object();     // Primary: new name
     std::atomic<bool> stopping = false;    // for graceful disconnecting SSE clients during shutdown
+    std::mutex switch_mutex;
+    std::condition_variable switch_cv;
+    bool switch_in_progress = false;
     server_models models;
     server_models_routes(const common_params & params, int argc, char ** argv)
             : params(params), models(params, argc, argv) {
@@ -312,6 +315,8 @@ struct server_models_routes {
     server_http_context::handler_t get_router_models_sse;
     server_http_context::handler_t post_router_models;
     server_http_context::handler_t del_router_models;
+    server_http_context::handler_t get_admin_models;
+    server_http_context::handler_t post_admin_switch;
 
     // router side handlers for the resumable streaming routes. each resolves the child that owns
     // a conversation through the conv_id -> model map, no probing or fan out

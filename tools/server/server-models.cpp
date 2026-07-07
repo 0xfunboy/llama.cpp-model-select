@@ -20,6 +20,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <cstdlib>
+#include <cctype>
 #include <atomic>
 #include <chrono>
 #include <queue>
@@ -354,7 +355,11 @@ void server_models::load_models() {
     common_preset global = {};
     common_presets custom_presets = {};
     if (!base_params.models_preset.empty()) {
-        custom_presets = ctx_preset.load_from_ini(base_params.models_preset, global);
+        if (string_ends_with(base_params.models_preset, ".json")) {
+            custom_presets = ctx_preset.load_from_json(base_params.models_preset, global);
+        } else {
+            custom_presets = ctx_preset.load_from_ini(base_params.models_preset, global);
+        }
         SRV_INF("Loaded %zu custom model presets from %s\n", custom_presets.size(), base_params.models_preset.c_str());
     }
 
@@ -1550,6 +1555,34 @@ struct server_models_sse_client {
     }
 };
 
+struct router_switch_guard {
+    server_models_routes & routes;
+    bool active = false;
+
+    explicit router_switch_guard(server_models_routes & routes) : routes(routes) {}
+
+    bool start() {
+        std::lock_guard<std::mutex> lk(routes.switch_mutex);
+        if (routes.switch_in_progress) {
+            return false;
+        }
+        routes.switch_in_progress = true;
+        active = true;
+        return true;
+    }
+
+    ~router_switch_guard() {
+        if (!active) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lk(routes.switch_mutex);
+            routes.switch_in_progress = false;
+        }
+        routes.switch_cv.notify_all();
+    }
+};
+
 static void res_ok(std::unique_ptr<server_http_res> & res, const json & response_data) {
     res->status = 200;
     res->data = safe_json_to_str(response_data);
@@ -1558,6 +1591,76 @@ static void res_ok(std::unique_ptr<server_http_res> & res, const json & response
 static void res_err(std::unique_ptr<server_http_res> & res, const json & error_data) {
     res->status = json_value(error_data, "code", 500);
     res->data = safe_json_to_str({{ "error", error_data }});
+}
+
+static std::string header_value_ci(const server_http_req & req, const std::string & name) {
+    auto lower = [](std::string s) {
+        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+            return (char) std::tolower(c);
+        });
+        return s;
+    };
+
+    const std::string needle = lower(name);
+    for (const auto & [key, value] : req.headers) {
+        if (lower(key) == needle) {
+            return value;
+        }
+    }
+    return "";
+}
+
+static std::string strip_bearer(std::string key) {
+    static const std::string prefix = "Bearer ";
+    if (key.substr(0, prefix.size()) == prefix) {
+        key = key.substr(prefix.size());
+    }
+    return key;
+}
+
+static bool validate_admin_api_key(const server_http_req & req, const common_params & params) {
+    const std::vector<std::string> & keys = params.admin_api_keys.empty() ? params.api_keys : params.admin_api_keys;
+    if (keys.empty()) {
+        return true;
+    }
+
+    std::string req_api_key = header_value_ci(req, "X-Admin-Api-Key");
+    if (req_api_key.empty()) {
+        req_api_key = header_value_ci(req, "Authorization");
+    }
+    if (req_api_key.empty()) {
+        req_api_key = header_value_ci(req, "X-Api-Key");
+    }
+    req_api_key = strip_bearer(req_api_key);
+
+    return std::find(keys.begin(), keys.end(), req_api_key) != keys.end();
+}
+
+static bool require_admin_api_key(
+        const server_http_req & req,
+        const common_params & params,
+        std::unique_ptr<server_http_res> & res) {
+    if (validate_admin_api_key(req, params)) {
+        return true;
+    }
+    res_err(res, format_error_response("Invalid Admin API Key", ERROR_TYPE_AUTHENTICATION));
+    SRV_WRN("%s", "unauthorized: Invalid Admin API Key\n");
+    return false;
+}
+
+static server_http_res_ptr wait_for_switch_to_finish(server_models_routes & routes, const server_http_req & req) {
+    std::unique_lock<std::mutex> lk(routes.switch_mutex);
+    routes.switch_cv.wait(lk, [&routes, &req]() {
+        return !routes.switch_in_progress || req.should_stop();
+    });
+
+    if (req.should_stop()) {
+        auto res = std::make_unique<server_http_res>();
+        res_err(res, format_error_response("request cancelled while model switch is in progress", ERROR_TYPE_UNAVAILABLE));
+        return res;
+    }
+
+    return nullptr;
 }
 
 static bool router_validate_model(std::string & name, server_models & models, bool models_autoload, std::unique_ptr<server_http_res> & res) {
@@ -1660,6 +1763,10 @@ void server_models_routes::init_routes() {
     };
 
     this->proxy_get = [this](const server_http_req & req) {
+        if (auto wait_res = wait_for_switch_to_finish(*this, req)) {
+            return wait_res;
+        }
+
         std::string method = "GET";
         std::string name = req.get_param("model");
         bool autoload = is_autoload(params, req);
@@ -1671,6 +1778,10 @@ void server_models_routes::init_routes() {
     };
 
     this->proxy_post = [this](const server_http_req & req) {
+        if (auto wait_res = wait_for_switch_to_finish(*this, req)) {
+            return wait_res;
+        }
+
         std::string method = "POST";
         json body = json::parse(req.body);
         std::string name = json_value(body, "model", std::string());
@@ -1775,6 +1886,87 @@ void server_models_routes::init_routes() {
         res_ok(res, {
             {"data", models_json},
             {"object", "list"},
+        });
+        return res;
+    };
+
+    this->get_admin_models = [this](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        if (!require_admin_api_key(req, params, res)) {
+            return res;
+        }
+        return get_router_models(req);
+    };
+
+    this->post_admin_switch = [this](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        if (!require_admin_api_key(req, params, res)) {
+            return res;
+        }
+
+        router_switch_guard guard(*this);
+        if (!guard.start()) {
+            res_err(res, format_error_response("model switch already in progress", ERROR_TYPE_UNAVAILABLE));
+            return res;
+        }
+
+        json body = req.body.empty() ? json::object() : json::parse(req.body);
+        std::string name = json_value(body, "model", json_value(body, "id", req.get_param("model")));
+        const bool reload = json_value(body, "reload", false);
+        if (name.empty()) {
+            res_err(res, format_error_response("model name is missing from the request", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        auto target = models.get_meta(name);
+        if (!target.has_value()) {
+            res_err(res, format_error_response(string_format("model '%s' not found", name.c_str()), ERROR_TYPE_NOT_FOUND));
+            return res;
+        }
+        name = target->name;
+
+        std::vector<std::string> to_unload;
+        bool target_running = false;
+        for (const auto & meta : models.get_all_meta()) {
+            if (meta.name == name && meta.is_running()) {
+                target_running = true;
+            }
+            if ((meta.is_running() || meta.status == SERVER_MODEL_STATUS_DOWNLOADING)
+                    && (reload || meta.name != name)) {
+                to_unload.push_back(meta.name);
+            }
+        }
+
+        for (const auto & model_name : to_unload) {
+            models.unload(model_name);
+        }
+        for (const auto & model_name : to_unload) {
+            models.wait(model_name, [](const server_model_meta & meta) {
+                return !meta.is_running() && meta.status != SERVER_MODEL_STATUS_DOWNLOADING;
+            });
+        }
+
+        if (reload || !target_running) {
+            models.ensure_model_ready(name);
+        }
+
+        auto final_meta = models.get_meta(name);
+        const std::string final_status = final_meta.has_value()
+            ? server_model_status_to_string(final_meta->status)
+            : "missing";
+        if (!final_meta.has_value() || (!final_meta->is_ready() && final_meta->status != SERVER_MODEL_STATUS_SLEEPING)) {
+            res_err(res, format_error_response(
+                string_format("model '%s' did not become ready (status: %s)", name.c_str(), final_status.c_str()),
+                ERROR_TYPE_UNAVAILABLE));
+            return res;
+        }
+
+        res_ok(res, {
+            {"success",  true},
+            {"model",    name},
+            {"status",   final_status},
+            {"reload",   reload},
+            {"unloaded", to_unload},
         });
         return res;
     };

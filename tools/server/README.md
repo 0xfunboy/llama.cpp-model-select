@@ -199,6 +199,8 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--rerank, --reranking` | enable reranking endpoint on server (default: disabled)<br/>(env: LLAMA_ARG_RERANKING) |
 | `--api-key KEY` | API key to use for authentication, multiple keys can be provided as a comma-separated list (default: none)<br/>(env: LLAMA_API_KEY) |
 | `--api-key-file FNAME` | path to file containing API keys, one per line; lines starting with a hash are treated as comments (default: none)<br/>(env: LLAMA_ARG_API_KEY_FILE) |
+| `--admin-api-key KEY` | admin API key for privileged server management endpoints, multiple keys can be provided as a comma-separated list (default: falls back to `--api-key`)<br/>(env: LLAMA_ADMIN_API_KEY) |
+| `--admin-api-key-file FNAME` | path to file containing admin API keys, one per line; lines starting with a hash are treated as comments (default: falls back to `--api-key-file`)<br/>(env: LLAMA_ARG_ADMIN_API_KEY_FILE) |
 | `--ssl-key-file FNAME` | path to file a PEM-encoded SSL private key<br/>(env: LLAMA_ARG_SSL_KEY_FILE) |
 | `--ssl-cert-file FNAME` | path to file a PEM-encoded SSL certificate<br/>(env: LLAMA_ARG_SSL_CERT_FILE) |
 | `--chat-template-kwargs STRING` | sets additional params for the json template parser, must be a valid json object string, e.g. '{"key1":"value1","key2":"value2"}'<br/>(env: LLAMA_ARG_CHAT_TEMPLATE_KWARGS) |
@@ -213,7 +215,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--slot-save-path PATH` | path to save slot kv cache (default: disabled) |
 | `--media-path PATH` | directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled) |
 | `--models-dir PATH` | directory containing models for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_DIR) |
-| `--models-preset PATH` | path to INI file containing model presets for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_PRESET) |
+| `--models-preset PATH` | path to INI or JSON file containing model presets for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_PRESET) |
 | `--models-max N` | for router server, maximum number of models to load simultaneously (default: 4, 0 = unlimited)<br/>(env: LLAMA_ARG_MODELS_MAX) |
 | `--models-autoload, --no-models-autoload` | for router server, whether to automatically load models (default: enabled)<br/>(env: LLAMA_ARG_MODELS_AUTOLOAD) |
 | `--jinja, --no-jinja` | whether to use jinja template engine for chat (default: enabled)<br/>(env: LLAMA_ARG_JINJA) |
@@ -1632,17 +1634,18 @@ Alternatively, you can also add GGUF based preset (see next section)
 
 ### Model presets
 
-Model presets allow advanced users to define custom configurations using an `.ini` file:
+Model presets allow advanced users to define custom configurations using an `.ini` or `.json` file:
 
 ```sh
 llama-server --models-preset ./my-models.ini
+llama-server --models-preset ./models.json
 ```
 
 Each section in the file defines a new preset. Keys within a section correspond to command-line arguments (without leading dashes). For example, the argument `--n-gpu-layers 123` is written as `n-gpu-layers = 123`.
 
 Short argument forms (e.g., `c`, `ngl`) and environment variable names (e.g., `LLAMA_ARG_N_GPU_LAYERS`) are also supported as keys.
 
-Example:
+INI example:
 
 ```ini
 version = 1
@@ -1676,6 +1679,31 @@ model-draft = /Users/abc/my-models/draft.gguf
 [custom_model]
 model = /Users/abc/my-awesome-model-Q4_K_M.gguf
 ```
+
+JSON example:
+
+```json
+{
+  "version": 1,
+  "global": {
+    "ctx_size": 8192,
+    "n_gpu_layers": 99,
+    "flash_attn": "on"
+  },
+  "models": [
+    {
+      "id": "custom_model",
+      "model": "/Users/abc/my-awesome-model-Q4_K_M.gguf",
+      "alias": "custom,my-model",
+      "tags": ["Q4_K_M", "local"],
+      "load_on_startup": true,
+      "stop_timeout": 15
+    }
+  ]
+}
+```
+
+JSON keys may use either hyphens or underscores. Common aliases such as `path`, `ctx`, `ctx_size`, `n_ctx`, `ngl`, `fa`, `cmoe`, `ncmoe`, and `autoload` are normalized to the matching llama.cpp options.
 
 Note: some arguments are controlled by router (e.g., host, port, API key, HF repo, model alias). They will be removed or overwritten upon loading.
 
@@ -1838,6 +1866,40 @@ Response:
 ```json
 {
   "success": true
+}
+```
+
+### GET `/admin/models`: Admin model list
+
+Returns the router model list with the same shape as `GET /models`, but protected by the admin API key when one is configured.
+
+Admin endpoints accept `X-Admin-Api-Key: <key>` or `Authorization: Bearer <key>`. If no admin key is configured, they fall back to the regular API keys; if no keys are configured at all, they are open like the rest of an unauthenticated server.
+
+### POST `/admin/switch`: Exclusive model switch
+
+Switch to a model as an exclusive running instance. The router blocks proxied model requests during the switch, unloads currently running/downloading models as needed, waits for them to stop, then loads the requested model. Unloading a child process clears that model's KV cache, slots, sampler state, and CUDA allocations.
+
+Payload:
+
+```json
+{
+  "model": "custom_model",
+  "reload": false
+}
+```
+
+- `model`: model id or alias to switch to.
+- `reload`: when `true`, unloads and reloads the target even if it is already running.
+
+Response:
+
+```json
+{
+  "success": true,
+  "model": "custom_model",
+  "status": "loaded",
+  "reload": false,
+  "unloaded": ["previous_model"]
 }
 ```
 
