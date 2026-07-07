@@ -51,7 +51,10 @@ export interface Ds4ActiveJobResponse {
 export interface Ds4ReportSummary {
 	id: string;
 	kind: 'eval' | 'bench';
+	status?: string;
+	resumable?: boolean;
 	created_at: string;
+	updated_at?: string;
 	model_selector: string;
 	summary: Record<string, unknown>;
 }
@@ -64,7 +67,10 @@ export interface Ds4ReportsResponse {
 export interface Ds4Report {
 	id: string;
 	kind: 'eval' | 'bench';
+	status?: string;
+	resumable?: boolean;
 	created_at: string;
+	updated_at?: string;
 	model_selector: string;
 	summary?: Record<string, unknown>;
 	results?: Record<string, unknown>[];
@@ -86,22 +92,24 @@ export interface Ds4Event<T = Record<string, unknown>> {
 }
 
 export interface Ds4EvalRequest {
-	model: string;
+	model?: string;
 	models?: string[];
-	max_tokens: number;
-	thinking_budget_tokens: number;
-	thinking: boolean;
-	temperature: number;
+	resume_report_id?: string;
+	max_tokens?: number;
+	thinking_budget_tokens?: number;
+	thinking?: boolean;
+	temperature?: number;
 	limit?: number;
 }
 
 export interface Ds4BenchRequest {
-	model: string;
+	model?: string;
 	models?: string[];
-	ctx_start: number;
-	ctx_max: number;
-	ctx_step: number;
-	gen_tokens: number;
+	resume_report_id?: string;
+	ctx_start?: number;
+	ctx_max?: number;
+	ctx_step?: number;
+	gen_tokens?: number;
 }
 
 function parseSseBlock(block: string): Ds4Event | null {

@@ -119,6 +119,10 @@
 		if (activeReport?.kind === 'bench') return summaryNumber('best_decode_tokens_per_second');
 		return Math.max(0, ...benchRows.map((row) => num(row.decode_tokens_per_second)));
 	});
+	const canResumeSelectedReport = $derived.by(() => {
+		if (!activeReport || activeReport.kind !== mode || isRunning || otherActiveJob) return false;
+		return activeReport.resumable === true || activeReport.status === 'paused';
+	});
 
 	onMount(() => {
 		void initialize();
@@ -205,7 +209,8 @@
 	}
 
 	function reportLabel(report: Ds4ReportSummary): string {
-		return report.created_at + ' · ' + report.model_selector;
+		const status = report.status ? '[' + report.status + '] ' : '';
+		return status + report.created_at + ' · ' + report.model_selector;
 	}
 
 	function summaryNumber(key: string): number {
@@ -432,11 +437,32 @@
 		try {
 			const snapshot = await Ds4Service.stopJob(jobId || undefined);
 			setSnapshot(snapshot);
-			appendTerminal('\nStop requested. Waiting for the server to cancel safely...\n');
+			await refreshReports();
+			appendTerminal('\nStop requested. Partial report saved; waiting for the server to pause safely...\n');
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
 		} finally {
 			isStopping = false;
+		}
+	}
+
+	async function resumeSelectedReport() {
+		if (!activeReport || !canResumeSelectedReport) return;
+		const report = activeReport;
+		streamController?.abort();
+		resetLiveState();
+		isRunning = true;
+		try {
+			const start =
+				report.kind === 'eval'
+					? await Ds4Service.runEval({ resume_report_id: report.id })
+					: await Ds4Service.runBench({ resume_report_id: report.id });
+			appendTerminal('Resuming ' + title + ' from report ' + report.id + '\n');
+			await attachJob(start.id, true, false);
+		} catch (e) {
+			error = e instanceof Error ? e.message : String(e);
+			appendTerminal('\nERROR: ' + error + '\n');
+			isRunning = false;
 		}
 	}
 
@@ -639,6 +665,14 @@
 						<option value={report.id}>{reportLabel(report)}</option>
 					{/each}
 				</select>
+				<button
+					type="button"
+					class="h-10 rounded-md border px-3 text-sm hover:bg-muted disabled:opacity-50"
+					disabled={!canResumeSelectedReport}
+					onclick={resumeSelectedReport}
+				>
+					Resume selected
+				</button>
 				<button type="button" class="h-10 rounded-md border px-3 text-sm hover:bg-muted" onclick={refreshReports}>Refresh history</button>
 			</div>
 		</div>

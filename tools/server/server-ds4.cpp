@@ -274,6 +274,25 @@ static std::string read_text_file(const std::filesystem::path & path) {
     return ss.str();
 }
 
+static std::filesystem::path report_path_from_id(std::string id) {
+    if (!line_is_safe_report_id(id)) {
+        throw std::runtime_error("invalid report id");
+    }
+    if (!ends_with(id, ".json")) {
+        id += ".json";
+    }
+    return reports_dir() / id;
+}
+
+static json read_report_by_id(const std::string & id) {
+    const auto path = report_path_from_id(id);
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) {
+        throw std::runtime_error("DS4 report not found");
+    }
+    return json::parse(read_text_file(path));
+}
+
 static std::vector<ds4_case> load_eval_cases() {
     std::vector<std::filesystem::path> candidates = {
         std::filesystem::path(LLAMA_DS4_EVAL_CASES_PATH),
@@ -1123,11 +1142,174 @@ struct server_ds4_routes::impl {
     void save_report(const std::shared_ptr<ds4_job> & job) {
         std::filesystem::create_directories(reports_dir());
         const auto path = reports_dir() / (job->id + ".json");
+        json snapshot;
+        {
+            std::lock_guard<std::mutex> lock(job->mutex);
+            snapshot = job->report;
+        }
         std::ofstream out(path, std::ios::binary);
         if (!out) {
             throw std::runtime_error(string_format("cannot write report '%s'", path.string().c_str()));
         }
-        out << job->report.dump(2) << "\n";
+        out << snapshot.dump(2) << "\n";
+    }
+
+    void store_report(const std::shared_ptr<ds4_job> & job, json report) {
+        report["updated_at"] = isoish_timestamp();
+        {
+            std::lock_guard<std::mutex> lock(job->mutex);
+            job->report = std::move(report);
+        }
+    }
+
+    json get_report_snapshot(const std::shared_ptr<ds4_job> & job) {
+        std::lock_guard<std::mutex> lock(job->mutex);
+        return job->report;
+    }
+
+    void save_paused_report(const std::shared_ptr<ds4_job> & job) {
+        json report = get_report_snapshot(job);
+        if (!report.is_object() || report.empty()) {
+            report = {
+                {"id", job->id},
+                {"kind", job->kind},
+                {"created_at", isoish_timestamp()},
+                {"model_selector", job->model_selector},
+                {"results", json::array()},
+                {"summary", json::object()},
+            };
+        }
+        report["status"] = "paused";
+        report["resumable"] = true;
+        report["paused_at"] = isoish_timestamp();
+        store_report(job, report);
+        save_report(job);
+        publish(job, "report-saved", {{"id", job->id}, {"status", "paused"}, {"resumable", true}});
+    }
+
+    json load_resume_report(const json & request, const std::string & expected_kind) {
+        std::string report_id = json_value(request, "resume_report_id", std::string());
+        if (report_id.empty()) {
+            report_id = json_value(request, "resume_from", std::string());
+        }
+        if (report_id.empty()) {
+            return json();
+        }
+        json report = read_report_by_id(report_id);
+        const std::string kind = json_value(report, "kind", std::string());
+        if (kind != expected_kind) {
+            throw std::runtime_error(string_format("report '%s' is '%s', not '%s'",
+                    report_id.c_str(), kind.c_str(), expected_kind.c_str()));
+        }
+        return report;
+    }
+
+    std::vector<std::string> models_from_resume_or_request(const json & request, const json & resume_report, std::string & selector) {
+        if (resume_report.is_object() && !request.contains("models") && !request.contains("model")) {
+            std::vector<std::string> names;
+            if (resume_report.contains("models") && resume_report["models"].is_array()) {
+                for (const auto & item : resume_report["models"]) {
+                    if (item.is_string()) {
+                        names.push_back(item.get<std::string>());
+                    }
+                }
+            }
+            if (!names.empty()) {
+                selector = json_value(resume_report, "model_selector", join_strings(names, ", "));
+                std::set<std::string> seen;
+                std::vector<std::string> ordered;
+                for (const auto & name : names) {
+                    if (seen.insert(name).second) {
+                        ordered.push_back(name);
+                    }
+                }
+                names = std::move(ordered);
+                return names;
+            }
+            selector = json_value(resume_report, "model_selector", std::string("ALL"));
+            return expand_model_selector(selector);
+        }
+        return expand_model_request(request, selector);
+    }
+
+    static std::string eval_row_key(const std::string & model, const std::string & case_id) {
+        return model + "\t" + case_id;
+    }
+
+    static std::string eval_row_key(const json & row) {
+        return eval_row_key(json_value(row, "model", std::string()), json_value(row, "id", std::string()));
+    }
+
+    static std::string bench_row_key(const std::string & model, int ctx) {
+        return model + "\t" + std::to_string(ctx);
+    }
+
+    static std::string bench_row_key(const json & row) {
+        return bench_row_key(json_value(row, "model", std::string()), json_value(row, "ctx", 0));
+    }
+
+    std::set<std::string> completed_eval_keys(const json & report) {
+        std::set<std::string> keys;
+        if (!report.contains("results") || !report["results"].is_array()) {
+            return keys;
+        }
+        for (const auto & row : report["results"]) {
+            const std::string key = eval_row_key(row);
+            if (key != "\t") {
+                keys.insert(key);
+            }
+        }
+        return keys;
+    }
+
+    std::set<std::string> completed_bench_keys(const json & report) {
+        std::set<std::string> keys;
+        if (!report.contains("results") || !report["results"].is_array()) {
+            return keys;
+        }
+        for (const auto & row : report["results"]) {
+            const std::string key = bench_row_key(row);
+            if (key != "\t0") {
+                keys.insert(key);
+            }
+        }
+        return keys;
+    }
+
+    void update_eval_summary(json & report) {
+        int total_pass = 0;
+        int total_fail = 0;
+        if (report.contains("results") && report["results"].is_array()) {
+            for (const auto & row : report["results"]) {
+                if (json_value(row, "pass", false)) {
+                    total_pass++;
+                } else {
+                    total_fail++;
+                }
+            }
+        }
+        report["summary"] = {
+            {"pass", total_pass},
+            {"fail", total_fail},
+            {"total", total_pass + total_fail},
+            {"score", (total_pass + total_fail) ? (double) total_pass / (double) (total_pass + total_fail) : 0.0},
+        };
+    }
+
+    void update_bench_summary(json & report) {
+        double best_decode = 0.0;
+        double best_prompt = 0.0;
+        if (report.contains("results") && report["results"].is_array()) {
+            for (const auto & row : report["results"]) {
+                best_decode = std::max(best_decode, json_value(row, "decode_tokens_per_second", 0.0));
+                best_prompt = std::max(best_prompt, json_value(row, "prompt_tokens_per_second", 0.0));
+            }
+        }
+        report["summary"] = {
+            {"rows", report.contains("results") && report["results"].is_array() ? report["results"].size() : 0},
+            {"best_decode_tokens_per_second", best_decode},
+            {"best_prompt_tokens_per_second", best_prompt},
+        };
     }
 
     void run_eval_job(const std::shared_ptr<ds4_job> & job, json request) {
@@ -1136,42 +1318,70 @@ struct server_ds4_routes::impl {
                 std::lock_guard<std::mutex> lock(job->mutex);
                 job->status = "running";
             }
-            const int max_tokens = std::max(1, json_value(request, "max_tokens", 16000));
-            const int think_budget = std::max(1, json_value(request, "thinking_budget_tokens", max_tokens));
+            const json resume_report = load_resume_report(request, "eval");
+            const bool is_resume = resume_report.is_object() && !resume_report.empty();
+            const int max_tokens = std::max(1, json_value(request, "max_tokens",
+                    is_resume ? json_value(resume_report, "max_tokens", 16000) : 16000));
+            const int think_budget = std::max(1, json_value(request, "thinking_budget_tokens",
+                    is_resume ? json_value(resume_report, "thinking_budget_tokens", max_tokens) : max_tokens));
             const int timeout_tokens = max_tokens;
-            const int limit = json_value(request, "limit", 0);
-            const bool thinking = json_value(request, "thinking", true);
-            const double temperature = json_value(request, "temperature", 0.0);
+            const int limit = json_value(request, "limit", is_resume ? json_value(resume_report, "limit", 0) : 0);
+            const bool thinking = json_value(request, "thinking", is_resume ? json_value(resume_report, "thinking", true) : true);
+            const double temperature = json_value(request, "temperature",
+                    is_resume ? json_value(resume_report, "temperature", 0.0) : 0.0);
             std::string selector;
-            const auto model_names = expand_model_request(request, selector);
+            const auto model_names = models_from_resume_or_request(request, resume_report, selector);
             auto cases = load_eval_cases();
             if (limit > 0 && limit < (int) cases.size()) {
                 cases.resize((size_t) limit);
             }
 
-            {
-                std::lock_guard<std::mutex> lock(job->mutex);
-                job->total = (int) (cases.size() * std::max<size_t>(1, model_names.size()));
-            }
-            publish(job, "status", {{"message", "DS4-Eval started"}, {"models", model_names}, {"cases", cases.size()}});
-
             json report = {
                 {"id", job->id},
                 {"kind", "eval"},
+                {"status", "running"},
+                {"resumable", false},
                 {"created_at", isoish_timestamp()},
                 {"model_selector", selector},
+                {"models", model_names},
                 {"max_tokens", max_tokens},
                 {"thinking_budget_tokens", think_budget},
                 {"thinking", thinking},
                 {"temperature", temperature},
+                {"limit", limit},
                 {"results", json::array()},
                 {"summary", json::object()},
             };
+            if (is_resume) {
+                report["resume_from"] = json_value(resume_report, "id", std::string());
+                report["resumed_at"] = isoish_timestamp();
+                if (resume_report.contains("results") && resume_report["results"].is_array()) {
+                    report["results"] = resume_report["results"];
+                }
+            }
+            update_eval_summary(report);
+            const auto completed = completed_eval_keys(report);
+            {
+                std::lock_guard<std::mutex> lock(job->mutex);
+                job->total = (int) (cases.size() * std::max<size_t>(1, model_names.size()));
+                job->current = std::min<int>((int) completed.size(), job->total);
+            }
+            store_report(job, report);
+            publish(job, "status", {{"message", "DS4-Eval started"}, {"models", model_names}, {"cases", cases.size()}});
 
-            int total_pass = 0;
-            int total_fail = 0;
             for (const auto & model_name : model_names) {
                 ensure_not_cancelled(job);
+                bool has_pending = false;
+                for (const auto & tc : cases) {
+                    if (!completed.count(eval_row_key(model_name, tc.id))) {
+                        has_pending = true;
+                        break;
+                    }
+                }
+                if (!has_pending) {
+                    log(job, string_format("\033[1;36m==> Skipping %s, already complete\033[0m\n", model_name.c_str()));
+                    continue;
+                }
                 log(job, string_format("\033[1;36m==> Loading %s\033[0m\n", model_name.c_str()));
                 std::string resolved;
                 json switch_details;
@@ -1191,6 +1401,9 @@ struct server_ds4_routes::impl {
                 for (const auto & tc : cases) {
                     ensure_not_cancelled(job);
                     case_index++;
+                    if (completed.count(eval_row_key(resolved, tc.id))) {
+                        continue;
+                    }
                     {
                         std::lock_guard<std::mutex> lock(job->mutex);
                         job->current++;
@@ -1261,10 +1474,8 @@ struct server_ds4_routes::impl {
 
                     if (pass) {
                         model_pass++;
-                        total_pass++;
                     } else {
                         model_fail++;
-                        total_fail++;
                     }
 
                     json row = {
@@ -1287,6 +1498,10 @@ struct server_ds4_routes::impl {
                         {"content", generated.content},
                     };
                     report["results"].push_back(row);
+                    update_eval_summary(report);
+                    report["status"] = "running";
+                    report["resumable"] = false;
+                    store_report(job, report);
                     publish(job, "case", row);
                     log(job, string_format("\n\033[%sm%s expected=%s got=%s elapsed=%.2fs tps=%.2f\033[0m\n",
                             pass ? "1;32" : "1;31",
@@ -1304,21 +1519,17 @@ struct server_ds4_routes::impl {
                 });
             }
 
-            report["summary"] = {
-                {"pass", total_pass},
-                {"fail", total_fail},
-                {"total", total_pass + total_fail},
-                {"score", (total_pass + total_fail) ? (double) total_pass / (double) (total_pass + total_fail) : 0.0},
-            };
-            {
-                std::lock_guard<std::mutex> lock(job->mutex);
-                job->report = report;
-            }
+            update_eval_summary(report);
+            report["status"] = "completed";
+            report["resumable"] = false;
+            report["completed_at"] = isoish_timestamp();
+            store_report(job, report);
             save_report(job);
             finish_job(job, "completed");
         } catch (const ds4_cancelled &) {
             log(job, "\n\033[1;33mCANCELLED by user\033[0m\n", "stderr");
-            finish_job(job, "cancelled", "cancelled");
+            save_paused_report(job);
+            finish_job(job, "paused", "paused");
         } catch (const std::exception & e) {
             log(job, std::string("\n\033[1;31mERROR: ") + e.what() + "\033[0m\n", "stderr");
             finish_job(job, "failed", e.what());
@@ -1331,12 +1542,18 @@ struct server_ds4_routes::impl {
                 std::lock_guard<std::mutex> lock(job->mutex);
                 job->status = "running";
             }
+            const json resume_report = load_resume_report(request, "bench");
+            const bool is_resume = resume_report.is_object() && !resume_report.empty();
             std::string selector;
-            const auto model_names = expand_model_request(request, selector);
-            const int ctx_start = std::max(128, json_value(request, "ctx_start", 2048));
-            const int ctx_max = std::max(ctx_start, json_value(request, "ctx_max", 131072));
-            const int ctx_step = std::max(128, json_value(request, "ctx_step", 4096));
-            const int gen_tokens = std::max(1, json_value(request, "gen_tokens", 64));
+            const auto model_names = models_from_resume_or_request(request, resume_report, selector);
+            const int ctx_start = std::max(128, json_value(request, "ctx_start",
+                    is_resume ? json_value(resume_report, "ctx_start", 2048) : 2048));
+            const int ctx_max = std::max(ctx_start, json_value(request, "ctx_max",
+                    is_resume ? json_value(resume_report, "ctx_max", 131072) : 131072));
+            const int ctx_step = std::max(128, json_value(request, "ctx_step",
+                    is_resume ? json_value(resume_report, "ctx_step", 4096) : 4096));
+            const int gen_tokens = std::max(1, json_value(request, "gen_tokens",
+                    is_resume ? json_value(resume_report, "gen_tokens", 64) : 64));
             {
                 std::lock_guard<std::mutex> lock(job->mutex);
                 job->total = (int) model_names.size();
@@ -1346,8 +1563,11 @@ struct server_ds4_routes::impl {
             json report = {
                 {"id", job->id},
                 {"kind", "bench"},
+                {"status", "running"},
+                {"resumable", false},
                 {"created_at", isoish_timestamp()},
                 {"model_selector", selector},
+                {"models", model_names},
                 {"ctx_start", ctx_start},
                 {"ctx_max", ctx_max},
                 {"ctx_step", ctx_step},
@@ -1355,6 +1575,16 @@ struct server_ds4_routes::impl {
                 {"results", json::array()},
                 {"summary", json::object()},
             };
+            if (is_resume) {
+                report["resume_from"] = json_value(resume_report, "id", std::string());
+                report["resumed_at"] = isoish_timestamp();
+                if (resume_report.contains("results") && resume_report["results"].is_array()) {
+                    report["results"] = resume_report["results"];
+                }
+            }
+            update_bench_summary(report);
+            const auto completed = completed_bench_keys(report);
+            store_report(job, report);
 
             const std::string prompt_text = read_bench_prompt();
             for (const auto & model_name : model_names) {
@@ -1398,6 +1628,12 @@ struct server_ds4_routes::impl {
                 json model_rows = json::array();
                 for (int ctx = ctx_start; ctx <= last_ctx; ctx += ctx_step) {
                     ensure_not_cancelled(job);
+                    if (completed.count(bench_row_key(resolved, ctx))) {
+                        if (ctx + ctx_step > last_ctx && ctx != last_ctx && last_ctx <= ctx_max) {
+                            ctx = last_ctx - ctx_step;
+                        }
+                        continue;
+                    }
                     json prefix = json::array();
                     for (int i = 0; i < ctx; i++) {
                         prefix.push_back(tokens[(size_t) i]);
@@ -1455,6 +1691,10 @@ struct server_ds4_routes::impl {
                     };
                     report["results"].push_back(row);
                     model_rows.push_back(row);
+                    update_bench_summary(report);
+                    report["status"] = "running";
+                    report["resumable"] = false;
+                    store_report(job, report);
                     publish(job, "bench-row", row);
                     log(job, string_format("ctx=%d prompt=%.2f tok/s decode=%.2f tok/s\n",
                             ctx, prompt_tps, decode_tps));
@@ -1467,26 +1707,17 @@ struct server_ds4_routes::impl {
                 publish(job, "model-summary", {{"model", resolved}, {"rows", model_rows}});
             }
 
-            double best_decode = 0.0;
-            double best_prompt = 0.0;
-            for (const auto & row : report["results"]) {
-                best_decode = std::max(best_decode, json_value(row, "decode_tokens_per_second", 0.0));
-                best_prompt = std::max(best_prompt, json_value(row, "prompt_tokens_per_second", 0.0));
-            }
-            report["summary"] = {
-                {"rows", report["results"].size()},
-                {"best_decode_tokens_per_second", best_decode},
-                {"best_prompt_tokens_per_second", best_prompt},
-            };
-            {
-                std::lock_guard<std::mutex> lock(job->mutex);
-                job->report = report;
-            }
+            update_bench_summary(report);
+            report["status"] = "completed";
+            report["resumable"] = false;
+            report["completed_at"] = isoish_timestamp();
+            store_report(job, report);
             save_report(job);
             finish_job(job, "completed");
         } catch (const ds4_cancelled &) {
             log(job, "\n\033[1;33mCANCELLED by user\033[0m\n", "stderr");
-            finish_job(job, "cancelled", "cancelled");
+            save_paused_report(job);
+            finish_job(job, "paused", "paused");
         } catch (const std::exception & e) {
             log(job, std::string("\n\033[1;31mERROR: ") + e.what() + "\033[0m\n", "stderr");
             finish_job(job, "failed", e.what());
@@ -1497,7 +1728,13 @@ struct server_ds4_routes::impl {
         auto res = std::make_unique<server_http_res>();
         json body = req.body.empty() ? json::object() : json::parse(req.body);
         std::string selector;
-        expand_model_request(body, selector);
+        try {
+            const json resume_report = load_resume_report(body, kind);
+            models_from_resume_or_request(body, resume_report, selector);
+        } catch (const std::exception & e) {
+            ds4_res_err(res, format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
         std::string error;
         auto job = create_job(kind, selector, error);
         if (!job) {
@@ -1645,12 +1882,17 @@ struct server_ds4_routes::impl {
             ds4_res_err(res, format_error_response("DS4 job not found", ERROR_TYPE_NOT_FOUND));
             return res;
         }
+        bool should_save = false;
         {
             std::lock_guard<std::mutex> lock(job->mutex);
             if (!job->finished) {
                 job->cancel_requested = true;
                 job->status = "cancelling";
+                should_save = true;
             }
+        }
+        if (should_save) {
+            save_paused_report(job);
         }
         publish(job, "status", {{"message", "cancellation requested"}});
         ds4_res_ok(res, job_snapshot(job));
@@ -1772,7 +2014,10 @@ void server_ds4_routes::init_routes() {
                 reports.push_back({
                     {"id", json_value(report, "id", entry.path().stem().string())},
                     {"kind", json_value(report, "kind", std::string())},
+                    {"status", json_value(report, "status", std::string())},
+                    {"resumable", json_value(report, "resumable", false)},
                     {"created_at", json_value(report, "created_at", std::string())},
+                    {"updated_at", json_value(report, "updated_at", std::string())},
                     {"model_selector", json_value(report, "model_selector", std::string())},
                     {"summary", json_value(report, "summary", json::object())},
                 });
