@@ -25,5 +25,9 @@ export const ROUTES = {
 	/** Settings base — for dynamic settings URLs use RouterService. */
 	SETTINGS: '#/settings',
 	/** Search — mobile-only full-page conversation search. */
-	SEARCH: '#/search'
+	SEARCH: '#/search',
+	/** DS4 eval dashboard. */
+	DS4_EVAL: '#/ds4-eval',
+	/** DS4 bench dashboard. */
+	DS4_BENCH: '#/ds4-bench'
 } as const;

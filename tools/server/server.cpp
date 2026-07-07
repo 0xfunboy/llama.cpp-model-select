@@ -1,6 +1,7 @@
 #include "server-context.h"
 #include "server-http.h"
 #include "server-models.h"
+#include "server-ds4.h"
 #include "server-cors-proxy.h"
 #include "server-stream.h"
 #include "server-tools.h"
@@ -156,6 +157,7 @@ int llama_server(int argc, char ** argv) {
     server_tools tools;
 
     std::optional<server_models_routes> models_routes{};
+    std::optional<server_ds4_routes> ds4_routes{};
     if (is_router_server) {
         // setup server instances manager
         try {
@@ -202,6 +204,26 @@ int llama_server(int argc, char ** argv) {
         ctx_http.del ("/models",               ex_wrapper(models_routes->del_router_models));
         ctx_http.get ("/admin/models",         ex_wrapper(models_routes->get_admin_models));
         ctx_http.post("/admin/switch",         ex_wrapper(models_routes->post_admin_switch));
+
+        ds4_routes.emplace(*models_routes);
+        ctx_http.get ("/api/ds4/models",           ex_wrapper(ds4_routes->get_models));
+        ctx_http.post("/api/ds4/run-eval",         ex_wrapper(ds4_routes->post_run_eval));
+        ctx_http.post("/api/ds4/run-bench",        ex_wrapper(ds4_routes->post_run_bench));
+        ctx_http.post("/api/ds4/run-status",       ex_wrapper(ds4_routes->get_job));
+        ctx_http.post("/api/ds4/run-events",       ex_wrapper(ds4_routes->get_job_events));
+        ctx_http.post("/api/ds4/run-report",       ex_wrapper(ds4_routes->get_report));
+        ctx_http.get ("/api/ds4/job",              ex_wrapper(ds4_routes->get_job));
+        ctx_http.get ("/api/ds4/job-events",       ex_wrapper(ds4_routes->get_job_events));
+        ctx_http.get ("/api/ds4/status",           ex_wrapper(ds4_routes->get_job));
+        ctx_http.get ("/api/ds4/events",           ex_wrapper(ds4_routes->get_job_events));
+        ctx_http.post("/api/ds4/status",           ex_wrapper(ds4_routes->get_job));
+        ctx_http.post("/api/ds4/events",           ex_wrapper(ds4_routes->get_job_events));
+        ctx_http.get ("/api/ds4/jobs/:id",         ex_wrapper(ds4_routes->get_job));
+        ctx_http.get ("/api/ds4/jobs/:id/events",  ex_wrapper(ds4_routes->get_job_events));
+        ctx_http.get ("/api/ds4/reports",          ex_wrapper(ds4_routes->get_reports));
+        ctx_http.get ("/api/ds4/report",           ex_wrapper(ds4_routes->get_report));
+        ctx_http.post("/api/ds4/report",           ex_wrapper(ds4_routes->get_report));
+        ctx_http.get ("/api/ds4/reports/:id",      ex_wrapper(ds4_routes->get_report));
     }
 
     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)

@@ -1,4 +1,4 @@
-import { Search, Settings, SquarePen } from '@lucide/svelte';
+import { Activity, ClipboardCheck, Search, Settings, SquarePen } from '@lucide/svelte';
 import McpLogo from '$lib/components/app/mcp/McpLogo.svelte';
 import type { Component } from 'svelte';
 import { ROUTES } from './routes';
@@ -27,6 +27,18 @@ export const SIDEBAR_ACTIONS_ITEMS: DesktopIconStripItem[] = [
 		tooltip: 'MCP Servers',
 		route: ROUTES.MCP_SERVERS,
 		activeRouteId: '/mcp-servers'
+	},
+	{
+		icon: ClipboardCheck,
+		tooltip: 'DS4-Eval',
+		route: ROUTES.DS4_EVAL,
+		activeRouteId: '/ds4-eval'
+	},
+	{
+		icon: Activity,
+		tooltip: 'DS4-Bench',
+		route: ROUTES.DS4_BENCH,
+		activeRouteId: '/ds4-bench'
 	},
 	{
 		icon: Settings,

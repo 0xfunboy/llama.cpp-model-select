@@ -91,6 +91,7 @@ export default defineConfig({
 			'/v1': SERVER_ORIGIN,
 			'/props': SERVER_ORIGIN,
 			'/models': SERVER_ORIGIN,
+			'/api': SERVER_ORIGIN,
 			'/tools': SERVER_ORIGIN,
 			'/slots': SERVER_ORIGIN,
 			'/cors-proxy': SERVER_ORIGIN

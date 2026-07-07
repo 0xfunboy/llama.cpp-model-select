@@ -37,12 +37,18 @@ set(TARGET llama-server-impl)
 
 add_library(${TARGET}
     server.cpp
+    server-ds4.cpp
+    server-ds4.h
     server-http.cpp
     server-http.h
     server-models.cpp
     server-models.h
 )
 set_target_properties(${TARGET} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+target_compile_definitions(${TARGET} PRIVATE
+    LLAMA_DS4_EVAL_CASES_PATH="${CMAKE_CURRENT_SOURCE_DIR}/ds4-eval-cases.json"
+    LLAMA_DS4_REPORTS_DIR="${CMAKE_SOURCE_DIR}/tools/ui/static/reports"
+)
 
 target_include_directories(${TARGET} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(${TARGET} PRIVATE ../mtmd ${CMAKE_SOURCE_DIR})
