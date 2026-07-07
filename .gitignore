@@ -51,6 +51,7 @@
 /vulkan-shaders-gen
 /rpc-server
 /out/
+/bench-results/
 /tmp/
 /autogen-*.md
 /common/build-info.cpp
