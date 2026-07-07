@@ -2,6 +2,7 @@
 #include "server-http.h"
 #include "server-models.h"
 #include "server-ds4.h"
+#include "server-fit-advisor.h"
 #include "server-cors-proxy.h"
 #include "server-stream.h"
 #include "server-tools.h"
@@ -158,6 +159,7 @@ int llama_server(int argc, char ** argv) {
 
     std::optional<server_models_routes> models_routes{};
     std::optional<server_ds4_routes> ds4_routes{};
+    std::optional<server_fit_advisor_routes> fit_advisor_routes{};
     if (is_router_server) {
         // setup server instances manager
         try {
@@ -224,6 +226,13 @@ int llama_server(int argc, char ** argv) {
         ctx_http.get ("/api/ds4/report",           ex_wrapper(ds4_routes->get_report));
         ctx_http.post("/api/ds4/report",           ex_wrapper(ds4_routes->get_report));
         ctx_http.get ("/api/ds4/reports/:id",      ex_wrapper(ds4_routes->get_report));
+
+        fit_advisor_routes.emplace(*models_routes);
+        ctx_http.get ("/api/fit-advisor/system",          ex_wrapper(fit_advisor_routes->get_system));
+        ctx_http.get ("/api/fit-advisor/models",          ex_wrapper(fit_advisor_routes->get_models));
+        ctx_http.post("/api/fit-advisor/catalog/refresh", ex_wrapper(fit_advisor_routes->post_catalog_refresh));
+        ctx_http.post("/api/fit-advisor/download",        ex_wrapper(fit_advisor_routes->post_download));
+        ctx_http.post("/api/fit-advisor/configure",       ex_wrapper(fit_advisor_routes->post_configure));
     }
 
     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)

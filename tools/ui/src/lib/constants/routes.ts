@@ -29,5 +29,7 @@ export const ROUTES = {
 	/** DS4 eval dashboard. */
 	DS4_EVAL: '#/ds4-eval',
 	/** DS4 bench dashboard. */
-	DS4_BENCH: '#/ds4-bench'
+	DS4_BENCH: '#/ds4-bench',
+	/** Model fit advisor dashboard. */
+	FIT_ADVISOR: '#/fit-advisor'
 } as const;

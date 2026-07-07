@@ -39,6 +39,8 @@ add_library(${TARGET}
     server.cpp
     server-ds4.cpp
     server-ds4.h
+    server-fit-advisor.cpp
+    server-fit-advisor.h
     server-http.cpp
     server-http.h
     server-models.cpp
