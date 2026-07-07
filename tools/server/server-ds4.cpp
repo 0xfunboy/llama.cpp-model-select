@@ -19,6 +19,7 @@
 #include <mutex>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <thread>
 
 #ifndef LLAMA_DS4_EVAL_CASES_PATH
@@ -61,11 +62,16 @@ struct ds4_job {
     int total = 0;
     uint64_t next_seq = 1;
     bool finished = false;
+    bool cancel_requested = false;
     json report = json::object();
 
     std::mutex mutex;
     std::condition_variable cv;
     std::deque<ds4_event> events;
+};
+
+struct ds4_cancelled : public std::runtime_error {
+    ds4_cancelled() : std::runtime_error("cancelled") {}
 };
 
 struct child_json_response {
@@ -112,6 +118,17 @@ static std::string lower_copy(std::string text) {
         return (char) std::tolower(c);
     });
     return text;
+}
+
+static std::string join_strings(const std::vector<std::string> & values, const std::string & sep) {
+    std::string out;
+    for (size_t i = 0; i < values.size(); i++) {
+        if (i > 0) {
+            out += sep;
+        }
+        out += values[i];
+    }
+    return out;
 }
 
 static bool starts_with(const std::string & text, const std::string & prefix) {
@@ -225,6 +242,22 @@ static std::string id_from_req(const server_http_req & req) {
         return "";
     }
     return id;
+}
+
+static std::string kind_from_req(const server_http_req & req) {
+    std::string kind = req.get_param("kind");
+    if (kind.empty()) {
+        kind = header_value_ci_ds4(req, "X-Kind");
+    }
+    if (!kind.empty() || req.body.empty()) {
+        return kind;
+    }
+    try {
+        json body = json::parse(req.body);
+        return json_value(body, "kind", std::string());
+    } catch (const std::exception &) {
+        return "";
+    }
 }
 
 static std::filesystem::path reports_dir() {
@@ -743,7 +776,8 @@ static stream_chat_result stream_child_chat(
         const common_params & params,
         int port,
         const json & body,
-        const std::function<void(const std::string &, const std::string &)> & on_delta) {
+        const std::function<void(const std::string &, const std::string &)> & on_delta,
+        const std::function<bool()> & should_cancel) {
     stream_chat_result out;
     httplib::Client cli(DS4_CHILD_HOST, port);
     configure_child_client(cli);
@@ -765,6 +799,10 @@ static stream_chat_result stream_child_chat(
     };
 
     req.content_receiver = [&](const char * data, size_t data_length, size_t, size_t) {
+        if (should_cancel()) {
+            out.error = "cancelled";
+            return false;
+        }
         if (out.status != 200) {
             raw_error_body.append(data, data_length);
             return true;
@@ -807,6 +845,10 @@ static stream_chat_result stream_child_chat(
     };
 
     auto result = cli.send(req);
+    if (should_cancel()) {
+        out.error = "cancelled";
+        return out;
+    }
     if (result.error() != httplib::Error::Success) {
         out.error = httplib::to_string(result.error());
         return out;
@@ -853,6 +895,7 @@ struct server_ds4_routes::impl {
     std::map<std::string, std::shared_ptr<ds4_job>> jobs;
     std::atomic<uint64_t> job_counter{0};
     bool active_job = false;
+    std::string active_job_id;
 
     explicit impl(server_models_routes & router) : router(router) {}
 
@@ -884,6 +927,29 @@ struct server_ds4_routes::impl {
         publish(job, "log", {{"stream", stream}, {"text", line}});
     }
 
+    bool is_cancel_requested(const std::shared_ptr<ds4_job> & job) {
+        std::lock_guard<std::mutex> lock(job->mutex);
+        return job->cancel_requested;
+    }
+
+    void ensure_not_cancelled(const std::shared_ptr<ds4_job> & job) {
+        if (is_cancel_requested(job)) {
+            throw ds4_cancelled();
+        }
+    }
+
+    std::shared_ptr<ds4_job> find_active_job() {
+        std::lock_guard<std::mutex> lock(jobs_mutex);
+        if (!active_job || active_job_id.empty()) {
+            return nullptr;
+        }
+        auto it = jobs.find(active_job_id);
+        if (it == jobs.end()) {
+            return nullptr;
+        }
+        return it->second;
+    }
+
     void finish_job(const std::shared_ptr<ds4_job> & job, const std::string & status, const std::string & error = "") {
         {
             std::lock_guard<std::mutex> lock(job->mutex);
@@ -894,7 +960,10 @@ struct server_ds4_routes::impl {
         publish(job, "done", {{"error", error}});
         {
             std::lock_guard<std::mutex> lock(jobs_mutex);
-            active_job = false;
+            if (active_job_id == job->id) {
+                active_job = false;
+                active_job_id.clear();
+            }
         }
     }
 
@@ -997,6 +1066,40 @@ struct server_ds4_routes::impl {
         return names;
     }
 
+    std::vector<std::string> expand_model_request(const json & request, std::string & selector) {
+        std::vector<std::string> requested;
+        if (request.contains("models") && request["models"].is_array()) {
+            for (const auto & item : request["models"]) {
+                if (item.is_string()) {
+                    std::string value = trim_copy(item.get<std::string>());
+                    if (!value.empty()) {
+                        requested.push_back(value);
+                    }
+                }
+            }
+        }
+
+        if (requested.empty()) {
+            selector = json_value(request, "model", std::string("ALL"));
+            return expand_model_selector(selector);
+        }
+
+        if (std::find(requested.begin(), requested.end(), "ALL") != requested.end()) {
+            selector = "ALL";
+            return expand_model_selector(selector);
+        }
+
+        std::vector<std::string> names;
+        for (const auto & value : requested) {
+            auto expanded = expand_model_selector(value);
+            names.insert(names.end(), expanded.begin(), expanded.end());
+        }
+        std::sort(names.begin(), names.end());
+        names.erase(std::unique(names.begin(), names.end()), names.end());
+        selector = join_strings(names, ", ");
+        return names;
+    }
+
     std::shared_ptr<ds4_job> create_job(const std::string & kind, const std::string & selector, std::string & error) {
         std::lock_guard<std::mutex> lock(jobs_mutex);
         if (active_job) {
@@ -1013,6 +1116,7 @@ struct server_ds4_routes::impl {
                 (int64_t) ggml_time_ms(),
                 job_counter.fetch_add(1, std::memory_order_relaxed));
         jobs[job->id] = job;
+        active_job_id = job->id;
         return job;
     }
 
@@ -1038,8 +1142,8 @@ struct server_ds4_routes::impl {
             const int limit = json_value(request, "limit", 0);
             const bool thinking = json_value(request, "thinking", true);
             const double temperature = json_value(request, "temperature", 0.0);
-            const std::string selector = json_value(request, "model", std::string("ALL"));
-            const auto model_names = expand_model_selector(selector);
+            std::string selector;
+            const auto model_names = expand_model_request(request, selector);
             auto cases = load_eval_cases();
             if (limit > 0 && limit < (int) cases.size()) {
                 cases.resize((size_t) limit);
@@ -1067,6 +1171,7 @@ struct server_ds4_routes::impl {
             int total_pass = 0;
             int total_fail = 0;
             for (const auto & model_name : model_names) {
+                ensure_not_cancelled(job);
                 log(job, string_format("\033[1;36m==> Loading %s\033[0m\n", model_name.c_str()));
                 std::string resolved;
                 json switch_details;
@@ -1084,6 +1189,7 @@ struct server_ds4_routes::impl {
                 int model_fail = 0;
                 int case_index = 0;
                 for (const auto & tc : cases) {
+                    ensure_not_cancelled(job);
                     case_index++;
                     {
                         std::lock_guard<std::mutex> lock(job->mutex);
@@ -1114,6 +1220,7 @@ struct server_ds4_routes::impl {
                         })},
                     };
 
+                    ensure_not_cancelled(job);
                     stream_chat_result generated = stream_child_chat(router.params, port, body,
                         [&](const std::string & channel, const std::string & delta) {
                             if (channel == "reasoning") {
@@ -1129,7 +1236,9 @@ struct server_ds4_routes::impl {
                                 }
                                 log(job, delta, "token");
                             }
-                        });
+                        },
+                        [this, job]() { return is_cancel_requested(job); });
+                    ensure_not_cancelled(job);
                     if (think_open) {
                         log(job, "\n\033[2m</think>\033[0m\n", "token");
                     }
@@ -1207,6 +1316,9 @@ struct server_ds4_routes::impl {
             }
             save_report(job);
             finish_job(job, "completed");
+        } catch (const ds4_cancelled &) {
+            log(job, "\n\033[1;33mCANCELLED by user\033[0m\n", "stderr");
+            finish_job(job, "cancelled", "cancelled");
         } catch (const std::exception & e) {
             log(job, std::string("\n\033[1;31mERROR: ") + e.what() + "\033[0m\n", "stderr");
             finish_job(job, "failed", e.what());
@@ -1219,12 +1331,12 @@ struct server_ds4_routes::impl {
                 std::lock_guard<std::mutex> lock(job->mutex);
                 job->status = "running";
             }
-            const std::string selector = json_value(request, "model", std::string("ALL"));
+            std::string selector;
+            const auto model_names = expand_model_request(request, selector);
             const int ctx_start = std::max(128, json_value(request, "ctx_start", 2048));
             const int ctx_max = std::max(ctx_start, json_value(request, "ctx_max", 131072));
             const int ctx_step = std::max(128, json_value(request, "ctx_step", 4096));
             const int gen_tokens = std::max(1, json_value(request, "gen_tokens", 64));
-            const auto model_names = expand_model_selector(selector);
             {
                 std::lock_guard<std::mutex> lock(job->mutex);
                 job->total = (int) model_names.size();
@@ -1246,6 +1358,7 @@ struct server_ds4_routes::impl {
 
             const std::string prompt_text = read_bench_prompt();
             for (const auto & model_name : model_names) {
+                ensure_not_cancelled(job);
                 {
                     std::lock_guard<std::mutex> lock(job->mutex);
                     job->current++;
@@ -1284,6 +1397,7 @@ struct server_ds4_routes::impl {
                 int last_ctx = std::min(ctx_max, (int) tokens.size());
                 json model_rows = json::array();
                 for (int ctx = ctx_start; ctx <= last_ctx; ctx += ctx_step) {
+                    ensure_not_cancelled(job);
                     json prefix = json::array();
                     for (int i = 0; i < ctx; i++) {
                         prefix.push_back(tokens[(size_t) i]);
@@ -1316,6 +1430,7 @@ struct server_ds4_routes::impl {
                     if (decode.status != 200) {
                         throw std::runtime_error("decode failed: " + decode.raw);
                     }
+                    ensure_not_cancelled(job);
 
                     const double prefill_sec = std::max(0.001,
                             std::chrono::duration<double>(prefill_end - prefill_start).count());
@@ -1369,6 +1484,9 @@ struct server_ds4_routes::impl {
             }
             save_report(job);
             finish_job(job, "completed");
+        } catch (const ds4_cancelled &) {
+            log(job, "\n\033[1;33mCANCELLED by user\033[0m\n", "stderr");
+            finish_job(job, "cancelled", "cancelled");
         } catch (const std::exception & e) {
             log(job, std::string("\n\033[1;31mERROR: ") + e.what() + "\033[0m\n", "stderr");
             finish_job(job, "failed", e.what());
@@ -1378,7 +1496,8 @@ struct server_ds4_routes::impl {
     server_http_res_ptr start_job(const server_http_req & req, const std::string & kind) {
         auto res = std::make_unique<server_http_res>();
         json body = req.body.empty() ? json::object() : json::parse(req.body);
-        const std::string selector = json_value(body, "model", std::string("ALL"));
+        std::string selector;
+        expand_model_request(body, selector);
         std::string error;
         auto job = create_job(kind, selector, error);
         if (!job) {
@@ -1425,6 +1544,8 @@ struct server_ds4_routes::impl {
             {"current", job->current},
             {"total", job->total},
             {"finished", job->finished},
+            {"cancel_requested", job->cancel_requested},
+            {"next_seq", job->next_seq},
             {"report", job->report.is_null() ? json::object() : job->report},
         };
     }
@@ -1450,7 +1571,10 @@ struct server_ds4_routes::impl {
 
         uint64_t since = 0;
         try {
-            const std::string raw_since = req.get_param("since", "0");
+            std::string raw_since = req.get_param("since");
+            if (raw_since.empty()) {
+                raw_since = header_value_ci_ds4(req, "X-Since");
+            }
             since = raw_since.empty() ? 0 : (uint64_t) std::stoull(raw_since);
         } catch (const std::exception &) {
             since = 0;
@@ -1497,6 +1621,42 @@ struct server_ds4_routes::impl {
         return res;
     }
 
+    server_http_res_ptr handle_active_job(const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        const std::string requested_kind = kind_from_req(req);
+        auto job = find_active_job();
+        if (!job) {
+            ds4_res_ok(res, {{"active", false}, {"matches", false}, {"job", json::object()}});
+            return res;
+        }
+        json snapshot = job_snapshot(job);
+        const bool matches = requested_kind.empty() || json_value(snapshot, "kind", std::string()) == requested_kind;
+        ds4_res_ok(res, {{"active", true}, {"matches", matches}, {"job", snapshot}});
+        return res;
+    }
+
+    server_http_res_ptr handle_cancel_job(const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        auto job = find_job(id_from_req(req));
+        if (!job) {
+            job = find_active_job();
+        }
+        if (!job) {
+            ds4_res_err(res, format_error_response("DS4 job not found", ERROR_TYPE_NOT_FOUND));
+            return res;
+        }
+        {
+            std::lock_guard<std::mutex> lock(job->mutex);
+            if (!job->finished) {
+                job->cancel_requested = true;
+                job->status = "cancelling";
+            }
+        }
+        publish(job, "status", {{"message", "cancellation requested"}});
+        ds4_res_ok(res, job_snapshot(job));
+        return res;
+    }
+
     server_http_res_ptr handle_report(const server_http_req & req) {
         auto res = std::make_unique<server_http_res>();
         std::string id = id_from_req(req);
@@ -1518,7 +1678,7 @@ struct server_ds4_routes::impl {
         return res;
     }
 
-    server_http_res_ptr handle_eval_action_or_start(const server_http_req & req) {
+    server_http_res_ptr handle_action_or_start(const server_http_req & req, const std::string & kind) {
         if (!req.body.empty()) {
             try {
                 json body = json::parse(req.body);
@@ -1541,11 +1701,17 @@ struct server_ds4_routes::impl {
                 if (action == "report") {
                     return handle_report(req);
                 }
+                if (action == "active") {
+                    return handle_active_job(req);
+                }
+                if (action == "stop" || action == "cancel") {
+                    return handle_cancel_job(req);
+                }
             } catch (const std::exception &) {
                 // Let start_job surface the parse error consistently.
             }
         }
-        return start_job(req, "eval");
+        return start_job(req, kind);
     }
 };
 
@@ -1578,11 +1744,11 @@ void server_ds4_routes::init_routes() {
     };
 
     post_run_eval = [p = pimpl](const server_http_req & req) {
-        return p->handle_eval_action_or_start(req);
+        return p->handle_action_or_start(req, "eval");
     };
 
     post_run_bench = [p = pimpl](const server_http_req & req) {
-        return p->start_job(req, "bench");
+        return p->handle_action_or_start(req, "bench");
     };
 
     get_job = [p = pimpl](const server_http_req & req) {
@@ -1634,6 +1800,12 @@ void server_ds4_routes::init_routes() {
         }
         if (command == "events") {
             return p->handle_job_events(req);
+        }
+        if (command == "active") {
+            return p->handle_active_job(req);
+        }
+        if (command == "stop" || command == "cancel") {
+            return p->handle_cancel_job(req);
         }
         return p->handle_report(req);
     };

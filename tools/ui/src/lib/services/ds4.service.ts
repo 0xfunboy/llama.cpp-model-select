@@ -37,7 +37,15 @@ export interface Ds4JobSnapshot {
 	current: number;
 	total: number;
 	finished: boolean;
+	cancel_requested?: boolean;
+	next_seq?: number;
 	report?: Ds4Report;
+}
+
+export interface Ds4ActiveJobResponse {
+	active: boolean;
+	matches: boolean;
+	job?: Ds4JobSnapshot;
 }
 
 export interface Ds4ReportSummary {
@@ -79,6 +87,7 @@ export interface Ds4Event<T = Record<string, unknown>> {
 
 export interface Ds4EvalRequest {
 	model: string;
+	models?: string[];
 	max_tokens: number;
 	thinking_budget_tokens: number;
 	thinking: boolean;
@@ -88,6 +97,7 @@ export interface Ds4EvalRequest {
 
 export interface Ds4BenchRequest {
 	model: string;
+	models?: string[];
 	ctx_start: number;
 	ctx_max: number;
 	ctx_step: number;
@@ -138,6 +148,16 @@ export class Ds4Service {
 		return apiPost<Ds4JobStartResponse, Ds4BenchRequest>('/api/ds4/run-bench', body);
 	}
 
+	static getActiveJob(kind?: 'eval' | 'bench'): Promise<Ds4ActiveJobResponse> {
+		return apiFetch<Ds4ActiveJobResponse>('/api/ds4/report', {
+			authOnly: true,
+			headers: {
+				'X-Cmd': 'active',
+				...(kind ? { 'X-Kind': kind } : {})
+			}
+		});
+	}
+
 	static getJob(id: string): Promise<Ds4JobSnapshot> {
 		return apiFetch<Ds4JobSnapshot>('/api/ds4/report', {
 			authOnly: true,
@@ -145,6 +165,13 @@ export class Ds4Service {
 				'X-Cmd': 'status',
 				'X-Job-Id': id
 			}
+		});
+	}
+
+	static stopJob(id?: string): Promise<Ds4JobSnapshot> {
+		return apiPost<Ds4JobSnapshot, { cmd: string; id?: string }>('/api/ds4/run-eval', {
+			cmd: 'stop',
+			...(id ? { id } : {})
 		});
 	}
 
@@ -165,19 +192,21 @@ export class Ds4Service {
 	static async streamJob(
 		id: string,
 		onEvent: (event: Ds4Event) => void,
-		signal?: AbortSignal
+		signal?: AbortSignal,
+		since = 0
 	): Promise<void> {
-		const response = await fetch(`${base}/api/ds4/report`, {
+		const response = await fetch(base + '/api/ds4/report', {
 			headers: {
 				...getAuthHeaders(),
 				'X-Cmd': 'events',
-				'X-Job-Id': id
+				'X-Job-Id': id,
+				'X-Since': String(Math.max(0, since))
 			},
 			signal
 		});
 
 		if (!response.ok) {
-			throw new Error(`DS4 event stream failed: ${response.status} ${response.statusText}`);
+			throw new Error('DS4 event stream failed: ' + response.status + ' ' + response.statusText);
 		}
 		if (!response.body) {
 			throw new Error('DS4 event stream is empty');
