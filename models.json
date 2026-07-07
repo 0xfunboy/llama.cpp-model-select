@@ -34,6 +34,22 @@
       "stop_timeout": 15
     },
     {
+      "id": "devstral2-123b",
+      "model": "/home/cooper/models/devstral2-123b/Devstral-2-123B-Instruct-2512-UD-IQ2_XXS.gguf",
+      "alias": "devstral,devstral2,devstral-123b",
+      "tags": ["123B", "IQ2_XXS", "32k", "dual-GPU"],
+      "ctx_size": 32768,
+      "n_gpu_layers": 99,
+      "split_mode": "layer",
+      "tensor_split": "1,1",
+      "flash_attn": "on",
+      "cache_type_k": "q8_0",
+      "cache_type_v": "q8_0",
+      "reasoning": "off",
+      "load_on_startup": false,
+      "stop_timeout": 20
+    },
+    {
       "id": "qwen36-27b-heretic",
       "model": "/home/cooper/models/qwen36-27b-heretic/Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-Q3_K_M.gguf",
       "alias": "heretic,qwen36-27b,qwen3.6-27b",
