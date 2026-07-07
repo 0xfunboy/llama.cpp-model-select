@@ -1,5 +1,107 @@
 # llama.cpp
 
+## Fork Delta: `0xfunboy/llama.cpp-model-select`
+
+This fork tracks upstream `ggml-org/llama.cpp` and adds a native, UI-driven local
+LLM operations layer focused on model switching, model fitting, and long-running
+evaluation/benchmark jobs. The upstream README continues below this section.
+
+### Native Model Selection And Router Control
+
+- Adds a structural model-selection layer to `llama-server` router mode, backed by
+  a local `models.json` preset file.
+- Adds admin model lifecycle endpoints:
+  - `GET /admin/models`
+  - `POST /admin/switch`
+- Adds separate admin authentication support through the admin API key path.
+- Switches models as an exclusive lifecycle operation: active/proxied requests are
+  locked during switch, running model children are unloaded, and the selected
+  model is loaded cleanly.
+- Uses the existing llama.cpp child-process model boundary so unload/reload clears
+  per-model runtime state such as slots, KV cache, sampler state, and CUDA memory.
+- Extends the web UI with a model selector flow intended to feel closer to
+  Ollama-style local model switching while remaining native to `llama-server`.
+
+### DS4-Eval And DS4-Bench Dashboard
+
+- Ports DS4-style evaluation into the llama.cpp server/UI instead of keeping it as
+  an external script.
+- Adds UI sidebar sections:
+  - `DS4-Eval`
+  - `DS4-Bench`
+- Adds backend APIs under `/api/ds4/*` for model listing, starting eval/bench jobs,
+  status polling, SSE-style event streaming, report loading, stop, and resume.
+- `DS4-Eval` runs the DwarfStar-style test suite from
+  `tools/server/ds4-eval-cases.json`, including logic, cybersecurity, and reasoning
+  cases with pass/fail scoring.
+- Reasoning models are supported with configurable thinking controls, including a
+  default thinking token budget and `<think>` / reasoning-token accounting.
+- `DS4-Bench` measures prompt-processing and generation throughput using the
+  Promessi Sposi corpus when available.
+- Jobs are long-running and UI-resumable: closing or changing browser pages does
+  not hide the active job state when returning to the dashboard.
+- Stop saves a partial report, and resumable reports can be selected later to
+  continue a previous run.
+- Reports are saved as JSON under `tools/ui/static/reports`.
+- Model selection supports `ALL` as well as multi-select checkmarks for selected
+  model subsets.
+
+### Fit Advisor
+
+- Adds a native C++ Fit Advisor backend inspired by `llmfit`.
+- Adds a Svelte dashboard at `/fit-advisor` to rank GGUF models against the current
+  machine.
+- Detects local CPU/RAM/GPU/VRAM and estimates:
+  - required model weight memory
+  - KV cache memory
+  - runtime mode (`gpu_single`, `layer_split`, `cpu_offload`, `cpu_only`)
+  - rough throughput
+  - fit level and score
+- Pulls and caches the llmfit Hugging Face GGUF catalog, with filters for use case,
+  fit level, quantization, search text, context length, and result limit.
+- Writes recommended router presets directly into the configured JSON
+  `--models-preset` file.
+- Adds optional immediate load after configuring a model.
+
+### Aria2c Hugging Face Downloads
+
+- Replaces the Fit Advisor download path with background `aria2c` jobs for visible,
+  resumable, high-throughput Hugging Face downloads.
+- Downloads GGUF files into the router models directory, defaulting to
+  `/home/cooper/models/<model-name>/` when no `--models-dir` is set.
+- Reads Hugging Face auth from `HF_TOKEN` or `~/.cache/huggingface/token`.
+- Resolves the target GGUF file from the Hugging Face repo and selected quant,
+  including sharded GGUF sets.
+- Adds download status states:
+  - `available`
+  - `queued`
+  - `resolving`
+  - `downloading`
+  - `downloaded`
+  - `configured`
+  - `failed`
+- Adds download monitor endpoints:
+  - `GET /api/fit-advisor/downloads`
+  - `GET /api/fit-advisor/downloads/sse`
+- The frontend shows downloaded bytes, total size, completion percentage, speed,
+  target directory, errors, and enables `FIT` after a model reaches `downloaded`.
+
+### Local Operator Notes
+
+- This fork is intended to run primarily in router mode, for example:
+
+```sh
+llama-server \
+  --models-preset ./models.json \
+  --models-max 1 \
+  --models-autoload \
+  --admin-api-key-file /path/to/admin-api-key
+```
+
+- `aria2c` is required for Fit Advisor managed downloads.
+- `models.json` in this fork is a local preset file and may contain machine-specific
+  paths; adjust it when reinstalling on a different host.
+
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
