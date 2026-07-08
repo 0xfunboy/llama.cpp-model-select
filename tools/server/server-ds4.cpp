@@ -1200,6 +1200,12 @@ struct server_ds4_routes::impl {
             throw std::runtime_error(string_format("report '%s' is '%s', not '%s'",
                     report_id.c_str(), kind.c_str(), expected_kind.c_str()));
         }
+        const std::string status = json_value(report, "status", std::string());
+        const bool resumable = json_value(report, "resumable", false);
+        if (!resumable && status != "paused") {
+            throw std::runtime_error(string_format("report '%s' is complete or archived and cannot be resumed",
+                    report_id.c_str()));
+        }
         return report;
     }
 
@@ -2015,6 +2021,7 @@ void server_ds4_routes::init_routes() {
                     {"kind", json_value(report, "kind", std::string())},
                     {"status", json_value(report, "status", std::string())},
                     {"resumable", json_value(report, "resumable", false)},
+                    {"archive", !json_value(report, "resumable", false) && json_value(report, "status", std::string()) == "completed"},
                     {"created_at", json_value(report, "created_at", std::string())},
                     {"updated_at", json_value(report, "updated_at", std::string())},
                     {"model_selector", json_value(report, "model_selector", std::string())},

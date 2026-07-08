@@ -1,78 +1,105 @@
 # llama.cpp
 
-## Fork Delta: `0xfunboy/llama.cpp-model-select`
+## Fork Overview: `0xfunboy/llama.cpp-model-select`
 
-This fork tracks upstream `ggml-org/llama.cpp` and adds a native, UI-driven local
-LLM operations layer focused on model switching, model fitting, and long-running
-evaluation/benchmark jobs. The upstream README continues below this section.
+This fork tracks upstream `ggml-org/llama.cpp` and layers a local LLM operations
+console on top of native `llama-server` router mode. It is designed for machines
+that keep many GGUF models on disk but run a controlled number of model instances
+at a time.
 
-### Native Model Selection And Router Control
+The upstream README continues below this fork overview.
 
-- Adds a structural model-selection layer to `llama-server` router mode, backed by
-  a local `models.json` preset file.
-- Adds admin model lifecycle endpoints:
+### Added Modules
+
+- **Native model selector UI** backed by router presets in `models.json`.
+- **Admin router control API** for lifecycle-safe model switching:
   - `GET /admin/models`
   - `POST /admin/switch`
-- Adds separate admin authentication support through the admin API key path.
-- Switches models as an exclusive lifecycle operation: active/proxied requests are
-  locked during switch, running model children are unloaded, and the selected
-  model is loaded cleanly.
-- Uses the existing llama.cpp child-process model boundary so unload/reload clears
-  per-model runtime state such as slots, KV cache, sampler state, and CUDA memory.
-- Extends the web UI with a model selector flow intended to feel closer to
-  Ollama-style local model switching while remaining native to `llama-server`.
+- **DS4-Eval dashboard** for resumable DwarfStar-style evaluation runs.
+- **DS4-Bench dashboard** for prompt/generation throughput checks.
+- **DS4 model report view** with per-model sector summaries and single-model or
+  race-style comparison reports.
+- **Fit Advisor dashboard** at `/fit-advisor`, backed by a native C++ advisor
+  inspired by `llmfit`.
+- **aria2c Hugging Face download manager** for resumable GGUF downloads.
+- **Router preset writer** that can add downloaded or selected models directly to
+  the active `--models-preset` JSON file.
 
-### DS4-Eval And DS4-Bench Dashboard
+### Router And Model Lifecycle Features
 
-- Ports DS4-style evaluation into the llama.cpp server/UI instead of keeping it as
-  an external script.
-- Adds UI sidebar sections:
-  - `DS4-Eval`
-  - `DS4-Bench`
-- Adds backend APIs under `/api/ds4/*` for model listing, starting eval/bench jobs,
-  status polling, SSE-style event streaming, report loading, stop, and resume.
-- `DS4-Eval` runs the DwarfStar-style test suite from
-  `tools/server/ds4-eval-cases.json`, including logic, cybersecurity, and reasoning
-  cases with pass/fail scoring.
-- Reasoning models are supported with configurable thinking controls, including a
-  default thinking token budget and `<think>` / reasoning-token accounting.
-- `DS4-Bench` measures prompt-processing and generation throughput using the
+- Runs best in `llama-server` router mode with `--models-preset`.
+- Supports admin authentication separately from normal API authentication.
+- Enforces exclusive model switching: when a model is selected, other running or
+  downloading model instances are stopped before the new model is loaded.
+- Serializes automatic router autoload operations so separate UI panels cannot
+  trigger competing model loads at the same time.
+- Uses llama.cpp child-process isolation so unloading a model clears that child
+  instance's slots, KV cache, sampler state, and CUDA allocations.
+- Keeps the OpenAI-compatible request path native to `llama-server`; the model is
+  selected through router mode rather than a separate proxy stack.
+
+### Fit Advisor Features
+
+- Scores GGUF catalog models against the host's CPU, total RAM, single-GPU VRAM,
+  and aggregate multi-GPU VRAM.
+- Uses total RAM capacity for fit planning while still displaying currently free
+  RAM as an operational status value.
+- Detects NVIDIA VRAM from `nvidia-smi` and exposes both per-GPU and aggregate
+  VRAM estimates.
+- Supports strategy modes:
+  - `Balanced`
+  - `MultiGPU`
+  - `MoE offload`
+  - `Hybrid offload`
+- Estimates weight memory, KV cache memory, overhead, runtime mode, fit level,
+  rough tokens/sec, and score components.
+- Runtime modes include:
+  - `gpu_single`
+  - `layer_split`
+  - `moe_offload`
+  - `cpu_offload`
+  - `cpu_only`
+- Pulls and caches the llmfit Hugging Face GGUF catalog.
+- Filters by use case, minimum fit, quantization, search text, result limit, and
+  selectable context preset.
+- Context selection is a dropdown with common tiers from `4k` through `1M`, with
+  `131k` as the default advisor target.
+- Score output is decomposed into quality, speed, fit, context, and capacity
+  components so ranking decisions are inspectable.
+- High-capacity hosts weight long-context, larger coding/reasoning models more
+  heavily than tiny fast models.
+- Generates recommended command args and router preset JSON, including tensor
+  split, MoE offload, KV cache quantization, flash attention, and reasoning flags
+  when appropriate.
+- Avoids absolute user paths in generated presets when a relative path can be
+  written safely.
+
+### DS4-Eval And DS4-Bench Features
+
+- Runs the test suite from `tools/server/ds4-eval-cases.json`.
+- Covers multiple subject sectors, including logic, geometry, algebra,
+  cybersecurity, philosophy, and reasoning-style cases where present in the suite.
+- Supports model subsets and `ALL` selection.
+- Streams long-running job progress to the UI.
+- Keeps job state visible after page changes or browser reconnects.
+- Saves partial reports on stop and supports resuming compatible reports.
+- Writes reports under `tools/ui/static/reports`.
+- Provides a model report panel below test logs with sector-level percentages.
+- Supports single-model summaries and race-style comparison between models from
+  the same evaluation run.
+- DS4-Bench measures prompt-processing and generation throughput using the
   Promessi Sposi corpus when available.
-- Jobs are long-running and UI-resumable: closing or changing browser pages does
-  not hide the active job state when returning to the dashboard.
-- Stop saves a partial report, and resumable reports can be selected later to
-  continue a previous run.
-- Reports are saved as JSON under `tools/ui/static/reports`.
-- Model selection supports `ALL` as well as multi-select checkmarks for selected
-  model subsets.
 
-### Fit Advisor
+### Download Manager Features
 
-- Adds a native C++ Fit Advisor backend inspired by `llmfit`.
-- Adds a Svelte dashboard at `/fit-advisor` to rank GGUF models against the current
-  machine.
-- Detects local CPU/RAM/GPU/VRAM and estimates:
-  - required model weight memory
-  - KV cache memory
-  - runtime mode (`gpu_single`, `layer_split`, `cpu_offload`, `cpu_only`)
-  - rough throughput
-  - fit level and score
-- Pulls and caches the llmfit Hugging Face GGUF catalog, with filters for use case,
-  fit level, quantization, search text, context length, and result limit.
-- Writes recommended router presets directly into the configured JSON
-  `--models-preset` file.
-- Adds optional immediate load after configuring a model.
-
-### Aria2c Hugging Face Downloads
-
-- Replaces the Fit Advisor download path with background `aria2c` jobs for visible,
-  resumable, high-throughput Hugging Face downloads.
-- Downloads GGUF files into the router models directory, defaulting to
-  `$HOME/models/<model-name>/` when no `--models-dir` is set.
+- Uses background `aria2c` jobs for high-throughput resumable Hugging Face GGUF
+  downloads.
+- Downloads into the router models directory, defaulting to
+  `$HOME/models/<model-name>/` when no `--models-dir` is configured.
 - Reads Hugging Face auth from `HF_TOKEN` or `~/.cache/huggingface/token`.
-- Resolves the target GGUF file from the Hugging Face repo and selected quant,
-  including sharded GGUF sets.
-- Adds download status states:
+- Resolves target GGUF files from selected quantization, including sharded GGUF
+  sets.
+- Exposes download states:
   - `available`
   - `queued`
   - `resolving`
@@ -80,15 +107,30 @@ evaluation/benchmark jobs. The upstream README continues below this section.
   - `downloaded`
   - `configured`
   - `failed`
-- Adds download monitor endpoints:
+- Exposes download monitor endpoints:
   - `GET /api/fit-advisor/downloads`
   - `GET /api/fit-advisor/downloads/sse`
-- The frontend shows downloaded bytes, total size, completion percentage, speed,
-  target directory, errors, and enables `FIT` after a model reaches `downloaded`.
+- The UI shows downloaded bytes, total size, percent, speed, target directory,
+  errors, and enables `FIT` after the model reaches `downloaded`.
+
+### Compatibility And Bug Fixes
+
+- Normalizes incompatible assistant history when switching between model families
+  with different chat templates, avoiding Jinja failures such as assistant
+  non-text chunk errors.
+- Flattens non-portable historical reasoning chunks when a target template only
+  accepts text assistant content.
+- Prevents automatic model load races across independent UI sections.
+- Deprioritizes creative or uncensored finetunes for DS4-style correctness and
+  disables generated reasoning flags for those presets when appropriate.
+- Fixes advisor ranking issues caused by using transient free RAM instead of total
+  host RAM capacity.
+- Fixes advisor ranking issues caused by an 8k context default that overvalued
+  small short-context models.
 
 ### Local Operator Notes
 
-- This fork is intended to run primarily in router mode, for example:
+- This fork is intended to run primarily in router mode:
 
 ```sh
 llama-server \

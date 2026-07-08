@@ -292,6 +292,35 @@ static double bytes_to_gib(double bytes) {
     return bytes / 1073741824.0;
 }
 
+static std::optional<double> linux_meminfo_gib(const std::string & key) {
+#if defined(__linux__)
+    try {
+        std::ifstream in("/proc/meminfo");
+        std::string line;
+        while (std::getline(in, line)) {
+            auto pos = line.find(':');
+            if (pos == std::string::npos) {
+                continue;
+            }
+            if (trim_copy(line.substr(0, pos)) != key) {
+                continue;
+            }
+            std::istringstream iss(line.substr(pos + 1));
+            double kb = 0.0;
+            std::string unit;
+            iss >> kb >> unit;
+            if (kb > 0.0) {
+                return bytes_to_gib(kb * 1024.0);
+            }
+        }
+    } catch (...) {
+    }
+#else
+    (void) key;
+#endif
+    return std::nullopt;
+}
+
 static json detect_system_json() {
     double total_ram_gb = 0.0;
     double available_ram_gb = 0.0;
@@ -302,10 +331,17 @@ static json detect_system_json() {
         available_ram_gb = bytes_to_gib((double) si.freeram * (double) si.mem_unit);
         available_ram_gb += bytes_to_gib((double) si.bufferram * (double) si.mem_unit);
     }
+    if (auto mem_total = linux_meminfo_gib("MemTotal")) {
+        total_ram_gb = *mem_total;
+    }
+    if (auto mem_available = linux_meminfo_gib("MemAvailable")) {
+        available_ram_gb = *mem_available;
+    }
 #endif
     if (total_ram_gb <= 0.0) {
         total_ram_gb = 0.0;
     }
+    const double fit_ram_capacity_gb = total_ram_gb;
 
     json gpus = json::array();
     std::vector<double> vram_gb;
@@ -350,6 +386,7 @@ static json detect_system_json() {
         {"cpu_cores", (int) std::max(1u, std::thread::hardware_concurrency())},
         {"total_ram_gb", total_ram_gb},
         {"available_ram_gb", available_ram_gb > 0.0 ? available_ram_gb : total_ram_gb},
+        {"fit_ram_capacity_gb", fit_ram_capacity_gb},
         {"has_gpu", !vram_gb.empty()},
         {"gpu_name", primary_gpu},
         {"gpu_count", (int) vram_gb.size()},
@@ -534,13 +571,19 @@ static double fit_score(double required, double available) {
     return std::clamp(100.0 * std::exp(-0.5 * z * z), 0.0, 100.0);
 }
 
-static double context_score(int context_length, const std::string & use_case) {
-    int target = 4096;
-    if (use_case == "coding" || use_case == "reasoning") target = 8192;
-    if (use_case == "embedding") target = 512;
+static double context_score(int context_length, int target_context, const std::string & use_case) {
+    int target = std::max(512, target_context);
+    if (use_case == "embedding") {
+        target = std::min(target, 512);
+    }
     if (context_length >= target) return 100.0;
-    if (context_length >= target / 2) return 70.0;
-    return 30.0;
+    const double ratio = (double) context_length / (double) target;
+    if (ratio >= 0.75) return 85.0;
+    if (ratio >= 0.50) return 65.0;
+    if (ratio >= 0.25) return 40.0;
+    if (context_length >= 8192) return 22.0;
+    if (context_length >= 4096) return 12.0;
+    return 5.0;
 }
 
 static double quality_score(const json & model, double params_b, const std::string & quant, const std::string & use_case) {
@@ -1275,6 +1318,25 @@ static bool local_file_exists(const std::string & path) {
     return std::filesystem::exists(path, ec) && std::filesystem::is_regular_file(path, ec);
 }
 
+static std::filesystem::path aria2_sidecar_path(const std::string & path) {
+    return std::filesystem::path(path + ".aria2");
+}
+
+static bool local_file_has_aria2_sidecar(const std::string & path) {
+    if (path.empty()) return false;
+    std::error_code ec;
+    const auto sidecar = aria2_sidecar_path(path);
+    return std::filesystem::exists(sidecar, ec) && std::filesystem::is_regular_file(sidecar, ec);
+}
+
+static bool local_model_file_ready(const std::string & path) {
+    return local_file_exists(path) && !local_file_has_aria2_sidecar(path);
+}
+
+static bool local_model_file_partial(const std::string & path) {
+    return local_file_exists(path) && local_file_has_aria2_sidecar(path);
+}
+
 static std::string preset_model_path(const std::string & path) {
     if (path.empty()) return path;
     std::error_code ec;
@@ -1472,17 +1534,18 @@ static json analyze_catalog_model(
 
     const double single_vram = json_value(system, "gpu_vram_gb", 0.0);
     const double total_vram = json_value(system, "total_gpu_vram_gb", 0.0);
-    const double ram = json_value(system, "available_ram_gb", 0.0);
+    const double ram_capacity = json_value(system, "fit_ram_capacity_gb", json_value(system, "total_ram_gb", 0.0));
+    const double ram_available_now = json_value(system, "available_ram_gb", ram_capacity);
     const int gpu_count = json_value(system, "gpu_count", 0);
 
     std::string fit_level = "too_tight";
     std::string run_mode = "cpu_only";
-    double available_gb = ram;
+    double available_gb = ram_capacity;
     double effective_required_gb = required_gb;
     std::vector<std::string> notes;
     double moe_offloaded_gb = 0.0;
     if (strategy == "moe_offload" && moe_memory && gpu_count > 0 &&
-            moe_memory->first <= total_vram * 0.92 && moe_memory->second <= ram) {
+            moe_memory->first <= total_vram * 0.92 && moe_memory->second <= ram_capacity) {
         fit_level = moe_memory->first <= total_vram * 0.75 ? "good" : "marginal";
         run_mode = "moe_offload";
         available_gb = total_vram;
@@ -1512,21 +1575,21 @@ static json analyze_catalog_model(
         run_mode = "layer_split";
         available_gb = total_vram;
         notes.push_back("Fits aggregate VRAM with little headroom.");
-    } else if (gpu_count > 0 && required_gb <= ram) {
+    } else if (gpu_count > 0 && required_gb <= ram_capacity) {
         fit_level = "marginal";
         run_mode = "cpu_offload";
-        available_gb = ram;
+        available_gb = ram_capacity;
         notes.push_back("Does not fit VRAM cleanly; CPU offload likely works but will be slower.");
-    } else if (required_gb <= ram) {
+    } else if (required_gb <= ram_capacity) {
         fit_level = "good";
         run_mode = "cpu_only";
-        available_gb = ram;
+        available_gb = ram_capacity;
         notes.push_back("Fits system RAM, but no GPU acceleration was detected.");
     } else {
         fit_level = "too_tight";
         run_mode = gpu_count > 0 ? "layer_split" : "cpu_only";
-        available_gb = gpu_count > 0 ? std::max(total_vram, single_vram) : ram;
-        notes.push_back("Estimated memory exceeds available RAM/VRAM.");
+        available_gb = gpu_count > 0 ? std::max(total_vram, single_vram) : ram_capacity;
+        notes.push_back("Estimated memory exceeds total RAM/VRAM capacity.");
     }
     if (strategy == "multi_gpu" && gpu_count > 1 && run_mode == "gpu_single" && required_gb <= total_vram * 0.90) {
         run_mode = "layer_split";
@@ -1536,9 +1599,12 @@ static json analyze_catalog_model(
     }
     if (strategy == "hybrid_offload" && gpu_count > 0 && run_mode != "cpu_only" && run_mode != "cpu_offload" && required_gb > single_vram * 0.90) {
         run_mode = "cpu_offload";
-        available_gb = ram;
-        fit_level = required_gb <= ram * 0.85 ? "good" : (required_gb <= ram ? "marginal" : "too_tight");
+        available_gb = ram_capacity;
+        fit_level = required_gb <= ram_capacity * 0.85 ? "good" : (required_gb <= ram_capacity ? "marginal" : "too_tight");
         notes.push_back("Hybrid offload requested; prioritizing GPU layers with CPU/RAM fallback.");
+    }
+    if (ram_available_now > 0.0 && available_gb == ram_capacity && effective_required_gb > ram_available_now * 0.90) {
+        notes.push_back("Fit is calculated on total RAM capacity; current free RAM is lower because the machine is in use.");
     }
 
     const std::string use_case = infer_use_case(model);
@@ -1554,23 +1620,36 @@ static json analyze_catalog_model(
     const double q = quality_score(model, params_b, quant, use_case);
     const double speed = std::clamp((tps / (use_case == "reasoning" ? 25.0 : 40.0)) * 100.0, 0.0, 100.0);
     const double fit = fit_score(effective_required_gb, available_gb);
-    const double ctx_score = context_score(native_ctx, use_case);
+    const double ctx_score = context_score(native_ctx, target_ctx, use_case);
     double wq = 0.45, ws = 0.30, wf = 0.15, wc = 0.10;
     if (use_case == "coding")     { wq = 0.50; ws = 0.20; wf = 0.15; wc = 0.15; }
     if (use_case == "reasoning")  { wq = 0.55; ws = 0.15; wf = 0.15; wc = 0.15; }
     if (use_case == "chat")       { wq = 0.40; ws = 0.35; wf = 0.15; wc = 0.10; }
     if (use_case == "multimodal") { wq = 0.50; ws = 0.20; wf = 0.15; wc = 0.15; }
+    const bool high_capacity_host = total_vram >= 40.0 || ram_capacity >= 96.0;
+    if (high_capacity_host && target_ctx >= 65536 && (use_case == "coding" || use_case == "reasoning")) {
+        wq = use_case == "reasoning" ? 0.64 : 0.62;
+        ws = 0.08;
+        wf = 0.12;
+        wc = use_case == "reasoning" ? 0.16 : 0.18;
+    }
     double strategy_bonus = 0.0;
     if (strategy == "multi_gpu" && run_mode == "layer_split") strategy_bonus = 7.0;
     if (strategy == "moe_offload" && run_mode == "moe_offload") strategy_bonus = 9.0;
     if (strategy == "hybrid_offload" && run_mode == "cpu_offload") strategy_bonus = 5.0;
-    const double score = std::round(std::clamp(q*wq + speed*ws + fit*wf + ctx_score*wc + strategy_bonus, 0.0, 100.0) * 10.0) / 10.0;
+    double capacity_bonus = 0.0;
+    if (high_capacity_host && (use_case == "coding" || use_case == "reasoning")) {
+        if (params_b >= 40.0) capacity_bonus = 6.0;
+        else if (params_b >= 20.0) capacity_bonus = 4.0;
+        else if (params_b < 13.0 && target_ctx >= 65536) capacity_bonus = -3.0;
+    }
+    const double score = std::round(std::clamp(q*wq + speed*ws + fit*wf + ctx_score*wc + strategy_bonus + capacity_bonus, 0.0, 100.0) * 10.0) / 10.0;
 
     const json source = first_gguf_source(model);
     const std::string repo = json_value(source, "repo", std::string());
     const std::string download_ref = repo.empty() ? "" : repo + ":" + quant;
     const json installed_match = find_installed(installed, model, repo, quant);
-    const bool configured = installed_match.is_object() && !installed_match.empty();
+    const bool configured_entry = installed_match.is_object() && !installed_match.empty();
     const std::filesystem::path target_dir = default_download_dir(router, repo, id);
     const json download_job = download_snapshot_for_model(id, download_ref);
     const std::string job_status = download_job.is_object() ? json_value(download_job, "status", std::string()) : std::string();
@@ -1587,7 +1666,9 @@ static json analyze_catalog_model(
         }
     }
 
-    const bool downloaded = configured || local_file_exists(local_path);
+    const bool partial = local_model_file_partial(local_path);
+    const bool downloaded = local_model_file_ready(local_path);
+    const bool configured = configured_entry && downloaded;
     std::string download_status = "available";
     if (configured) {
         download_status = "configured";
@@ -1595,6 +1676,8 @@ static json analyze_catalog_model(
         download_status = "downloading";
     } else if (job_status == "failed") {
         download_status = "failed";
+    } else if (partial) {
+        download_status = "partial";
     } else if (downloaded) {
         download_status = "downloaded";
     }
@@ -1616,15 +1699,18 @@ static json analyze_catalog_model(
         {"quant", quant},
         {"format", json_value(model, "format", std::string("gguf"))},
         {"context_length", native_ctx},
+        {"requested_context_length", target_ctx},
         {"effective_context_length", ctx},
         {"use_case", use_case},
         {"fit_level", fit_level},
         {"score", score},
-        {"score_components", {{"quality", q}, {"speed", speed}, {"fit", fit}, {"context", ctx_score}}},
+        {"score_components", {{"quality", q}, {"speed", speed}, {"fit", fit}, {"context", ctx_score}, {"capacity", capacity_bonus}}},
         {"estimated_tps", tps},
         {"memory_required_gb", effective_required_gb},
         {"full_memory_required_gb", required_gb},
         {"memory_available_gb", available_gb},
+        {"ram_available_now_gb", ram_available_now},
+        {"ram_capacity_gb", ram_capacity},
         {"weights_gb", weights_gb},
         {"kv_cache_gb", kv_gb},
         {"overhead_gb", overhead_gb},
@@ -1636,6 +1722,7 @@ static json analyze_catalog_model(
         {"installed", configured},
         {"configured", configured},
         {"downloaded", downloaded},
+        {"partial", partial},
         {"download_status", download_status},
         {"installed_model_id", json_value(installed_match, "id", std::string())},
         {"local_path", local_path.empty() ? nullptr : json(local_path)},
@@ -1667,7 +1754,7 @@ static json sorted_filtered_models(
     const std::string quant_filter = req.get_param("quant", "");
     const std::string search = req.get_param("search", "");
     const std::string strategy = lower_copy(req.get_param("strategy", "balanced"));
-    const int target_ctx = std::max(512, std::atoi(req.get_param("context", "8192").c_str()));
+    const int target_ctx = std::max(512, std::atoi(req.get_param("context", "131072").c_str()));
     const int min_rank = include_too_tight ? 0 : fit_rank(fit_filter.empty() ? "marginal" : fit_filter);
     int limit = std::atoi(req.get_param("limit", "300").c_str());
     if (limit <= 0) limit = 300;
@@ -1872,7 +1959,7 @@ struct server_fit_advisor_routes::impl {
 
         try {
             auto local = find_local_gguf(target_dir, quant);
-            if (local && local_file_exists(local->string())) {
+            if (local && local_model_file_ready(local->string())) {
                 fit_res_ok(res, {
                     {"success", true},
                     {"model", hf_ref},
@@ -2047,6 +2134,14 @@ struct server_fit_advisor_routes::impl {
         }
         if (model_id.empty() && local_path.empty() && hf_ref.empty()) {
             fit_res_err(res, format_error_response("configure request must include model_id, local_path, or hf_ref", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (!local_path.empty() && local_model_file_partial(local_path)) {
+            fit_res_err(res, format_error_response("model download is incomplete; resume the download before configuring it", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (!local_path.empty() && !local_model_file_ready(local_path)) {
+            fit_res_err(res, format_error_response("model file is not ready or is missing on disk", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
 

@@ -53,6 +53,7 @@ export interface Ds4ReportSummary {
 	kind: 'eval' | 'bench';
 	status?: string;
 	resumable?: boolean;
+	archive?: boolean;
 	created_at: string;
 	updated_at?: string;
 	model_selector: string;
@@ -69,6 +70,7 @@ export interface Ds4Report {
 	kind: 'eval' | 'bench';
 	status?: string;
 	resumable?: boolean;
+	archive?: boolean;
 	created_at: string;
 	updated_at?: string;
 	model_selector: string;

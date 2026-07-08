@@ -85,6 +85,56 @@ std::string gen_tool_call_id() {
     return random_string();
 }
 
+static std::string chat_content_text_field(const json & part, const char * key) {
+    return part.contains(key) && part.at(key).is_string() ? part.at(key).get<std::string>() : std::string();
+}
+
+static void append_chat_text(std::string & out, const std::string & text) {
+    if (text.empty()) {
+        return;
+    }
+    if (!out.empty()) {
+        out += "\n";
+    }
+    out += text;
+}
+
+static void flatten_assistant_content_for_text_templates(json & messages) {
+    if (!messages.is_array()) {
+        return;
+    }
+
+    for (auto & msg : messages) {
+        if (!msg.is_object() || json_value(msg, "role", std::string()) != "assistant") {
+            continue;
+        }
+
+        // Reasoning blocks from one model family are not portable to another
+        // family chat template. Keep the visible assistant answer as context.
+        msg.erase("reasoning_content");
+
+        if (!msg.contains("content") || !msg.at("content").is_array()) {
+            continue;
+        }
+
+        std::string text_content;
+        for (const auto & part : msg.at("content")) {
+            if (!part.is_object()) {
+                continue;
+            }
+            const std::string type = json_value(part, "type", std::string());
+            if (type == "text" || type == "input_text" || type == "output_text") {
+                append_chat_text(text_content, chat_content_text_field(part, "text"));
+            } else if (type == "refusal") {
+                append_chat_text(text_content, chat_content_text_field(part, "refusal"));
+            } else if (type == "media_marker") {
+                append_chat_text(text_content, chat_content_text_field(part, "text"));
+            }
+        }
+        msg["content"] = text_content;
+    }
+}
+
 const char * get_media_marker() {
     static const std::string marker = []() {
         // allow user to pin a reproducible marker via env var
@@ -981,6 +1031,22 @@ json oaicompat_chat_params_parse(
             throw std::invalid_argument("Expected 'content' to be a string or an array");
         }
 
+        if (role == "assistant") {
+            bool has_non_text_assistant_part = false;
+            for (const auto & p : content) {
+                const std::string type = json_value(p, "type", std::string());
+                if (type != "text" && type != "media_marker") {
+                    has_non_text_assistant_part = true;
+                    break;
+                }
+            }
+            if (has_non_text_assistant_part) {
+                SRV_WRN("%s", "assistant history contains non-text content chunks; flattening to text before template validation\n");
+                flatten_assistant_content_for_text_templates(messages);
+                continue;
+            }
+        }
+
         for (auto & p : content) {
             std::string type = json_value(p, "type", std::string());
             if (type == "image_url") {
@@ -1087,8 +1153,26 @@ json oaicompat_chat_params_parse(
 
     inputs.force_pure_content = opt.force_pure_content;
 
-    // Apply chat template to the list of messages
-    auto chat_params = common_chat_templates_apply(opt.tmpls.get(), inputs);
+    // Apply chat template to the list of messages. Some model templates reject
+    // assistant history that contains non-text typed chunks, especially when a
+    // conversation is continued after switching model families.
+    common_chat_params chat_params;
+    try {
+        chat_params = common_chat_templates_apply(opt.tmpls.get(), inputs);
+    } catch (const std::exception & e) {
+        const std::string err = e.what();
+        if (err.find("Only text chunks are supported in assistant message contents") == std::string::npos) {
+            throw;
+        }
+
+        SRV_WRN("%s", "chat template rejected assistant non-text chunks; retrying with text-only assistant history\n");
+        json flattened_messages = messages;
+        flatten_assistant_content_for_text_templates(flattened_messages);
+
+        common_chat_templates_inputs retry_inputs = inputs;
+        retry_inputs.messages = common_chat_msgs_parse_oaicompat(flattened_messages);
+        chat_params = common_chat_templates_apply(opt.tmpls.get(), retry_inputs);
+    }
 
     llama_params["chat_format"] = static_cast<int>(chat_params.format);
     llama_params["prompt"]      = chat_params.prompt;

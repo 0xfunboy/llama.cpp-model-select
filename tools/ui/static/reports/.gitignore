@@ -1,2 +1,4 @@
-*.json
+# DS4 benchmark/eval reports are intentionally kept as portable artifacts.
+# They contain benchmark results, not secrets, and can be backed up with the repo.
 !.gitignore
+!*.json

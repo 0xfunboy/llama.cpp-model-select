@@ -368,7 +368,11 @@
 	}
 
 	function reportLabel(report: Ds4ReportSummary): string {
-		const status = report.status ? '[' + report.status + '] ' : '';
+		const status = report.resumable || report.status === 'paused'
+			? '[resume] '
+			: report.status === 'completed'
+				? '[archive] '
+				: report.status ? '[' + report.status + '] ' : '';
 		return status + report.created_at + ' · ' + report.model_selector;
 	}
 
@@ -830,7 +834,7 @@
 					disabled={!canResumeSelectedReport}
 					onclick={resumeSelectedReport}
 				>
-					Resume selected
+					Resume interrupted
 				</button>
 				<button type="button" class="h-10 rounded-md border px-3 text-sm hover:bg-muted" onclick={refreshReports}>Refresh history</button>
 			</div>

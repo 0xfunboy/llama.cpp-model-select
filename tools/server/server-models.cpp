@@ -1663,6 +1663,18 @@ static server_http_res_ptr wait_for_switch_to_finish(server_models_routes & rout
     return nullptr;
 }
 
+static server_http_res_ptr start_switch_or_wait(
+        server_models_routes & routes,
+        const server_http_req & req,
+        router_switch_guard & guard) {
+    while (!guard.start()) {
+        if (auto wait_res = wait_for_switch_to_finish(routes, req)) {
+            return wait_res;
+        }
+    }
+    return nullptr;
+}
+
 static bool router_validate_model(std::string & name, server_models & models, bool models_autoload, std::unique_ptr<server_http_res> & res) {
     if (name.empty()) {
         res_err(res, format_error_response("model name is missing from the request", ERROR_TYPE_INVALID_REQUEST));
@@ -1771,8 +1783,18 @@ void server_models_routes::init_routes() {
         std::string name = req.get_param("model");
         bool autoload = is_autoload(params, req);
         auto error_res = std::make_unique<server_http_res>();
-        if (!router_validate_model(name, models, autoload, error_res)) {
-            return error_res;
+        if (autoload) {
+            router_switch_guard guard(*this);
+            if (auto wait_res = start_switch_or_wait(*this, req, guard)) {
+                return wait_res;
+            }
+            if (!router_validate_model(name, models, autoload, error_res)) {
+                return error_res;
+            }
+        } else {
+            if (!router_validate_model(name, models, autoload, error_res)) {
+                return error_res;
+            }
         }
         return models.proxy_request(req, method, name, false);
     };
@@ -1787,8 +1809,18 @@ void server_models_routes::init_routes() {
         std::string name = json_value(body, "model", std::string());
         bool autoload = is_autoload(params, req);
         auto error_res = std::make_unique<server_http_res>();
-        if (!router_validate_model(name, models, autoload, error_res)) {
-            return error_res;
+        if (autoload) {
+            router_switch_guard guard(*this);
+            if (auto wait_res = start_switch_or_wait(*this, req, guard)) {
+                return wait_res;
+            }
+            if (!router_validate_model(name, models, autoload, error_res)) {
+                return error_res;
+            }
+        } else {
+            if (!router_validate_model(name, models, autoload, error_res)) {
+                return error_res;
+            }
         }
         // remember which child serves this conversation so the stream routes can route straight
         // to it without polling, keyed on the exact conv id from the header
@@ -1811,6 +1843,10 @@ void server_models_routes::init_routes() {
         if (meta->is_running()) {
             res_err(res, format_error_response("model is already running", ERROR_TYPE_INVALID_REQUEST));
             return res;
+        }
+        router_switch_guard guard(*this);
+        if (auto wait_res = start_switch_or_wait(*this, req, guard)) {
+            return wait_res;
         }
         models.load(meta->name);
         res_ok(res, {{"success", true}});

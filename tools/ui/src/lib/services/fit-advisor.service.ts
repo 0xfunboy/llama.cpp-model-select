@@ -14,6 +14,7 @@ export interface FitAdvisorSystem {
 	cpu_cores: number;
 	total_ram_gb: number;
 	available_ram_gb: number;
+	fit_ram_capacity_gb?: number;
 	has_gpu: boolean;
 	gpu_name: string;
 	gpu_count: number;
@@ -57,7 +58,7 @@ export interface FitAdvisorDownloadJob {
 	repo: string;
 	quant: string;
 	hf_ref: string;
-	status: 'queued' | 'resolving' | 'downloading' | 'downloaded' | 'failed';
+	status: 'queued' | 'resolving' | 'downloading' | 'downloaded' | 'partial' | 'failed';
 	error?: string | null;
 	target_dir: string;
 	requested_filename?: string | null;
@@ -95,6 +96,7 @@ export interface FitAdvisorModel {
 	quant: string;
 	format: string;
 	context_length: number;
+	requested_context_length?: number;
 	effective_context_length: number;
 	use_case: string;
 	fit_level: 'perfect' | 'good' | 'marginal' | 'too_tight';
@@ -104,11 +106,14 @@ export interface FitAdvisorModel {
 		speed: number;
 		fit: number;
 		context: number;
+		capacity?: number;
 	};
 	estimated_tps: number;
 	memory_required_gb: number;
 	full_memory_required_gb?: number;
 	memory_available_gb: number;
+	ram_available_now_gb?: number;
+	ram_capacity_gb?: number;
 	weights_gb: number;
 	kv_cache_gb: number;
 	overhead_gb: number;
@@ -120,7 +125,8 @@ export interface FitAdvisorModel {
 	installed: boolean;
 	configured?: boolean;
 	downloaded?: boolean;
-	download_status?: 'available' | 'downloading' | 'downloaded' | 'configured' | 'failed';
+	partial?: boolean;
+	download_status?: 'available' | 'downloading' | 'downloaded' | 'configured' | 'partial' | 'failed';
 	installed_model_id?: string;
 	local_path?: string | null;
 	target_dir?: string;

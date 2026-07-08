@@ -25,7 +25,7 @@
 	let quant = $state('');
 	let search = $state('');
 	let strategy = $state('balanced');
-	let context = $state(8192);
+	let context = $state(131072);
 	let limit = $state(300);
 	let includeTooTight = $state(false);
 	let loadNow = $state(false);
@@ -33,6 +33,16 @@
 	const models = $derived(response?.models ?? []);
 	const system = $derived(response?.system ?? null);
 	const catalog = $derived(response?.catalog ?? null);
+	const contextOptions = [
+		{ value: 4096, label: '4k' },
+		{ value: 8192, label: '8k' },
+		{ value: 16384, label: '16k' },
+		{ value: 32768, label: '32k' },
+		{ value: 65536, label: '64k' },
+		{ value: 131072, label: '131k' },
+		{ value: 262144, label: '262k' },
+		{ value: 1048576, label: '1M' }
+	];
 
 	onMount(() => {
 		void loadModels(true);
@@ -66,7 +76,7 @@
 				local_path: job.local_path ?? selectedModel.local_path,
 				target_dir: job.target_dir ?? selectedModel.target_dir,
 				download_progress: job,
-				download_status: job.status === 'downloaded' ? 'downloaded' : job.status === 'failed' ? 'failed' : 'downloading',
+				download_status: job.status === 'downloaded' ? 'downloaded' : job.status === 'partial' ? 'partial' : job.status === 'failed' ? 'failed' : 'downloading',
 				downloaded: job.status === 'downloaded'
 			};
 		}
@@ -241,6 +251,7 @@
 	function statusClass(status: string): string {
 		if (status === 'configured') return 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30';
 		if (status === 'downloaded') return 'bg-cyan-500/15 text-cyan-300 border-cyan-500/30';
+		if (status === 'partial') return 'bg-amber-500/15 text-amber-300 border-amber-500/30';
 		if (status === 'downloading' || status === 'resolving' || status === 'queued') return 'bg-amber-500/15 text-amber-300 border-amber-500/30';
 		if (status === 'failed') return 'bg-red-500/15 text-red-300 border-red-500/30';
 		return 'bg-muted text-muted-foreground border-border';
@@ -253,8 +264,11 @@
 
 	function canFit(model: FitAdvisorModel): boolean {
 		const status = statusFor(model);
-		const job = downloadJobFor(model);
-		return status === 'downloaded' || status === 'configured' || Boolean(model.local_path ?? job?.local_path);
+		return status === 'downloaded' || status === 'configured';
+	}
+
+	function downloadButtonLabel(model: FitAdvisorModel): string {
+		return statusFor(model) === 'partial' ? 'Resume DL' : 'Download';
 	}
 </script>
 
@@ -306,8 +320,8 @@
 				</div>
 				<div class="rounded-lg border bg-card p-3">
 					<div class="text-xs text-muted-foreground">RAM</div>
-					<div class="mt-1 text-sm font-medium">{fmtGb(system.available_ram_gb)} available</div>
-					<div class="mt-1 text-xs text-muted-foreground">{fmtGb(system.total_ram_gb)} total</div>
+					<div class="mt-1 text-sm font-medium">{fmtGb(system.fit_ram_capacity_gb ?? system.total_ram_gb)} total</div>
+					<div class="mt-1 text-xs text-muted-foreground">{fmtGb(system.available_ram_gb)} currently free</div>
 				</div>
 				<div class="rounded-lg border bg-card p-3">
 					<div class="text-xs text-muted-foreground">GPU</div>
@@ -359,7 +373,11 @@
 				</label>
 				<label class="text-sm">
 					<span class="text-xs text-muted-foreground">Context</span>
-					<input class="mt-1 h-10 w-full rounded-md border bg-background px-2" type="number" min="512" step="512" bind:value={context} />
+					<select class="mt-1 h-10 w-full rounded-md border bg-background px-2" bind:value={context}>
+						{#each contextOptions as option}
+							<option value={option.value}>{option.label}</option>
+						{/each}
+					</select>
 				</label>
 				<label class="text-sm">
 					<span class="text-xs text-muted-foreground">Limit</span>
@@ -504,6 +522,14 @@
 								<div class="mt-1 font-medium">{selectedModel.gpu_mode}</div>
 							</div>
 							<div class="rounded-md border p-2">
+								<div class="text-xs text-muted-foreground">Score</div>
+								<div class="mt-1 font-medium">{fmtNum(selectedModel.score)}</div>
+							</div>
+							<div class="rounded-md border p-2">
+								<div class="text-xs text-muted-foreground">Context Score</div>
+								<div class="mt-1 font-medium">{fmtNum(selectedModel.score_components.context)}</div>
+							</div>
+							<div class="rounded-md border p-2">
 								<div class="text-xs text-muted-foreground">Weights</div>
 								<div class="mt-1 font-medium">{fmtGb(selectedModel.weights_gb)}</div>
 							</div>
@@ -516,9 +542,15 @@
 								<div class="mt-1 font-medium">{fmtGb(selectedModel.memory_required_gb)}</div>
 							</div>
 							<div class="rounded-md border p-2">
-								<div class="text-xs text-muted-foreground">Available Pool</div>
+								<div class="text-xs text-muted-foreground">Fit Pool</div>
 								<div class="mt-1 font-medium">{fmtGb(selectedModel.memory_available_gb)}</div>
 							</div>
+							{#if selectedModel.ram_available_now_gb && selectedModel.ram_capacity_gb && selectedModel.memory_available_gb === selectedModel.ram_capacity_gb}
+								<div class="rounded-md border p-2">
+									<div class="text-xs text-muted-foreground">Free RAM Now</div>
+									<div class="mt-1 font-medium">{fmtGb(selectedModel.ram_available_now_gb)}</div>
+								</div>
+							{/if}
 							{#if selectedModel.full_memory_required_gb && selectedModel.full_memory_required_gb > selectedModel.memory_required_gb + 0.1}
 								<div class="rounded-md border p-2">
 									<div class="text-xs text-muted-foreground">Full model</div>
@@ -531,6 +563,14 @@
 									<div class="mt-1 font-medium">{fmtGb(selectedModel.moe_offloaded_gb)}</div>
 								</div>
 							{/if}
+							<div class="rounded-md border p-2">
+								<div class="text-xs text-muted-foreground">Quality / Speed</div>
+								<div class="mt-1 font-medium">{fmtNum(selectedModel.score_components.quality)} / {fmtNum(selectedModel.score_components.speed)}</div>
+							</div>
+							<div class="rounded-md border p-2">
+								<div class="text-xs text-muted-foreground">Fit Score</div>
+								<div class="mt-1 font-medium">{fmtNum(selectedModel.score_components.fit)}</div>
+							</div>
 							<div class="rounded-md border p-2">
 								<div class="text-xs text-muted-foreground">State</div>
 								<div class="mt-1 font-medium">{selectedStatus}</div>
@@ -588,7 +628,7 @@
 								onclick={() => downloadModel(selectedModel!)}
 							>
 								<Download class="h-4 w-4" />
-								Download
+								{downloadButtonLabel(selectedModel)}
 							</button>
 							<button
 								type="button"
