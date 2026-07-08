@@ -402,6 +402,56 @@ static double quant_quality_penalty(const std::string & quant) {
     return -5.0;
 }
 
+static bool model_bool(const json & model, const char * key) {
+    return model.contains(key) && model[key].is_boolean() && model[key].get<bool>();
+}
+
+static double model_number(const json & model, const char * key, double fallback = 0.0) {
+    if (model.contains(key) && model[key].is_number()) {
+        return model[key].get<double>();
+    }
+    return fallback;
+}
+
+static bool is_moe_model(const json & model) {
+    return model_bool(model, "is_moe") ||
+           model_number(model, "active_parameters") > 0.0 ||
+           model_number(model, "num_experts") > 0.0 ||
+           model_number(model, "moe_intermediate_size") > 0.0;
+}
+
+static bool is_creative_uncensored_tune(const std::string & name) {
+    const std::string n = lower_copy(name);
+    return n.find("uncensored") != std::string::npos ||
+           n.find("abliterated") != std::string::npos ||
+           n.find("heretic") != std::string::npos ||
+           n.find("deckard") != std::string::npos ||
+           n.find("nsfw") != std::string::npos;
+}
+
+static bool is_reasoning_named(const std::string & name) {
+    const std::string n = lower_copy(name);
+    return n.find("reason") != std::string::npos ||
+           n.find("thinking") != std::string::npos ||
+           n.find("think") != std::string::npos ||
+           n.find("deepseek-r1") != std::string::npos;
+}
+
+static std::optional<std::pair<double, double>> moe_memory_for_quant(const json & model, const std::string & quant, double kv_gb, double overhead_gb) {
+    if (!is_moe_model(model)) {
+        return std::nullopt;
+    }
+    const double active = model_number(model, "active_parameters");
+    const double total = model_number(model, "parameters_raw");
+    if (active <= 0.0 || total <= 0.0 || active >= total) {
+        return std::nullopt;
+    }
+    const double bpp = quant_bpp(quant);
+    const double active_vram = std::max(0.5, (active * bpp) / 1073741824.0 * 1.10) + kv_gb + overhead_gb;
+    const double offloaded_ram = std::max(0.0, ((total - active) * bpp) / 1073741824.0);
+    return std::make_pair(active_vram, offloaded_ram);
+}
+
 static double kv_bytes_per_element(const std::string & kv_quant) {
     std::string q = lower_copy(kv_quant);
     if (q == "fp8" || q == "q8_0" || q == "q8" || q == "int8") return 1.0;
@@ -456,7 +506,12 @@ static std::string infer_use_case(const json & model) {
     if (uc.find("embedding") != std::string::npos || name.find("embed") != std::string::npos || name.find("bge") != std::string::npos) return "embedding";
     if (name.find("code") != std::string::npos || uc.find("code") != std::string::npos || name.find("coder") != std::string::npos) return "coding";
     if (uc.find("vision") != std::string::npos || uc.find("multimodal") != std::string::npos || name.find("-vl") != std::string::npos) return "multimodal";
-    if (uc.find("reason") != std::string::npos || name.find("deepseek-r1") != std::string::npos || name.find("think") != std::string::npos) return "reasoning";
+    if (uc.find("reason") != std::string::npos || name.find("deepseek-r1") != std::string::npos || name.find("think") != std::string::npos) {
+        if (is_creative_uncensored_tune(name) && uc.find("reason") == std::string::npos) {
+            return "general";
+        }
+        return "reasoning";
+    }
     if (uc.find("chat") != std::string::npos || uc.find("instruction") != std::string::npos || name.find("instruct") != std::string::npos) return "chat";
     return "general";
 }
@@ -511,6 +566,12 @@ static double quality_score(const json & model, double params_b, const std::stri
     if (use_case == "coding" && (name.find("code") != std::string::npos || name.find("coder") != std::string::npos || name.find("starcoder") != std::string::npos)) task = 6.0;
     if (use_case == "reasoning" && params_b >= 13.0) task = 5.0;
     if (use_case == "multimodal" && (name.find("vision") != std::string::npos || name.find("-vl") != std::string::npos)) task = 6.0;
+    if ((use_case == "reasoning" || use_case == "coding") && is_creative_uncensored_tune(name)) {
+        task -= 12.0;
+    }
+    if (is_reasoning_named(name) && !is_creative_uncensored_tune(name)) {
+        task += 3.0;
+    }
 
     return std::clamp(base + family + task + quant_quality_penalty(quant), 0.0, 100.0);
 }
@@ -1214,6 +1275,18 @@ static bool local_file_exists(const std::string & path) {
     return std::filesystem::exists(path, ec) && std::filesystem::is_regular_file(path, ec);
 }
 
+static std::string preset_model_path(const std::string & path) {
+    if (path.empty()) return path;
+    std::error_code ec;
+    const auto cwd = std::filesystem::current_path(ec);
+    if (ec) return path;
+    const auto relative = std::filesystem::relative(std::filesystem::path(path), cwd, ec);
+    if (!ec && !relative.empty()) {
+        return relative.string();
+    }
+    return path;
+}
+
 static json first_gguf_source(const json & model) {
     if (model.contains("gguf_sources") && model["gguf_sources"].is_array() && !model["gguf_sources"].empty()) {
         for (const auto & source : model["gguf_sources"]) {
@@ -1251,7 +1324,11 @@ static json find_installed(const json & installed, const json & model, const std
     return json::object();
 }
 
-static json make_recommendation_args(const json & system, const std::string & run_mode, const std::string & model_ref, int ctx, int threads) {
+static bool preset_should_disable_reasoning(const std::string & model_id) {
+    return is_creative_uncensored_tune(model_id);
+}
+
+static json make_recommendation_args(const json & system, const std::string & run_mode, const std::string & model_ref, int ctx, int threads, const std::string & model_id) {
     json args = json::array();
     if (local_file_exists(model_ref)) {
         args.push_back("--model");
@@ -1274,6 +1351,15 @@ static json make_recommendation_args(const json & system, const std::string & ru
     args.push_back("512");
     args.push_back("--ubatch-size");
     args.push_back("512");
+    if (preset_should_disable_reasoning(model_id)) {
+        args.push_back("--reasoning");
+        args.push_back("off");
+    } else if (is_reasoning_named(model_id)) {
+        args.push_back("--reasoning");
+        args.push_back("on");
+        args.push_back("--reasoning-budget");
+        args.push_back("4096");
+    }
 
     if (run_mode == "gpu_single") {
         args.push_back("--n-gpu-layers");
@@ -1300,6 +1386,18 @@ static json make_recommendation_args(const json & system, const std::string & ru
             args.push_back("--tensor-split");
             args.push_back(split);
         }
+    } else if (run_mode == "moe_offload") {
+        args.push_back("--n-gpu-layers");
+        args.push_back("99");
+        args.push_back("--split-mode");
+        args.push_back("layer");
+        const std::string split = tensor_split_from_system(system);
+        if (!split.empty()) {
+            args.push_back("--tensor-split");
+            args.push_back(split);
+        }
+        args.push_back("--n-cpu-moe");
+        args.push_back("999");
     } else {
         args.push_back("--n-gpu-layers");
         args.push_back("0");
@@ -1307,7 +1405,7 @@ static json make_recommendation_args(const json & system, const std::string & ru
     return args;
 }
 
-static json preset_from_plan(const json & system, const std::string & run_mode, const std::string & model_ref, int ctx, int threads) {
+static json preset_from_plan(const json & system, const std::string & run_mode, const std::string & model_ref, int ctx, int threads, const std::string & model_id) {
     json preset = {
         {"ctx_size", ctx},
         {"cache_type_k", "q8_0"},
@@ -1318,8 +1416,14 @@ static json preset_from_plan(const json & system, const std::string & run_mode, 
         {"ubatch_size", 512},
         {"load_on_startup", false},
     };
+    if (preset_should_disable_reasoning(model_id)) {
+        preset["reasoning"] = "off";
+    } else if (is_reasoning_named(model_id)) {
+        preset["reasoning"] = "on";
+        preset["reasoning_budget"] = 4096;
+    }
     if (local_file_exists(model_ref)) {
-        preset["model"] = model_ref;
+        preset["model"] = preset_model_path(model_ref);
     } else if (!model_ref.empty()) {
         preset["hf_repo"] = model_ref;
     }
@@ -1336,6 +1440,12 @@ static json preset_from_plan(const json & system, const std::string & run_mode, 
         preset["split_mode"] = "layer";
         const std::string split = tensor_split_from_system(system);
         if (!split.empty()) preset["tensor_split"] = split;
+    } else if (run_mode == "moe_offload") {
+        preset["n_gpu_layers"] = 99;
+        preset["split_mode"] = "layer";
+        const std::string split = tensor_split_from_system(system);
+        if (!split.empty()) preset["tensor_split"] = split;
+        preset["n_cpu_moe"] = 999;
     } else {
         preset["n_gpu_layers"] = 0;
     }
@@ -1347,7 +1457,8 @@ static json analyze_catalog_model(
         const json & system,
         const json & installed,
         const server_models_routes & router,
-        int target_ctx) {
+        int target_ctx,
+        const std::string & strategy) {
     const std::string id = json_value(model, "name", std::string());
     const std::string quant = json_value(model, "quantization", std::string("Q4_K_M"));
     const double params_b = params_b_from_json(model);
@@ -1357,6 +1468,7 @@ static json analyze_catalog_model(
     const double kv_gb = estimate_kv_cache_gb(model, params_b, ctx, "q8_0");
     const double overhead_gb = 0.70;
     const double required_gb = weights_gb + kv_gb + overhead_gb;
+    const auto moe_memory = moe_memory_for_quant(model, quant, kv_gb, overhead_gb);
 
     const double single_vram = json_value(system, "gpu_vram_gb", 0.0);
     const double total_vram = json_value(system, "total_gpu_vram_gb", 0.0);
@@ -1366,12 +1478,29 @@ static json analyze_catalog_model(
     std::string fit_level = "too_tight";
     std::string run_mode = "cpu_only";
     double available_gb = ram;
+    double effective_required_gb = required_gb;
     std::vector<std::string> notes;
-    if (gpu_count > 0 && required_gb <= single_vram * 0.90) {
+    double moe_offloaded_gb = 0.0;
+    if (strategy == "moe_offload" && moe_memory && gpu_count > 0 &&
+            moe_memory->first <= total_vram * 0.92 && moe_memory->second <= ram) {
+        fit_level = moe_memory->first <= total_vram * 0.75 ? "good" : "marginal";
+        run_mode = "moe_offload";
+        available_gb = total_vram;
+        effective_required_gb = moe_memory->first;
+        moe_offloaded_gb = moe_memory->second;
+        notes.push_back("MoE offload: active experts stay in VRAM; inactive experts spill to system RAM.");
+    } else if (gpu_count > 0 && required_gb <= single_vram * 0.90 && strategy != "multi_gpu") {
         fit_level = "perfect";
         run_mode = "gpu_single";
         available_gb = single_vram;
         notes.push_back("Fits comfortably on one GPU.");
+    } else if (gpu_count > 1 && strategy == "moe_offload" && moe_memory) {
+        fit_level = "too_tight";
+        run_mode = "moe_offload";
+        available_gb = total_vram;
+        effective_required_gb = moe_memory->first;
+        moe_offloaded_gb = moe_memory->second;
+        notes.push_back("MoE offload requested, but active experts or offloaded RAM exceed this machine.");
     } else if (gpu_count > 1 && required_gb <= total_vram * 0.90) {
         fit_level = "good";
         run_mode = "layer_split";
@@ -1399,12 +1528,24 @@ static json analyze_catalog_model(
         available_gb = gpu_count > 0 ? std::max(total_vram, single_vram) : ram;
         notes.push_back("Estimated memory exceeds available RAM/VRAM.");
     }
+    if (strategy == "multi_gpu" && gpu_count > 1 && run_mode == "gpu_single" && required_gb <= total_vram * 0.90) {
+        run_mode = "layer_split";
+        available_gb = total_vram;
+        fit_level = "good";
+        notes.push_back("MultiGPU mode requested; using layer split even though the model also fits on one GPU.");
+    }
+    if (strategy == "hybrid_offload" && gpu_count > 0 && run_mode != "cpu_only" && run_mode != "cpu_offload" && required_gb > single_vram * 0.90) {
+        run_mode = "cpu_offload";
+        available_gb = ram;
+        fit_level = required_gb <= ram * 0.85 ? "good" : (required_gb <= ram ? "marginal" : "too_tight");
+        notes.push_back("Hybrid offload requested; prioritizing GPU layers with CPU/RAM fallback.");
+    }
 
     const std::string use_case = infer_use_case(model);
     const double bandwidth = gpu_bandwidth_gbps(json_value(system, "gpu_name", std::string()));
     double tps = 0.1;
     if (bandwidth > 0.0 && run_mode != "cpu_only") {
-        double mode_factor = run_mode == "layer_split" ? 0.90 : (run_mode == "cpu_offload" ? 0.50 : 1.0);
+        double mode_factor = run_mode == "layer_split" ? 0.90 : (run_mode == "moe_offload" ? 0.80 : (run_mode == "cpu_offload" ? 0.50 : 1.0));
         tps = std::max(0.1, (bandwidth / std::max(0.1, params_b * quant_bpp(quant))) * 0.55 * mode_factor);
     } else {
         tps = std::max(0.1, (70.0 / std::max(0.1, params_b)) * quant_speed_multiplier(quant));
@@ -1412,14 +1553,18 @@ static json analyze_catalog_model(
 
     const double q = quality_score(model, params_b, quant, use_case);
     const double speed = std::clamp((tps / (use_case == "reasoning" ? 25.0 : 40.0)) * 100.0, 0.0, 100.0);
-    const double fit = fit_score(required_gb, available_gb);
+    const double fit = fit_score(effective_required_gb, available_gb);
     const double ctx_score = context_score(native_ctx, use_case);
     double wq = 0.45, ws = 0.30, wf = 0.15, wc = 0.10;
     if (use_case == "coding")     { wq = 0.50; ws = 0.20; wf = 0.15; wc = 0.15; }
     if (use_case == "reasoning")  { wq = 0.55; ws = 0.15; wf = 0.15; wc = 0.15; }
     if (use_case == "chat")       { wq = 0.40; ws = 0.35; wf = 0.15; wc = 0.10; }
     if (use_case == "multimodal") { wq = 0.50; ws = 0.20; wf = 0.15; wc = 0.15; }
-    const double score = std::round((q*wq + speed*ws + fit*wf + ctx_score*wc) * 10.0) / 10.0;
+    double strategy_bonus = 0.0;
+    if (strategy == "multi_gpu" && run_mode == "layer_split") strategy_bonus = 7.0;
+    if (strategy == "moe_offload" && run_mode == "moe_offload") strategy_bonus = 9.0;
+    if (strategy == "hybrid_offload" && run_mode == "cpu_offload") strategy_bonus = 5.0;
+    const double score = std::round(std::clamp(q*wq + speed*ws + fit*wf + ctx_score*wc + strategy_bonus, 0.0, 100.0) * 10.0) / 10.0;
 
     const json source = first_gguf_source(model);
     const std::string repo = json_value(source, "repo", std::string());
@@ -1456,7 +1601,10 @@ static json analyze_catalog_model(
 
     const std::string model_ref = !local_path.empty() ? local_path : download_ref;
     const int threads = json_value(system, "cpu_cores", 8);
-    const json preset = preset_from_plan(system, run_mode, model_ref, ctx, threads);
+    json preset = preset_from_plan(system, run_mode, model_ref, ctx, threads, id);
+    if (is_creative_uncensored_tune(id)) {
+        notes.push_back("Creative/uncensored finetune: not prioritized for DS4-style correctness; reasoning is disabled in the generated preset.");
+    }
 
     return {
         {"id", id},
@@ -1474,13 +1622,16 @@ static json analyze_catalog_model(
         {"score", score},
         {"score_components", {{"quality", q}, {"speed", speed}, {"fit", fit}, {"context", ctx_score}}},
         {"estimated_tps", tps},
-        {"memory_required_gb", required_gb},
+        {"memory_required_gb", effective_required_gb},
+        {"full_memory_required_gb", required_gb},
         {"memory_available_gb", available_gb},
         {"weights_gb", weights_gb},
         {"kv_cache_gb", kv_gb},
         {"overhead_gb", overhead_gb},
-        {"utilization_pct", available_gb > 0.0 ? required_gb / available_gb * 100.0 : 0.0},
+        {"moe_offloaded_gb", moe_offloaded_gb},
+        {"utilization_pct", available_gb > 0.0 ? effective_required_gb / available_gb * 100.0 : 0.0},
         {"gpu_mode", run_mode},
+        {"fit_strategy", strategy},
         {"runtime", "llama.cpp"},
         {"installed", configured},
         {"configured", configured},
@@ -1499,7 +1650,7 @@ static json analyze_catalog_model(
             {"url", std::string("https://huggingface.co/") + repo},
             {"target_dir", target_dir.string()},
         })},
-        {"recommended_args", make_recommendation_args(system, run_mode, model_ref, ctx, threads)},
+        {"recommended_args", make_recommendation_args(system, run_mode, model_ref, ctx, threads, id)},
         {"preset", preset},
     };
 }
@@ -1515,6 +1666,7 @@ static json sorted_filtered_models(
     const std::string fit_filter = lower_copy(req.get_param("min_fit", "marginal"));
     const std::string quant_filter = req.get_param("quant", "");
     const std::string search = req.get_param("search", "");
+    const std::string strategy = lower_copy(req.get_param("strategy", "balanced"));
     const int target_ctx = std::max(512, std::atoi(req.get_param("context", "8192").c_str()));
     const int min_rank = include_too_tight ? 0 : fit_rank(fit_filter.empty() ? "marginal" : fit_filter);
     int limit = std::atoi(req.get_param("limit", "300").c_str());
@@ -1529,13 +1681,22 @@ static json sorted_filtered_models(
         if (!model.is_object()) continue;
         const std::string format = lower_copy(json_value(model, "format", std::string("gguf")));
         if (format != "gguf") continue;
-        const json row = analyze_catalog_model(model, system, installed, router, target_ctx);
+        const json row = analyze_catalog_model(model, system, installed, router, target_ctx, strategy);
         const std::string row_use_case = json_value(row, "use_case", std::string());
         const std::string row_fit = json_value(row, "fit_level", std::string());
         const std::string row_quant = json_value(row, "quant", std::string());
         const std::string row_id = json_value(row, "id", std::string());
         if (use_case_filter != "all" && use_case_filter != row_use_case) continue;
         if (fit_rank(row_fit) < min_rank) continue;
+        const std::string row_mode = json_value(row, "gpu_mode", std::string());
+        if (strategy == "multi_gpu") {
+            if (row_mode != "layer_split") continue;
+            const double single_vram = json_value(system, "gpu_vram_gb", 0.0);
+            const double row_required = json_value(row, "full_memory_required_gb", json_value(row, "memory_required_gb", 0.0));
+            if (single_vram > 0.0 && row_required <= single_vram * 0.85) continue;
+        }
+        if (strategy == "moe_offload" && row_mode != "moe_offload") continue;
+        if (strategy == "hybrid_offload" && row_mode != "cpu_offload") continue;
         if (!quant_filter.empty() && !contains_ci(row_quant, quant_filter)) continue;
         if (!search.empty() && !contains_ci(row_id, search)) continue;
         out.push_back(row);
@@ -1914,7 +2075,7 @@ struct server_fit_advisor_routes::impl {
             }
             entry["id"] = id;
             if (!local_path.empty()) {
-                entry["model"] = local_path;
+                entry["model"] = preset_model_path(local_path);
             } else if (!hf_ref.empty()) {
                 entry["hf_repo"] = hf_ref;
             }
@@ -1925,7 +2086,7 @@ struct server_fit_advisor_routes::impl {
                 const json system = detect_system_json();
                 const int ctx = json_value(body, "ctx_size", 8192);
                 const std::string mode = json_value(body, "gpu_mode", std::string("layer_split"));
-                entry.merge_patch(preset_from_plan(system, mode, !local_path.empty() ? local_path : hf_ref, ctx, json_value(system, "cpu_cores", 8)));
+                entry.merge_patch(preset_from_plan(system, mode, !local_path.empty() ? local_path : hf_ref, ctx, json_value(system, "cpu_cores", 8), id));
                 entry["id"] = id;
             }
             if (body.contains("alias")) {

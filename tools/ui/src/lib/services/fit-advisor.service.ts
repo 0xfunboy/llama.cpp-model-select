@@ -107,12 +107,15 @@ export interface FitAdvisorModel {
 	};
 	estimated_tps: number;
 	memory_required_gb: number;
+	full_memory_required_gb?: number;
 	memory_available_gb: number;
 	weights_gb: number;
 	kv_cache_gb: number;
 	overhead_gb: number;
+	moe_offloaded_gb?: number;
 	utilization_pct: number;
 	gpu_mode: string;
+	fit_strategy?: string;
 	runtime: string;
 	installed: boolean;
 	configured?: boolean;
@@ -144,6 +147,7 @@ export interface FitAdvisorModelsQuery {
 	min_fit?: string;
 	quant?: string;
 	search?: string;
+	strategy?: string;
 	context?: number;
 	limit?: number;
 	include_too_tight?: boolean;

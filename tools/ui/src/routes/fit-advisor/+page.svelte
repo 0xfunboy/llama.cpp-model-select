@@ -20,10 +20,11 @@
 	let isConfiguring = $state(false);
 	let error = $state('');
 	let message = $state('');
-	let useCase = $state('coding');
+	let useCase = $state('all');
 	let minFit = $state('marginal');
 	let quant = $state('');
 	let search = $state('');
+	let strategy = $state('balanced');
 	let context = $state(8192);
 	let limit = $state(300);
 	let includeTooTight = $state(false);
@@ -103,6 +104,7 @@
 				min_fit: minFit,
 				quant,
 				search,
+				strategy,
 				context,
 				limit,
 				include_too_tight: includeTooTight
@@ -368,6 +370,38 @@
 					<span>Show too tight</span>
 				</label>
 			</div>
+				<div class="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
+				<div class="flex flex-wrap gap-2">
+					<button
+						type="button"
+						class={strategy === 'balanced' ? 'h-9 rounded-md bg-primary px-3 text-xs text-primary-foreground' : 'h-9 rounded-md border px-3 text-xs hover:bg-muted'}
+						onclick={() => (strategy = 'balanced')}
+					>
+						Balanced
+					</button>
+					<button
+						type="button"
+						class={strategy === 'multi_gpu' ? 'h-9 rounded-md bg-primary px-3 text-xs text-primary-foreground' : 'h-9 rounded-md border px-3 text-xs hover:bg-muted'}
+						onclick={() => (strategy = 'multi_gpu')}
+					>
+						MultiGPU
+					</button>
+					<button
+						type="button"
+						class={strategy === 'moe_offload' ? 'h-9 rounded-md bg-primary px-3 text-xs text-primary-foreground' : 'h-9 rounded-md border px-3 text-xs hover:bg-muted'}
+						onclick={() => (strategy = 'moe_offload')}
+					>
+						MoE offload
+					</button>
+					<button
+						type="button"
+						class={strategy === 'hybrid_offload' ? 'h-9 rounded-md bg-primary px-3 text-xs text-primary-foreground' : 'h-9 rounded-md border px-3 text-xs hover:bg-muted'}
+						onclick={() => (strategy = 'hybrid_offload')}
+					>
+						Hybrid offload
+					</button>
+				</div>
+			</div>
 			<div class="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
 				<div>
 					{#if catalog}
@@ -485,6 +519,18 @@
 								<div class="text-xs text-muted-foreground">Available Pool</div>
 								<div class="mt-1 font-medium">{fmtGb(selectedModel.memory_available_gb)}</div>
 							</div>
+							{#if selectedModel.full_memory_required_gb && selectedModel.full_memory_required_gb > selectedModel.memory_required_gb + 0.1}
+								<div class="rounded-md border p-2">
+									<div class="text-xs text-muted-foreground">Full model</div>
+									<div class="mt-1 font-medium">{fmtGb(selectedModel.full_memory_required_gb)}</div>
+								</div>
+							{/if}
+							{#if selectedModel.moe_offloaded_gb && selectedModel.moe_offloaded_gb > 0}
+								<div class="rounded-md border p-2">
+									<div class="text-xs text-muted-foreground">MoE RAM offload</div>
+									<div class="mt-1 font-medium">{fmtGb(selectedModel.moe_offloaded_gb)}</div>
+								</div>
+							{/if}
 							<div class="rounded-md border p-2">
 								<div class="text-xs text-muted-foreground">State</div>
 								<div class="mt-1 font-medium">{selectedStatus}</div>
