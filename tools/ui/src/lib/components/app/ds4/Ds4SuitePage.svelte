@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
-	import { Activity, BarChart3, ClipboardCheck, RefreshCw, Square, SquareCheck, X } from '@lucide/svelte';
+	import { Activity, BarChart3, ClipboardCheck, RefreshCw, Square, SquareCheck, Trophy, X } from '@lucide/svelte';
 	import {
 		Ds4Service,
 		type Ds4Event,
@@ -40,6 +40,26 @@
 		gen_tokens?: number;
 	}
 
+	interface EvalModelSummary {
+		model: string;
+		pass: number;
+		fail: number;
+		total: number;
+		score: number;
+		avg_tokens_per_second: number;
+	}
+
+	interface EvalSectorSummary extends EvalModelSummary {
+		sector: string;
+	}
+
+	interface EvalRaceSectorSummary {
+		sector: string;
+		left?: EvalSectorSummary;
+		right?: EvalSectorSummary;
+		delta: number;
+	}
+
 	let { mode }: Props = $props();
 
 	const isEval = $derived(mode === 'eval');
@@ -71,6 +91,10 @@
 	let benchRows = $state<BenchRow[]>([]);
 	let otherActiveJob = $state<Ds4JobSnapshot | null>(null);
 	let streamController: AbortController | null = null;
+	let reportMode = $state<'single' | 'race'>('single');
+	let singleReportModel = $state('');
+	let raceModelA = $state('');
+	let raceModelB = $state('');
 
 	let maxTokens = $state(16000);
 	let thinkingBudget = $state(16000);
@@ -102,6 +126,14 @@
 		}
 		return benchRows;
 	});
+	const reportModels = $derived.by(() => uniqueModels(displayEvalRows));
+	const modelReportRows = $derived.by(() => buildModelSummaries(displayEvalRows));
+	const sectorReportRows = $derived.by(() => buildSectorSummaries(displayEvalRows));
+	const singleModelSummary = $derived.by(() => modelReportRows.find((row) => row.model === singleReportModel));
+	const singleSectorRows = $derived.by(() => sectorReportRows.filter((row) => row.model === singleReportModel));
+	const raceModelSummaryA = $derived.by(() => modelReportRows.find((row) => row.model === raceModelA));
+	const raceModelSummaryB = $derived.by(() => modelReportRows.find((row) => row.model === raceModelB));
+	const raceSectorRows = $derived.by(() => buildRaceSectorRows(sectorReportRows, raceModelA, raceModelB));
 	const evalPass = $derived.by(() => {
 		if (activeReport?.kind === 'eval') return summaryNumber('pass');
 		return evalRows.filter((row) => row.pass).length;
@@ -129,6 +161,31 @@
 		return () => {
 			streamController?.abort();
 		};
+	});
+
+	$effect(() => {
+		const ids = reportModels;
+		if (ids.length === 0) {
+			singleReportModel = '';
+			raceModelA = '';
+			raceModelB = '';
+			reportMode = 'single';
+			return;
+		}
+
+		if (!ids.includes(singleReportModel)) {
+			singleReportModel = ids[0];
+		}
+		if (!ids.includes(raceModelA)) {
+			raceModelA = ids[0];
+		}
+		if (ids.length > 1 && (!ids.includes(raceModelB) || raceModelB === raceModelA)) {
+			raceModelB = ids.find((id) => id !== raceModelA) ?? ids[1];
+		}
+		if (ids.length < 2) {
+			raceModelB = '';
+			reportMode = 'single';
+		}
 	});
 
 	async function initialize() {
@@ -193,6 +250,108 @@
 
 	function num(value: unknown): number {
 		return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+	}
+
+	function scorePercent(pass: number, total: number): number {
+		return total > 0 ? Math.round((pass / total) * 100) : 0;
+	}
+
+	function formatDelta(value: number): string {
+		if (!Number.isFinite(value)) return '0%';
+		return (value > 0 ? '+' : '') + Math.round(value) + '%';
+	}
+
+	function uniqueModels(rows: EvalRow[]): string[] {
+		const seen = new Set<string>();
+		for (const row of rows) {
+			const model = String(row.model || '').trim();
+			if (model) seen.add(model);
+		}
+		return [...seen].sort((a, b) => a.localeCompare(b));
+	}
+
+	function sectorsForRow(row: EvalRow): string[] {
+		const source = String(row.source || '').trim().toLowerCase();
+		if (source === 'compsec') return ['Cybersecurity'];
+
+		const raw = String(row.domain || '').trim();
+		if (!raw) return ['General'];
+		const sectors = raw
+			.split(',')
+			.map((item) => item.trim())
+			.filter(Boolean);
+		return sectors.length > 0 ? sectors : ['General'];
+	}
+
+	function addSummary(map: Map<string, EvalSectorSummary>, key: string, model: string, pass: boolean, tokensPerSecond: number, sector = '') {
+		const row =
+			map.get(key) ??
+			({
+				model,
+				sector,
+				pass: 0,
+				fail: 0,
+				total: 0,
+				score: 0,
+				avg_tokens_per_second: 0
+			} satisfies EvalSectorSummary);
+		if (pass) row.pass += 1;
+		else row.fail += 1;
+		row.total += 1;
+		row.avg_tokens_per_second += tokensPerSecond;
+		map.set(key, row);
+	}
+
+	function finalizeSummary<T extends EvalModelSummary>(row: T): T {
+		row.score = scorePercent(row.pass, row.total);
+		row.avg_tokens_per_second = row.total > 0 ? row.avg_tokens_per_second / row.total : 0;
+		return row;
+	}
+
+	function buildModelSummaries(rows: EvalRow[]): EvalModelSummary[] {
+		const byModel = new Map<string, EvalSectorSummary>();
+		for (const row of rows) {
+			const model = String(row.model || '').trim();
+			if (!model) continue;
+			addSummary(byModel, model, model, row.pass === true, num(row.tokens_per_second));
+		}
+		return [...byModel.values()]
+			.map(finalizeSummary)
+			.sort((a, b) => b.score - a.score || b.total - a.total || a.model.localeCompare(b.model));
+	}
+
+	function buildSectorSummaries(rows: EvalRow[]): EvalSectorSummary[] {
+		const bySector = new Map<string, EvalSectorSummary>();
+		for (const row of rows) {
+			const model = String(row.model || '').trim();
+			if (!model) continue;
+			for (const sector of sectorsForRow(row)) {
+				addSummary(bySector, model + '\t' + sector, model, row.pass === true, num(row.tokens_per_second), sector);
+			}
+		}
+		return [...bySector.values()]
+			.map(finalizeSummary)
+			.sort((a, b) => a.sector.localeCompare(b.sector) || a.model.localeCompare(b.model));
+	}
+
+	function buildRaceSectorRows(rows: EvalSectorSummary[], leftModel: string, rightModel: string): EvalRaceSectorSummary[] {
+		if (!leftModel || !rightModel || leftModel === rightModel) return [];
+		const sectors = new Set<string>();
+		for (const row of rows) {
+			if (row.model === leftModel || row.model === rightModel) sectors.add(row.sector);
+		}
+		return [...sectors]
+			.sort((a, b) => a.localeCompare(b))
+			.map((sector) => {
+				const left = rows.find((row) => row.model === leftModel && row.sector === sector);
+				const right = rows.find((row) => row.model === rightModel && row.sector === sector);
+				return {
+					sector,
+					left,
+					right,
+					delta: (left?.score ?? 0) - (right?.score ?? 0)
+				};
+			});
 	}
 
 	function basename(path?: string): string {
@@ -735,6 +894,169 @@
 						{/if}
 					</tbody>
 				</table>
+			</div>
+
+			<div class="mt-4 rounded-md border bg-muted/20 p-4">
+				<div class="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+					<div class="flex items-center gap-2">
+						<Trophy class="h-4 w-4" />
+						<div>
+							<h3 class="text-sm font-semibold">Model Report</h3>
+							<p class="text-xs text-muted-foreground">
+								{reportModels.length > 1 ? 'Single model card or two-model race, grouped by tested sector.' : 'Single model card grouped by tested sector.'}
+							</p>
+						</div>
+					</div>
+
+					<div class="flex flex-col gap-2 sm:flex-row sm:items-center">
+						<div class="inline-grid h-10 grid-cols-2 overflow-hidden rounded-md border bg-background text-sm">
+							<button
+								type="button"
+								class={reportMode === 'single' ? 'bg-primary px-3 text-primary-foreground' : 'px-3 hover:bg-muted'}
+								onclick={() => (reportMode = 'single')}
+							>
+								Single
+							</button>
+							<button
+								type="button"
+								class={reportMode === 'race' ? 'bg-primary px-3 text-primary-foreground disabled:opacity-50' : 'px-3 hover:bg-muted disabled:opacity-50'}
+								disabled={reportModels.length < 2}
+								onclick={() => (reportMode = 'race')}
+							>
+								Race
+							</button>
+						</div>
+
+						{#if reportMode === 'single'}
+							<select bind:value={singleReportModel} class="h-10 min-w-64 rounded-md border bg-background px-3 text-sm" disabled={reportModels.length === 0}>
+								{#each reportModels as model}
+									<option value={model}>{model}</option>
+								{/each}
+							</select>
+						{:else}
+							<select bind:value={raceModelA} class="h-10 min-w-56 rounded-md border bg-background px-3 text-sm">
+								{#each reportModels as model}
+									<option value={model} disabled={model === raceModelB}>{model}</option>
+								{/each}
+							</select>
+							<select bind:value={raceModelB} class="h-10 min-w-56 rounded-md border bg-background px-3 text-sm">
+								{#each reportModels as model}
+									<option value={model} disabled={model === raceModelA}>{model}</option>
+								{/each}
+							</select>
+						{/if}
+					</div>
+				</div>
+
+				{#if reportModels.length === 0}
+					<div class="mt-4 rounded-md border bg-background px-3 py-6 text-sm text-muted-foreground">No model report yet.</div>
+				{:else if reportMode === 'single'}
+					<div class="mt-4 grid gap-3 md:grid-cols-4">
+						<div class="rounded-md border bg-background p-3">
+							<div class="text-xs text-muted-foreground">Model</div>
+							<div class="mt-1 truncate text-lg font-semibold">{singleReportModel}</div>
+						</div>
+						<div class="rounded-md border bg-background p-3">
+							<div class="text-xs text-muted-foreground">Score</div>
+							<div class="mt-1 text-2xl font-semibold">{singleModelSummary?.score ?? 0}%</div>
+						</div>
+						<div class="rounded-md border bg-background p-3">
+							<div class="text-xs text-muted-foreground">Pass / total</div>
+							<div class="mt-1 text-2xl font-semibold">{singleModelSummary?.pass ?? 0}/{singleModelSummary?.total ?? 0}</div>
+						</div>
+						<div class="rounded-md border bg-background p-3">
+							<div class="text-xs text-muted-foreground">Avg tok/s</div>
+							<div class="mt-1 text-2xl font-semibold">{num(singleModelSummary?.avg_tokens_per_second).toFixed(1)}</div>
+						</div>
+					</div>
+
+					<div class="mt-4 overflow-auto rounded-md border bg-background">
+						<table class="w-full min-w-[46rem] text-left text-xs">
+							<thead class="bg-background text-muted-foreground">
+								<tr>
+									<th class="px-3 py-2">Sector</th>
+									<th class="px-3 py-2">Score</th>
+									<th class="px-3 py-2">Pass</th>
+									<th class="px-3 py-2">Fail</th>
+									<th class="px-3 py-2">Cases</th>
+									<th class="px-3 py-2">Avg tok/s</th>
+								</tr>
+							</thead>
+							<tbody>
+								{#each singleSectorRows as row}
+									<tr class="border-t">
+										<td class="px-3 py-2 font-medium">{row.sector}</td>
+										<td class="px-3 py-2">
+											<div class="flex items-center gap-2">
+												<div class="h-2 w-28 overflow-hidden rounded-full bg-red-500/20">
+													<div class="h-full bg-emerald-500" style={'width: ' + row.score + '%'}></div>
+												</div>
+												<span>{row.score}%</span>
+											</div>
+										</td>
+										<td class="px-3 py-2 text-emerald-500">{row.pass}</td>
+										<td class="px-3 py-2 text-red-500">{row.fail}</td>
+										<td class="px-3 py-2">{row.total}</td>
+										<td class="px-3 py-2">{row.avg_tokens_per_second.toFixed(1)}</td>
+									</tr>
+								{/each}
+							</tbody>
+						</table>
+					</div>
+				{:else}
+					<div class="mt-4 grid gap-3 md:grid-cols-3">
+						<div class="rounded-md border bg-background p-3">
+							<div class="text-xs text-muted-foreground">{raceModelA}</div>
+							<div class="mt-1 text-2xl font-semibold">{raceModelSummaryA?.score ?? 0}%</div>
+							<div class="text-xs text-muted-foreground">{raceModelSummaryA?.pass ?? 0}/{raceModelSummaryA?.total ?? 0} pass</div>
+						</div>
+						<div class="rounded-md border bg-background p-3">
+							<div class="text-xs text-muted-foreground">Leader</div>
+							<div class="mt-1 truncate text-2xl font-semibold">
+								{#if (raceModelSummaryA?.score ?? 0) === (raceModelSummaryB?.score ?? 0)}
+									Tie
+								{:else if (raceModelSummaryA?.score ?? 0) > (raceModelSummaryB?.score ?? 0)}
+									{raceModelA}
+								{:else}
+									{raceModelB}
+								{/if}
+							</div>
+							<div class="text-xs text-muted-foreground">
+								Delta {formatDelta((raceModelSummaryA?.score ?? 0) - (raceModelSummaryB?.score ?? 0))}
+							</div>
+						</div>
+						<div class="rounded-md border bg-background p-3">
+							<div class="text-xs text-muted-foreground">{raceModelB}</div>
+							<div class="mt-1 text-2xl font-semibold">{raceModelSummaryB?.score ?? 0}%</div>
+							<div class="text-xs text-muted-foreground">{raceModelSummaryB?.pass ?? 0}/{raceModelSummaryB?.total ?? 0} pass</div>
+						</div>
+					</div>
+
+					<div class="mt-4 overflow-auto rounded-md border bg-background">
+						<table class="w-full min-w-[64rem] text-left text-xs">
+							<thead class="bg-background text-muted-foreground">
+								<tr>
+									<th class="px-3 py-2">Sector</th>
+									<th class="px-3 py-2">{raceModelA}</th>
+									<th class="px-3 py-2">{raceModelB}</th>
+									<th class="px-3 py-2">Delta</th>
+									<th class="px-3 py-2">Cases</th>
+								</tr>
+							</thead>
+							<tbody>
+								{#each raceSectorRows as row}
+									<tr class="border-t">
+										<td class="px-3 py-2 font-medium">{row.sector}</td>
+										<td class="px-3 py-2">{row.left?.score ?? 0}% · {row.left?.pass ?? 0}/{row.left?.total ?? 0}</td>
+										<td class="px-3 py-2">{row.right?.score ?? 0}% · {row.right?.pass ?? 0}/{row.right?.total ?? 0}</td>
+										<td class={row.delta >= 0 ? 'px-3 py-2 font-medium text-emerald-500' : 'px-3 py-2 font-medium text-red-500'}>{formatDelta(row.delta)}</td>
+										<td class="px-3 py-2">{row.left?.total ?? 0} / {row.right?.total ?? 0}</td>
+									</tr>
+								{/each}
+							</tbody>
+						</table>
+					</div>
+				{/if}
 			</div>
 		{:else}
 			<div class="grid gap-3 md:grid-cols-3">
