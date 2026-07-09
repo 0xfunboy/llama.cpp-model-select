@@ -3,6 +3,7 @@
 #include "server-models.h"
 #include "server-ds4.h"
 #include "server-fit-advisor.h"
+#include "server-caliber-advisor.h"
 #include "server-cors-proxy.h"
 #include "server-stream.h"
 #include "server-tools.h"
@@ -160,6 +161,7 @@ int llama_server(int argc, char ** argv) {
     std::optional<server_models_routes> models_routes{};
     std::optional<server_ds4_routes> ds4_routes{};
     std::optional<server_fit_advisor_routes> fit_advisor_routes{};
+    std::optional<server_caliber_advisor_routes> caliber_advisor_routes{};
     if (is_router_server) {
         // setup server instances manager
         try {
@@ -236,6 +238,20 @@ int llama_server(int argc, char ** argv) {
         ctx_http.get ("/api/fit-advisor/downloads",       ex_wrapper(fit_advisor_routes->get_downloads));
         ctx_http.get ("/api/fit-advisor/downloads/sse",   ex_wrapper(fit_advisor_routes->get_download_events));
         ctx_http.post("/api/fit-advisor/configure",       ex_wrapper(fit_advisor_routes->post_configure));
+
+        caliber_advisor_routes.emplace(*models_routes);
+        ctx_http.get ("/api/caliber-advisor/system",        ex_wrapper(caliber_advisor_routes->get_system));
+        ctx_http.get ("/api/caliber-advisor/models",        ex_wrapper(caliber_advisor_routes->get_models));
+        ctx_http.post("/api/caliber-advisor/plan",          ex_wrapper(caliber_advisor_routes->post_plan));
+        ctx_http.post("/api/caliber-advisor/sweep",         ex_wrapper(caliber_advisor_routes->post_sweep));
+        ctx_http.get ("/api/caliber-advisor/sweep/events",  ex_wrapper(caliber_advisor_routes->get_sweep_events));
+        ctx_http.get ("/api/caliber-advisor/sweep/status",  ex_wrapper(caliber_advisor_routes->get_sweep_status));
+        ctx_http.get ("/api/caliber-advisor/results",       ex_wrapper(caliber_advisor_routes->get_results));
+        ctx_http.get ("/api/caliber-advisor/reports",       ex_wrapper(caliber_advisor_routes->get_reports));
+        ctx_http.get ("/api/caliber-advisor/report",        ex_wrapper(caliber_advisor_routes->get_report));
+        ctx_http.get ("/api/caliber-advisor/reports/:id",   ex_wrapper(caliber_advisor_routes->get_report));
+        ctx_http.del ("/api/caliber-advisor/reports/:id",   ex_wrapper(caliber_advisor_routes->delete_report));
+        ctx_http.post("/api/caliber-advisor/configure",     ex_wrapper(caliber_advisor_routes->post_configure));
     }
 
     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)

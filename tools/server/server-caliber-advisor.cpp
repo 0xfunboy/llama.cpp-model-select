@@ -1,0 +1,477 @@
+#include "server-caliber-advisor.h"
+
+#include "caliber-plan.h"
+#include "caliber-scoring.h"
+#include "server-common.h"
+#include "server-models.h"
+
+#include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <cctype>
+#include <filesystem>
+#include <fstream>
+#include <mutex>
+#include <sstream>
+#include <thread>
+
+#ifndef LLAMA_CALIBER_REPORTS_DIR
+#define LLAMA_CALIBER_REPORTS_DIR "tools/ui/static/reports/caliber"
+#endif
+
+namespace {
+
+using json = nlohmann::ordered_json;
+
+struct caliber_event {
+    uint64_t seq = 0;
+    std::string event;
+    json data;
+};
+
+struct caliber_job {
+    std::string id;
+    std::string status = "queued";
+    std::string error;
+    std::string report_id;
+    int current = 0;
+    int total = 0;
+    bool finished = false;
+    uint64_t next_seq = 1;
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<caliber_event> events;
+};
+
+static std::filesystem::path reports_dir() {
+    return std::filesystem::path(LLAMA_CALIBER_REPORTS_DIR);
+}
+
+static std::string read_text_file(const std::filesystem::path & path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) throw std::runtime_error("failed to read " + path.string());
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
+}
+
+static void write_text_file(const std::filesystem::path & path, const std::string & text) {
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) throw std::runtime_error("failed to write " + path.string());
+    out << text;
+}
+
+static std::string isoish_timestamp() {
+    using namespace std::chrono;
+    const auto now = system_clock::now();
+    const std::time_t t = system_clock::to_time_t(now);
+    std::tm tm{};
+    gmtime_r(&t, &tm);
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
+    return buf;
+}
+
+static std::string slugify(std::string value) {
+    std::string out;
+    for (char c : value) {
+        if (std::isalnum((unsigned char) c)) out.push_back((char) std::tolower(c));
+        else if (c == '-' || c == '_' || c == '.') out.push_back(c);
+        else if (!out.empty() && out.back() != '-') out.push_back('-');
+    }
+    while (!out.empty() && out.back() == '-') out.pop_back();
+    return out.empty() ? "caliber" : out;
+}
+
+static void res_ok(server_http_res_ptr & res, const json & data) {
+    res->status = 200;
+    res->content_type = "application/json; charset=utf-8";
+    res->data = safe_json_to_str(data);
+}
+
+static void res_err(server_http_res_ptr & res, const std::string & message, int code = 400) {
+    res->status = code;
+    res->content_type = "application/json; charset=utf-8";
+    res->data = safe_json_to_str({{"error", {{"message", message}, {"code", code}}}});
+}
+
+static std::string model_path_from_meta(const server_model_meta & meta) {
+    std::string path;
+    if (meta.preset.get_option("LLAMA_ARG_MODEL", path)) return path;
+    return "";
+}
+
+static std::string hf_repo_from_meta(const server_model_meta & meta) {
+    std::string repo;
+    if (meta.preset.get_option("LLAMA_ARG_HF_REPO", repo)) return repo;
+    return "";
+}
+
+static json model_meta_json(const server_model_meta & meta) {
+    const std::string path = model_path_from_meta(meta);
+    json out = {
+        {"id", meta.name},
+        {"name", meta.name},
+        {"source", server_model_source_to_string(meta.source)},
+        {"status", server_model_status_to_string(meta.status)},
+        {"path", path.empty() ? json(nullptr) : json(path)},
+        {"hf_repo", hf_repo_from_meta(meta).empty() ? json(nullptr) : json(hf_repo_from_meta(meta))},
+        {"tags", json::array()},
+    };
+    for (const auto & tag : meta.tags) out["tags"].push_back(tag);
+    if (!path.empty() && std::filesystem::exists(path)) {
+        try {
+            out["plan_meta"] = caliber::read_gguf_plan_meta(path);
+        } catch (...) {
+            out["plan_meta_error"] = "failed to read GGUF metadata";
+        }
+    }
+    return out;
+}
+
+static json default_plan_cfg() {
+    return {
+        {"hardware", {
+            {"vram_budget_mib", 49152},
+            {"vram_driver_usable_mib", 24576},
+            {"cpu_cores_physical", (int) std::max(1u, std::thread::hardware_concurrency() / 2)},
+            {"cpu_threads_logical", (int) std::max(1u, std::thread::hardware_concurrency())},
+            {"system_ram_available_mib", 0},
+        }},
+        {"planning", {
+            {"overhead_mib", 1200},
+            {"moecpu_sweep", {0, 8, 16, 24, 32}},
+            {"offload_sweep", {20, 28, 36, 48, 60, 80}},
+            {"kv_rescue", {{"enabled", true}, {"min_context_tokens", 65536}, {"kv_k", "q4_0"}, {"kv_v", "q4_0"}}},
+            {"workload_sweeps", {{"context_reserve_tokens", 512}, {"kv_fill_ratios", {0.25, 0.5, 0.75, 0.9}}, {"prefill_micro_tokens", {2048}}, {"prefill_ratios", {0.25, 0.9}}}},
+        }},
+        {"bench", {{"n_predict", 128}}},
+        {"context_candidates", {{{"ctx", 8192}, {"kv", "q8_0"}}, {{"ctx", 32768}, {"kv", "q8_0"}}, {{"ctx", 131072}, {"kv", "q8_0"}}}},
+        {"max_context_cap", 262144},
+        {"base_args", "--flash-attn auto --parallel 1 --batch-size 512 --ubatch-size 512"},
+    };
+}
+
+static json merge_cfg(json base, const json & patch) {
+    if (patch.is_object()) base.merge_patch(patch);
+    return base;
+}
+
+static json report_summary(const json & report, const std::filesystem::path & path) {
+    return {
+        {"id", json_value(report, "id", path.stem().string())},
+        {"created_at", json_value(report, "created_at", std::string())},
+        {"status", json_value(report, "status", std::string())},
+        {"model", json_value(report, "model", std::string())},
+        {"plan_items", report.contains("plan") && report["plan"].is_array() ? report["plan"].size() : 0},
+        {"rows", report.contains("rows") && report["rows"].is_array() ? report["rows"].size() : 0},
+        {"path", path.string()},
+    };
+}
+
+} // namespace
+
+struct server_caliber_advisor_routes::impl {
+    server_models_routes & router;
+    std::mutex jobs_mutex;
+    std::map<std::string, std::shared_ptr<caliber_job>> jobs;
+
+    explicit impl(server_models_routes & router) : router(router) {}
+
+    void publish(const std::shared_ptr<caliber_job> & job, const std::string & event, json data) {
+        std::lock_guard<std::mutex> lock(job->mutex);
+        data["job_id"] = job->id;
+        data["status"] = job->status;
+        data["current"] = job->current;
+        data["total"] = job->total;
+        data["ts"] = isoish_timestamp();
+        caliber_event ev;
+        ev.seq = job->next_seq++;
+        ev.event = event;
+        ev.data = std::move(data);
+        ev.data["seq"] = ev.seq;
+        job->events.push_back(std::move(ev));
+        while (job->events.size() > 200) job->events.pop_front();
+        job->cv.notify_all();
+    }
+
+    std::vector<json> model_plan_metas(const json & body) {
+        std::vector<json> metas;
+        const std::string requested = json_value(body, "model", json_value(body, "id", std::string()));
+        const std::string requested_path = json_value(body, "path", json_value(body, "model_path", std::string()));
+        if (!requested_path.empty()) {
+            metas.push_back(caliber::read_gguf_plan_meta(requested_path));
+            return metas;
+        }
+        for (const auto & meta : router.models.get_all_meta()) {
+            if (!requested.empty() && requested != meta.name) continue;
+            const std::string path = model_path_from_meta(meta);
+            if (path.empty() || !std::filesystem::exists(path)) continue;
+            metas.push_back(caliber::read_gguf_plan_meta(path));
+        }
+        return metas;
+    }
+
+    json build_plan_payload(const json & body) {
+        const auto metas = model_plan_metas(body);
+        const json cfg = merge_cfg(default_plan_cfg(), json_value(body, "cfg", json::object()));
+        const json opts = json_value(body, "opts", json::object());
+        const auto items = caliber::invoke_plan(metas, cfg, {}, json::object(), opts);
+        json plan = json::array();
+        for (const auto & item : items) plan.push_back(item);
+        return {{"cfg", cfg}, {"models", metas}, {"plan", plan}, {"plan_count", plan.size()}};
+    }
+
+    server_http_res_ptr handle_system(const server_http_req &) {
+        auto res = std::make_unique<server_http_res>();
+        res_ok(res, {{"module", "caliber-advisor"}, {"reports_dir", reports_dir().string()}, {"default_cfg", default_plan_cfg()}});
+        return res;
+    }
+
+    server_http_res_ptr handle_models(const server_http_req & req) {
+        if (!req.get_param("reload").empty()) router.models.load_models();
+        auto res = std::make_unique<server_http_res>();
+        json models = json::array();
+        for (const auto & meta : router.models.get_all_meta()) models.push_back(model_meta_json(meta));
+        res_ok(res, {{"object", "list"}, {"data", models}});
+        return res;
+    }
+
+    server_http_res_ptr handle_plan(const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        const json body = req.body.empty() ? json::object() : json::parse(req.body);
+        json payload = build_plan_payload(body);
+        payload["object"] = "caliber.plan";
+        res_ok(res, payload);
+        return res;
+    }
+
+    server_http_res_ptr handle_sweep(const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        const json body = req.body.empty() ? json::object() : json::parse(req.body);
+        auto job = std::make_shared<caliber_job>();
+        job->id = slugify("caliber-" + isoish_timestamp() + "-" + std::to_string(jobs.size() + 1));
+        {
+            std::lock_guard<std::mutex> lock(jobs_mutex);
+            jobs[job->id] = job;
+        }
+        publish(job, "queued", json::object());
+        std::thread([this, job, body]() {
+            try {
+                {
+                    std::lock_guard<std::mutex> lock(job->mutex);
+                    job->status = "running";
+                }
+                publish(job, "started", json::object());
+                json payload = build_plan_payload(body);
+                job->total = (int) payload["plan"].size();
+                job->current = job->total;
+                const std::string model_name = payload["models"].is_array() && !payload["models"].empty()
+                    ? json_value(payload["models"][0], "model", std::string("local"))
+                    : std::string("local");
+                const std::string report_id = slugify(model_name + "-" + isoish_timestamp());
+                json report = {
+                    {"id", report_id},
+                    {"created_at", isoish_timestamp()},
+                    {"status", "planned"},
+                    {"model", model_name},
+                    {"note", "Planner report persisted; real benchmark runner attaches measured rows in the next server slice pass."},
+                    {"cfg", payload["cfg"]},
+                    {"models", payload["models"]},
+                    {"plan", payload["plan"]},
+                    {"rows", json::array()},
+                    {"winners", json::object()},
+                };
+                write_text_file(reports_dir() / (report_id + ".json"), report.dump(2) + "\n");
+                {
+                    std::lock_guard<std::mutex> lock(job->mutex);
+                    job->status = "completed";
+                    job->finished = true;
+                    job->report_id = report_id;
+                }
+                publish(job, "report", {{"report_id", report_id}, {"plan_count", payload["plan"].size()}});
+                publish(job, "done", {{"report_id", report_id}});
+            } catch (const std::exception & e) {
+                {
+                    std::lock_guard<std::mutex> lock(job->mutex);
+                    job->status = "failed";
+                    job->error = e.what();
+                    job->finished = true;
+                }
+                publish(job, "error", {{"error", e.what()}});
+            }
+        }).detach();
+        res_ok(res, {{"success", true}, {"job_id", job->id}, {"status", "queued"}});
+        return res;
+    }
+
+    server_http_res_ptr handle_sweep_status(const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        const std::string id = req.get_param("id");
+        std::shared_ptr<caliber_job> job;
+        {
+            std::lock_guard<std::mutex> lock(jobs_mutex);
+            if (!id.empty() && jobs.count(id)) job = jobs[id];
+            else if (!jobs.empty()) job = jobs.rbegin()->second;
+        }
+        if (!job) {
+            res_ok(res, {{"status", "idle"}});
+            return res;
+        }
+        std::lock_guard<std::mutex> lock(job->mutex);
+        res_ok(res, {{"job_id", job->id}, {"status", job->status}, {"error", job->error}, {"current", job->current}, {"total", job->total}, {"report_id", job->report_id}, {"finished", job->finished}});
+        return res;
+    }
+
+    server_http_res_ptr handle_sweep_events(const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        const std::string id = req.get_param("id");
+        std::shared_ptr<caliber_job> job;
+        {
+            std::lock_guard<std::mutex> lock(jobs_mutex);
+            if (!id.empty() && jobs.count(id)) job = jobs[id];
+            else if (!jobs.empty()) job = jobs.rbegin()->second;
+        }
+        if (!job) {
+            res->content_type = "text/event-stream";
+            res->data = "event: idle\ndata: {\"status\":\"idle\"}\n\n";
+            return res;
+        }
+        uint64_t since = 0;
+        try { since = req.get_param("since").empty() ? 0 : (uint64_t) std::stoull(req.get_param("since")); } catch (...) { since = 0; }
+        res->content_type = "text/event-stream";
+        res->headers["Cache-Control"] = "no-cache";
+        res->headers["X-Accel-Buffering"] = "no";
+        res->next = [job, since, &req](std::string & output) mutable {
+            std::unique_lock<std::mutex> lock(job->mutex);
+            job->cv.wait_for(lock, std::chrono::seconds(2), [&]() {
+                if (req.should_stop()) return true;
+                for (const auto & ev : job->events) if (ev.seq > since) return true;
+                return false;
+            });
+            if (req.should_stop()) return false;
+            for (const auto & ev : job->events) {
+                if (ev.seq <= since) continue;
+                since = ev.seq;
+                output = "event: " + ev.event + "\n";
+                output += "data: " + safe_json_to_str(ev.data) + "\n\n";
+                return true;
+            }
+            output = ": keepalive\n\n";
+            return true;
+        };
+        return res;
+    }
+
+    server_http_res_ptr handle_reports(const server_http_req &) {
+        auto res = std::make_unique<server_http_res>();
+        std::filesystem::create_directories(reports_dir());
+        json reports = json::array();
+        for (const auto & entry : std::filesystem::directory_iterator(reports_dir())) {
+            if (!entry.is_regular_file() || entry.path().extension() != ".json") continue;
+            try {
+                reports.push_back(report_summary(json::parse(read_text_file(entry.path())), entry.path()));
+            } catch (...) {}
+        }
+        res_ok(res, {{"object", "list"}, {"data", reports}});
+        return res;
+    }
+
+    server_http_res_ptr handle_report(const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        std::string id = req.get_param("id");
+        if (id.empty()) id = req.get_param("report_id");
+        if (id.empty()) {
+            res_err(res, "report id is required");
+            return res;
+        }
+        const auto path = reports_dir() / (slugify(id) + ".json");
+        if (!std::filesystem::exists(path)) {
+            res_err(res, "report not found", 404);
+            return res;
+        }
+        res_ok(res, json::parse(read_text_file(path)));
+        return res;
+    }
+
+    server_http_res_ptr handle_delete_report(const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        const std::string id = req.get_param("id");
+        if (id.empty()) {
+            res_err(res, "report id is required");
+            return res;
+        }
+        const auto path = reports_dir() / (slugify(id) + ".json");
+        bool removed = false;
+        if (std::filesystem::exists(path)) removed = std::filesystem::remove(path);
+        res_ok(res, {{"success", removed}, {"id", id}});
+        return res;
+    }
+
+    server_http_res_ptr handle_results(const server_http_req &) {
+        auto res = std::make_unique<server_http_res>();
+        std::filesystem::create_directories(reports_dir());
+        json all_rows = json::array();
+        json reports = json::array();
+        for (const auto & entry : std::filesystem::directory_iterator(reports_dir())) {
+            if (!entry.is_regular_file() || entry.path().extension() != ".json") continue;
+            try {
+                json report = json::parse(read_text_file(entry.path()));
+                reports.push_back(report_summary(report, entry.path()));
+                if (report.contains("rows") && report["rows"].is_array()) {
+                    for (const auto & row : report["rows"]) all_rows.push_back(row);
+                }
+            } catch (...) {}
+        }
+        std::vector<json> rows;
+        for (const auto & row : all_rows) rows.push_back(row);
+        json winners = json::object();
+        for (const std::string profile : {"speed", "efficiency", "safety", "overall"}) {
+            json grouped = json::object();
+            for (const auto & [model, winner] : caliber::group_winners(rows, caliber::winner_profile_from_string(profile))) grouped[model] = winner;
+            winners[profile] = grouped;
+        }
+        res_ok(res, {{"reports", reports}, {"rows", all_rows}, {"winners", winners}});
+        return res;
+    }
+
+    server_http_res_ptr handle_configure(const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        json body = req.body.empty() ? json::object() : json::parse(req.body);
+        const std::string model = json_value(body, "model", json_value(body, "model_id", std::string()));
+        if (model.empty()) {
+            res_err(res, "configure requires model/model_id");
+            return res;
+        }
+        if (!router.models.has_model(model)) {
+            res_err(res, "model not found", 404);
+            return res;
+        }
+        const bool load_now = json_value(body, "load_now", false);
+        if (load_now) router.models.load(model);
+        res_ok(res, {{"success", true}, {"model", model}, {"loaded", load_now}});
+        return res;
+    }
+};
+
+server_caliber_advisor_routes::server_caliber_advisor_routes(server_models_routes & router)
+        : pimpl(std::make_shared<impl>(router)) {
+    init_routes();
+}
+
+server_caliber_advisor_routes::~server_caliber_advisor_routes() = default;
+
+void server_caliber_advisor_routes::init_routes() {
+    get_system = [p = pimpl](const server_http_req & req) { return p->handle_system(req); };
+    get_models = [p = pimpl](const server_http_req & req) { return p->handle_models(req); };
+    post_plan = [p = pimpl](const server_http_req & req) { return p->handle_plan(req); };
+    post_sweep = [p = pimpl](const server_http_req & req) { return p->handle_sweep(req); };
+    get_sweep_events = [p = pimpl](const server_http_req & req) { return p->handle_sweep_events(req); };
+    get_sweep_status = [p = pimpl](const server_http_req & req) { return p->handle_sweep_status(req); };
+    get_results = [p = pimpl](const server_http_req & req) { return p->handle_results(req); };
+    get_reports = [p = pimpl](const server_http_req & req) { return p->handle_reports(req); };
+    get_report = [p = pimpl](const server_http_req & req) { return p->handle_report(req); };
+    delete_report = [p = pimpl](const server_http_req & req) { return p->handle_delete_report(req); };
+    post_configure = [p = pimpl](const server_http_req & req) { return p->handle_configure(req); };
+}

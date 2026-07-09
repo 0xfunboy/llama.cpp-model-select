@@ -40,6 +40,8 @@ add_library(${TARGET}
     caliber-plan.h
     caliber-scoring.cpp
     caliber-scoring.h
+    server-caliber-advisor.cpp
+    server-caliber-advisor.h
     server.cpp
     server-ds4.cpp
     server-ds4.h
@@ -54,6 +56,7 @@ set_target_properties(${TARGET} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 target_compile_definitions(${TARGET} PRIVATE
     LLAMA_DS4_EVAL_CASES_PATH="${CMAKE_CURRENT_SOURCE_DIR}/ds4-eval-cases.json"
     LLAMA_DS4_REPORTS_DIR="${CMAKE_SOURCE_DIR}/tools/ui/static/reports"
+    LLAMA_CALIBER_REPORTS_DIR="${CMAKE_SOURCE_DIR}/tools/ui/static/reports/caliber"
 )
 
 target_include_directories(${TARGET} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
