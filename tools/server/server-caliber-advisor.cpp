@@ -423,12 +423,19 @@ struct server_caliber_advisor_routes::impl {
         std::vector<json> metas;
         const std::string requested = json_value(body, "model", json_value(body, "id", std::string()));
         const std::string requested_path = json_value(body, "path", json_value(body, "model_path", std::string()));
+        std::set<std::string> requested_models;
+        if (body.contains("models") && body["models"].is_array()) {
+            for (const auto & id : body["models"]) {
+                if (id.is_string() && !id.get<std::string>().empty()) requested_models.insert(id.get<std::string>());
+            }
+        }
         if (!requested_path.empty()) {
             metas.push_back(caliber::read_gguf_plan_meta(requested_path));
             return metas;
         }
         for (const auto & meta : router.models.get_all_meta()) {
             if (!requested.empty() && requested != meta.name) continue;
+            if (!requested_models.empty() && !requested_models.count(meta.name)) continue;
             const std::string path = model_path_from_meta(meta);
             if (path.empty() || !std::filesystem::exists(path)) continue;
             metas.push_back(caliber::read_gguf_plan_meta(path));
