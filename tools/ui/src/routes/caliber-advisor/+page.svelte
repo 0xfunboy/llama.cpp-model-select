@@ -140,8 +140,9 @@
 	const winners = $derived((results?.winners as Record<ProfileId, Record<string, CaliberRow>> | undefined) ?? ({} as Record<ProfileId, Record<string, CaliberRow>>));
 	const profileWinners = $derived(Object.entries(winners[profile] ?? {}).filter(([, row]) => rowNum(row, ['eval_tps', 'tps']) > 0));
 	const bestWinner = $derived(profileWinners[0]?.[1] ?? null);
-	const completedReports = $derived(reports.filter((report) => report.rows > 0 || isCompleteStatus(report.status)));
+	const completedReports = $derived(reports.filter((report) => report.rows > 0 && isCompleteStatus(report.status)));
 	const pendingReports = $derived(reports.filter((report) => canDeleteReport(report)));
+	const failedReports = $derived(reports.filter((report) => report.status === 'failed'));
 	const selectedModels = $derived(models.filter((model) => selectedLocalIds.includes(model.id)));
 	const selectableModels = $derived(models.filter((model) => Boolean(model.path)));
 	const planModels = $derived(uniqueStrings(plan.map((item) => item.model)).length);
@@ -309,6 +310,11 @@
 		sweepAbort?.abort();
 		sweepAbort = new AbortController();
 		try {
+			if (plan.length === 0) {
+				const planned = await CaliberAdvisorService.plan(payload());
+				plan = planned.plan;
+				message = `${planned.plan_count} configs planned across ${selectedLocalIds.length} model(s)`;
+			}
 			const started = await CaliberAdvisorService.sweep(payload());
 			status = { job_id: started.job_id, status: started.status };
 			pushEvent(`Queued campaign ${started.job_id}`);
@@ -342,6 +348,7 @@
 	}
 
 	function humanEvent(event: string, data: CaliberSweepStatus & Record<string, unknown>): string {
+		if (event === 'preflight') return String(data.message ?? 'Preparing benchmark');
 		if (event === 'bench') return `Testing ${String(data.item ?? 'configuration')}`;
 		if (event === 'row') return data.ok ? `Measured ${fmtNumber(Number(data.eval_tps ?? 0), 1)} tok/s` : `Failed: ${String(data.error ?? 'configuration failed')}`;
 		if (event === 'report') return `Saved report ${String(data.report_id ?? '')}`;
@@ -418,8 +425,21 @@
 		return downloadFor(model)?.status ?? model.download_status ?? (model.installed ? 'configured' : 'available');
 	}
 
+	function downloadActionLabel(model: FitAdvisorModel): string {
+		const status = downloadStatus(model);
+		if (status === 'partial' || model.partial) return 'Resume DL';
+		if (status === 'failed') return 'Retry DL';
+		if (status === 'downloaded' || status === 'configured') return 'Downloaded';
+		return 'Download';
+	}
+
 	function isDownloading(model: FitAdvisorModel): boolean {
 		return ['queued', 'resolving', 'downloading'].includes(downloadStatus(model));
+	}
+
+	function canStartDownload(model: FitAdvisorModel): boolean {
+		if (!model.download) return false;
+		return !['queued', 'resolving', 'downloading', 'downloaded', 'configured'].includes(downloadStatus(model));
 	}
 
 	function canConfigureFit(model: FitAdvisorModel): boolean {
@@ -845,9 +865,9 @@
 							{/if}
 						</div>
 						<div class="row-actions">
-							<button type="button" onclick={() => downloadModel(model)} disabled={!model.download || isDownloading(model)}>
+							<button type="button" onclick={() => downloadModel(model)} disabled={!canStartDownload(model)}>
 								<Download size={15} />
-								Download
+								{downloadActionLabel(model)}
 							</button>
 							<button type="button" onclick={() => configureFitModel(model)} disabled={!canConfigureFit(model)}>
 								<CheckCircle2 size={15} />
@@ -893,7 +913,14 @@
 						</div>
 					{/each}
 					{#if profileWinners.length === 0}
-						<p class="empty">No completed benchmark rows yet. Start a campaign first.</p>
+						<div class="empty">
+							<p>No successful benchmark rows yet.</p>
+							{#if failedReports.length > 0}
+								<p>{failedReports.length} report(s) failed. Open Reports to inspect the failure and delete retry artifacts.</p>
+							{:else}
+								<p>Start a campaign first.</p>
+							{/if}
+						</div>
 					{/if}
 				</div>
 			</div>
@@ -1009,6 +1036,10 @@
 						{#if reportRows[0]}
 							<h3>Launcher for first measured row</h3>
 							<pre>{planLauncher(reportRows[0])}</pre>
+							<button type="button" onclick={() => configureCaliberRow(reportRows[0])} disabled={!rowNum(reportRows[0], ['eval_tps', 'tps'])}>
+								<CheckCircle2 size={15} />
+								FIT this result
+							</button>
 						{/if}
 					</div>
 				{:else}
@@ -1176,8 +1207,13 @@
 	button.active,
 	.choice.active,
 	.model-option.active {
-		background: rgba(255, 255, 255, 0.92);
+		background: #9ca3af;
 		color: #111;
+	}
+
+	.choice.active span,
+	.model-option.active span {
+		color: #1f2937;
 	}
 
 	button:disabled {

@@ -494,6 +494,8 @@ struct server_caliber_advisor_routes::impl {
                     job->status = "running";
                 }
                 publish(job, "started", json::object());
+                publish(job, "preflight", {{"message", "Unloading active router models before benchmark"}});
+                router.models.unload_all();
                 json payload = build_plan_payload(body);
                 json plan = payload["plan"];
                 const int requested_limit = json_value(body, "limit_rows", 0);
