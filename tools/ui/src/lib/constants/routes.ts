@@ -31,5 +31,7 @@ export const ROUTES = {
 	/** DS4 bench dashboard. */
 	DS4_BENCH: '#/ds4-bench',
 	/** Model fit advisor dashboard. */
-	FIT_ADVISOR: '#/fit-advisor'
+	FIT_ADVISOR: '#/fit-advisor',
+	/** Caliber benchmark advisor dashboard. */
+	CALIBER_ADVISOR: '#/caliber-advisor'
 } as const;

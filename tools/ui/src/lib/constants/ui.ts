@@ -1,5 +1,6 @@
 import { Activity, ClipboardCheck, Gauge, Search, Settings, SquarePen } from '@lucide/svelte';
 import McpLogo from '$lib/components/app/mcp/McpLogo.svelte';
+import CaliberAdvisorIcon from '$lib/components/app/icons/CaliberAdvisorIcon.svelte';
 import type { Component } from 'svelte';
 import { ROUTES } from './routes';
 
@@ -45,6 +46,12 @@ export const SIDEBAR_ACTIONS_ITEMS: DesktopIconStripItem[] = [
 		tooltip: 'Fit Advisor',
 		route: ROUTES.FIT_ADVISOR,
 		activeRouteId: '/fit-advisor'
+	},
+	{
+		icon: CaliberAdvisorIcon,
+		tooltip: 'Caliber Advisor',
+		route: ROUTES.CALIBER_ADVISOR,
+		activeRouteId: '/caliber-advisor'
 	},
 	{
 		icon: Settings,
