@@ -20,6 +20,7 @@ struct server_ds4_routes {
     server_http_context::handler_t get_job_events;
     server_http_context::handler_t get_reports;
     server_http_context::handler_t get_report;
+    server_http_context::handler_t delete_report;
 
 private:
     struct impl;

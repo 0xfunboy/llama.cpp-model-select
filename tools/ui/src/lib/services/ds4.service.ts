@@ -65,6 +65,11 @@ export interface Ds4ReportsResponse {
 	data: Ds4ReportSummary[];
 }
 
+export interface Ds4DeleteReportResponse {
+	deleted: boolean;
+	id: string;
+}
+
 export interface Ds4Report {
 	id: string;
 	kind: 'eval' | 'bench';
@@ -196,6 +201,13 @@ export class Ds4Service {
 				'X-Cmd': 'report',
 				'X-Report-Id': id
 			}
+		});
+	}
+
+	static deleteReport(id: string): Promise<Ds4DeleteReportResponse> {
+		return apiFetch<Ds4DeleteReportResponse>(`/api/ds4/reports/${encodeURIComponent(id)}`, {
+			authOnly: true,
+			method: 'DELETE'
 		});
 	}
 

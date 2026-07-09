@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
-	import { Activity, BarChart3, ClipboardCheck, RefreshCw, Square, SquareCheck, Trophy, X } from '@lucide/svelte';
+	import { Activity, BarChart3, ClipboardCheck, RefreshCw, Square, SquareCheck, Trash2, Trophy, X } from '@lucide/svelte';
 	import {
 		Ds4Service,
 		type Ds4Event,
@@ -89,6 +89,8 @@
 	let selectedReportId = $state('');
 	let evalRows = $state<EvalRow[]>([]);
 	let benchRows = $state<BenchRow[]>([]);
+	let archiveEvalRows = $state<EvalRow[]>([]);
+	let archiveEvalReportCount = $state(0);
 	let otherActiveJob = $state<Ds4JobSnapshot | null>(null);
 	let streamController: AbortController | null = null;
 	let reportMode = $state<'single' | 'race'>('single');
@@ -126,9 +128,10 @@
 		}
 		return benchRows;
 	});
-	const reportModels = $derived.by(() => uniqueModels(displayEvalRows));
-	const modelReportRows = $derived.by(() => buildModelSummaries(displayEvalRows));
-	const sectorReportRows = $derived.by(() => buildSectorSummaries(displayEvalRows));
+	const comparisonEvalRows = $derived.by(() => archiveEvalRows);
+	const reportModels = $derived.by(() => uniqueModels(comparisonEvalRows));
+	const modelReportRows = $derived.by(() => buildModelSummaries(comparisonEvalRows));
+	const sectorReportRows = $derived.by(() => buildSectorSummaries(comparisonEvalRows));
 	const singleModelSummary = $derived.by(() => modelReportRows.find((row) => row.model === singleReportModel));
 	const singleSectorRows = $derived.by(() => sectorReportRows.filter((row) => row.model === singleReportModel));
 	const raceModelSummaryA = $derived.by(() => modelReportRows.find((row) => row.model === raceModelA));
@@ -153,6 +156,10 @@
 	});
 	const canResumeSelectedReport = $derived.by(() => {
 		if (!activeReport || activeReport.kind !== mode || isRunning || otherActiveJob) return false;
+		return activeReport.resumable === true || activeReport.status === 'paused';
+	});
+	const canDeleteSelectedReport = $derived.by(() => {
+		if (!activeReport || activeReport.kind !== mode || isRunning) return false;
 		return activeReport.resumable === true || activeReport.status === 'paused';
 	});
 
@@ -354,6 +361,40 @@
 			});
 	}
 
+	function bestEvalRowsFromReports(completedReports: Ds4Report[]): EvalRow[] {
+		const bestByModel = new Map<string, { score: number; total: number; updated: string; rows: EvalRow[] }>();
+
+		for (const report of completedReports) {
+			if (report.kind !== 'eval' || report.status !== 'completed' || !Array.isArray(report.results)) continue;
+			const rowsByModel = new Map<string, EvalRow[]>();
+			for (const row of report.results as EvalRow[]) {
+				const model = String(row.model || '').trim();
+				if (!model) continue;
+				const rows = rowsByModel.get(model) ?? [];
+				rows.push(row);
+				rowsByModel.set(model, rows);
+			}
+
+			for (const [model, rows] of rowsByModel) {
+				const pass = rows.filter((row) => row.pass === true).length;
+				const total = rows.filter((row) => row.pass === true || row.pass === false).length;
+				const score = total > 0 ? pass / total : 0;
+				const updated = String(report.updated_at || report.created_at || '');
+				const current = bestByModel.get(model);
+				if (
+					!current ||
+					score > current.score ||
+					(score === current.score && total > current.total) ||
+					(score === current.score && total === current.total && updated > current.updated)
+				) {
+					bestByModel.set(model, { score, total, updated, rows });
+				}
+			}
+		}
+
+		return [...bestByModel.values()].flatMap((entry) => entry.rows);
+	}
+
 	function basename(path?: string): string {
 		if (!path) return '';
 		const normalized = path.replaceAll('\\', '/');
@@ -446,9 +487,33 @@
 			reports = response.data
 				.filter((report) => report.kind === mode)
 				.sort((a, b) => b.created_at.localeCompare(a.created_at));
+			await refreshArchiveReports();
 		} catch {
 			reports = [];
+			archiveEvalRows = [];
+			archiveEvalReportCount = 0;
 		}
+	}
+
+	async function refreshArchiveReports() {
+		if (!isEval) {
+			archiveEvalRows = [];
+			archiveEvalReportCount = 0;
+			return;
+		}
+		const completed = reports.filter((report) => report.kind === 'eval' && report.status === 'completed' && report.resumable !== true);
+		const loaded = await Promise.all(
+			completed.map(async (report) => {
+				try {
+					return await Ds4Service.getReport(report.id);
+				} catch {
+					return null;
+				}
+			})
+		);
+		const validReports = loaded.filter((report): report is Ds4Report => Boolean(report));
+		archiveEvalRows = bestEvalRowsFromReports(validReports);
+		archiveEvalReportCount = validReports.length;
 	}
 
 	function setSnapshot(snapshot: Ds4JobSnapshot) {
@@ -626,6 +691,19 @@
 			error = e instanceof Error ? e.message : String(e);
 			appendTerminal('\nERROR: ' + error + '\n');
 			isRunning = false;
+		}
+	}
+
+	async function deleteSelectedReport() {
+		if (!activeReport || !canDeleteSelectedReport) return;
+		const id = activeReport.id;
+		try {
+			await Ds4Service.deleteReport(id);
+			if (selectedReportId === id) selectedReportId = '';
+			activeReport = null;
+			await refreshReports();
+		} catch (e) {
+			error = e instanceof Error ? e.message : String(e);
 		}
 	}
 
@@ -836,6 +914,15 @@
 				>
 					Resume interrupted
 				</button>
+				<button
+					type="button"
+					class="inline-flex h-10 items-center gap-2 rounded-md border px-3 text-sm hover:bg-muted disabled:opacity-50"
+					disabled={!canDeleteSelectedReport}
+					onclick={deleteSelectedReport}
+				>
+					<Trash2 class="h-4 w-4" />
+					Delete pending
+				</button>
 				<button type="button" class="h-10 rounded-md border px-3 text-sm hover:bg-muted" onclick={refreshReports}>Refresh history</button>
 			</div>
 		</div>
@@ -907,7 +994,7 @@
 						<div>
 							<h3 class="text-sm font-semibold">Model Report</h3>
 							<p class="text-xs text-muted-foreground">
-								{reportModels.length > 1 ? 'Single model card or two-model race, grouped by tested sector.' : 'Single model card grouped by tested sector.'}
+								Completed archive only · {archiveEvalReportCount} report{archiveEvalReportCount === 1 ? '' : 's'} · best run per model.
 							</p>
 						</div>
 					</div>

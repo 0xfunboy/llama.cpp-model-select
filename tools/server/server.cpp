@@ -226,6 +226,7 @@ int llama_server(int argc, char ** argv) {
         ctx_http.get ("/api/ds4/report",           ex_wrapper(ds4_routes->get_report));
         ctx_http.post("/api/ds4/report",           ex_wrapper(ds4_routes->get_report));
         ctx_http.get ("/api/ds4/reports/:id",      ex_wrapper(ds4_routes->get_report));
+        ctx_http.del ("/api/ds4/reports/:id",      ex_wrapper(ds4_routes->delete_report));
 
         fit_advisor_routes.emplace(*models_routes);
         ctx_http.get ("/api/fit-advisor/system",          ex_wrapper(fit_advisor_routes->get_system));

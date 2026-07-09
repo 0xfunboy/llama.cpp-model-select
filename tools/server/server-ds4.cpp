@@ -1345,7 +1345,7 @@ struct server_ds4_routes::impl {
                 {"id", job->id},
                 {"kind", "eval"},
                 {"status", "running"},
-                {"resumable", false},
+                {"resumable", true},
                 {"created_at", isoish_timestamp()},
                 {"model_selector", selector},
                 {"models", model_names},
@@ -1372,6 +1372,7 @@ struct server_ds4_routes::impl {
                 job->current = std::min<int>((int) completed.size(), job->total);
             }
             store_report(job, report);
+            save_report(job);
             publish(job, "status", {{"message", "DS4-Eval started"}, {"models", model_names}, {"cases", cases.size()}});
 
             for (const auto & model_name : model_names) {
@@ -1505,8 +1506,9 @@ struct server_ds4_routes::impl {
                     report["results"].push_back(row);
                     update_eval_summary(report);
                     report["status"] = "running";
-                    report["resumable"] = false;
+                    report["resumable"] = true;
                     store_report(job, report);
+                    save_report(job);
                     publish(job, "case", row);
                     log(job, string_format("\n\033[%sm%s expected=%s got=%s elapsed=%.2fs tps=%.2f\033[0m\n",
                             pass ? "1;32" : "1;31",
@@ -1537,6 +1539,7 @@ struct server_ds4_routes::impl {
             finish_job(job, "paused", "paused");
         } catch (const std::exception & e) {
             log(job, std::string("\n\033[1;31mERROR: ") + e.what() + "\033[0m\n", "stderr");
+            save_paused_report(job);
             finish_job(job, "failed", e.what());
         }
     }
@@ -1569,7 +1572,7 @@ struct server_ds4_routes::impl {
                 {"id", job->id},
                 {"kind", "bench"},
                 {"status", "running"},
-                {"resumable", false},
+                {"resumable", true},
                 {"created_at", isoish_timestamp()},
                 {"model_selector", selector},
                 {"models", model_names},
@@ -1590,6 +1593,7 @@ struct server_ds4_routes::impl {
             update_bench_summary(report);
             const auto completed = completed_bench_keys(report);
             store_report(job, report);
+            save_report(job);
 
             const std::string prompt_text = read_bench_prompt();
             for (const auto & model_name : model_names) {
@@ -1698,8 +1702,9 @@ struct server_ds4_routes::impl {
                     model_rows.push_back(row);
                     update_bench_summary(report);
                     report["status"] = "running";
-                    report["resumable"] = false;
+                    report["resumable"] = true;
                     store_report(job, report);
+                    save_report(job);
                     publish(job, "bench-row", row);
                     log(job, string_format("ctx=%d prompt=%.2f tok/s decode=%.2f tok/s\n",
                             ctx, prompt_tps, decode_tps));
@@ -1725,6 +1730,7 @@ struct server_ds4_routes::impl {
             finish_job(job, "paused", "paused");
         } catch (const std::exception & e) {
             log(job, std::string("\n\033[1;31mERROR: ") + e.what() + "\033[0m\n", "stderr");
+            save_paused_report(job);
             finish_job(job, "failed", e.what());
         }
     }
@@ -1925,6 +1931,51 @@ struct server_ds4_routes::impl {
         return res;
     }
 
+    server_http_res_ptr handle_delete_report(const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        std::string id = id_from_req(req);
+        if (!line_is_safe_report_id(id)) {
+            ds4_res_err(res, format_error_response("invalid report id", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        const auto path = report_path_from_id(id);
+        std::error_code ec;
+        if (!std::filesystem::exists(path, ec)) {
+            ds4_res_err(res, format_error_response("DS4 report not found", ERROR_TYPE_NOT_FOUND));
+            return res;
+        }
+
+        json report;
+        try {
+            report = json::parse(read_text_file(path));
+        } catch (const std::exception & e) {
+            ds4_res_err(res, format_error_response(e.what(), ERROR_TYPE_SERVER));
+            return res;
+        }
+
+        const std::string report_id = json_value(report, "id", std::filesystem::path(path).stem().string());
+        const std::string status = json_value(report, "status", std::string());
+        if (status == "completed" || json_value(report, "resumable", false) == false) {
+            ds4_res_err(res, format_error_response("completed or archived DS4 reports cannot be deleted from the pending-report action", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        if (auto job = find_job(report_id)) {
+            std::lock_guard<std::mutex> lock(job->mutex);
+            if (!job->finished) {
+                ds4_res_err(res, format_error_response("cannot delete a report while its DS4 job is still running", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+        }
+
+        if (!std::filesystem::remove(path, ec) || ec) {
+            ds4_res_err(res, format_error_response("failed to delete DS4 report", ERROR_TYPE_SERVER));
+            return res;
+        }
+        ds4_res_ok(res, {{"deleted", true}, {"id", report_id}});
+        return res;
+    }
+
     server_http_res_ptr handle_action_or_start(const server_http_req & req, const std::string & kind) {
         if (!req.body.empty()) {
             try {
@@ -2059,5 +2110,9 @@ void server_ds4_routes::init_routes() {
             return p->handle_cancel_job(req);
         }
         return p->handle_report(req);
+    };
+
+    delete_report = [p = pimpl](const server_http_req & req) {
+        return p->handle_delete_report(req);
     };
 }
