@@ -36,6 +36,8 @@ target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INI
 set(TARGET llama-server-impl)
 
 add_library(${TARGET}
+    caliber-plan.cpp
+    caliber-plan.h
     caliber-scoring.cpp
     caliber-scoring.h
     server.cpp
@@ -55,7 +57,7 @@ target_compile_definitions(${TARGET} PRIVATE
 )
 
 target_include_directories(${TARGET} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_include_directories(${TARGET} PRIVATE ../mtmd ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/vendor)
+target_include_directories(${TARGET} PRIVATE ../mtmd ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/vendor ${CMAKE_SOURCE_DIR}/ggml/include)
 target_link_libraries(${TARGET} PUBLIC server-context llama-ui cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
 
 if(LLAMA_TOOLS_INSTALL)
@@ -72,6 +74,22 @@ target_compile_definitions(test-caliber-scoring PRIVATE
     CALIBER_WINNER_FIXTURE_PATH="/home/cooper/calibr/tests/fixtures/winner-policy-cases.json"
 )
 target_include_directories(test-caliber-scoring PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/vendor)
+
+add_executable(test-caliber-plan EXCLUDE_FROM_ALL
+    tests/test-caliber-plan.cpp
+    caliber-plan.cpp
+    caliber-plan.h
+    caliber-scoring.cpp
+    caliber-scoring.h
+)
+target_compile_features(test-caliber-plan PRIVATE cxx_std_17)
+target_include_directories(test-caliber-plan PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/vendor
+    ${CMAKE_SOURCE_DIR}/ggml/include
+)
+target_link_libraries(test-caliber-plan PRIVATE ggml)
 
 # llama-server executable
 
