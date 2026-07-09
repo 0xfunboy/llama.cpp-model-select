@@ -1,4 +1,6 @@
+import { base } from '$app/paths';
 import { apiFetch, apiPost } from '$lib/utils';
+import { getAuthHeaders } from '$lib/utils/api-headers';
 
 export interface CaliberModel {
 	id: string;
@@ -49,6 +51,11 @@ export interface CaliberReportsResponse {
 	data: CaliberReportSummary[];
 }
 
+export interface CaliberDeleteReportResponse {
+	success: boolean;
+	id: string;
+}
+
 export interface CaliberSweepResponse {
 	success: boolean;
 	job_id: string;
@@ -63,6 +70,33 @@ export interface CaliberSweepStatus {
 	total?: number;
 	report_id?: string;
 	finished?: boolean;
+}
+
+export interface CaliberSweepEvent {
+	event: string;
+	data: CaliberSweepStatus & Record<string, unknown>;
+}
+
+export interface CaliberConfigureResponse {
+	success: boolean;
+	model: string;
+	loaded: boolean;
+	entry?: Record<string, unknown>;
+	models_preset?: string;
+}
+
+function parseSseBlock(block: string): CaliberSweepEvent | null {
+	let event = 'message';
+	let data = '';
+	for (const line of block.split('\n')) {
+		if (line.startsWith('event:')) {
+			event = line.slice(6).trim();
+		} else if (line.startsWith('data:')) {
+			data += line.slice(5).trim();
+		}
+	}
+	if (!data) return null;
+	return { event, data: JSON.parse(data) as CaliberSweepStatus & Record<string, unknown> };
 }
 
 export class CaliberAdvisorService {
@@ -92,6 +126,48 @@ export class CaliberAdvisorService {
 		});
 	}
 
+	static async streamSweepEvents(
+		jobId: string,
+		onEvent: (event: CaliberSweepEvent) => void,
+		signal?: AbortSignal,
+		since = 0
+	): Promise<void> {
+		const params = new URLSearchParams({ id: jobId });
+		if (since > 0) params.set('since', String(since));
+		const response = await fetch(base + `/api/caliber-advisor/sweep/events?${params.toString()}`, {
+			headers: getAuthHeaders(),
+			signal
+		});
+
+		if (!response.ok) {
+			throw new Error(
+				'Caliber Advisor event stream failed: ' + response.status + ' ' + response.statusText
+			);
+		}
+		if (!response.body) throw new Error('Caliber Advisor event stream is empty');
+
+		const reader = response.body.getReader();
+		const decoder = new TextDecoder();
+		let buffer = '';
+		for (;;) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			buffer += decoder.decode(value, { stream: true });
+			for (;;) {
+				const index = buffer.indexOf('\n\n');
+				if (index === -1) break;
+				const parsed = parseSseBlock(buffer.slice(0, index));
+				buffer = buffer.slice(index + 2);
+				if (parsed) onEvent(parsed);
+			}
+		}
+		const tail = buffer.trim();
+		if (tail) {
+			const parsed = parseSseBlock(tail);
+			if (parsed) onEvent(parsed);
+		}
+	}
+
 	static reports(): Promise<CaliberReportsResponse> {
 		return apiFetch<CaliberReportsResponse>('/api/caliber-advisor/reports', { authOnly: true });
 	}
@@ -103,7 +179,24 @@ export class CaliberAdvisorService {
 		);
 	}
 
+	static deleteReport(id: string): Promise<CaliberDeleteReportResponse> {
+		return apiFetch<CaliberDeleteReportResponse>(
+			`/api/caliber-advisor/reports/${encodeURIComponent(id)}`,
+			{
+				authOnly: true,
+				method: 'DELETE'
+			}
+		);
+	}
+
 	static results(): Promise<Record<string, unknown>> {
 		return apiFetch<Record<string, unknown>>('/api/caliber-advisor/results', { authOnly: true });
+	}
+
+	static configure(payload: Record<string, unknown>): Promise<CaliberConfigureResponse> {
+		return apiPost<CaliberConfigureResponse, Record<string, unknown>>(
+			'/api/caliber-advisor/configure',
+			payload
+		);
 	}
 }

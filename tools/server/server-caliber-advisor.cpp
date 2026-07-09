@@ -6,14 +6,17 @@
 #include "server-models.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cctype>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
 #include <sstream>
 #include <thread>
+#include <unistd.h>
 
 #ifndef LLAMA_CALIBER_REPORTS_DIR
 #define LLAMA_CALIBER_REPORTS_DIR "tools/ui/static/reports/caliber"
@@ -62,6 +65,45 @@ static void write_text_file(const std::filesystem::path & path, const std::strin
     out << text;
 }
 
+static std::string shell_quote(const std::string & value) {
+    std::string out = "'";
+    for (char c : value) {
+        if (c == '\'') out += "'\\''";
+        else out.push_back(c);
+    }
+    out += "'";
+    return out;
+}
+
+static std::filesystem::path current_executable_dir() {
+    char buf[4096];
+    const ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (len > 0) {
+        buf[len] = '\0';
+        return std::filesystem::path(buf).parent_path();
+    }
+    return std::filesystem::current_path() / "build" / "bin";
+}
+
+static std::string run_command_capture(const std::string & command, int & exit_code) {
+    std::array<char, 4096> buffer{};
+    std::string output;
+    FILE * pipe = popen((command + " 2>&1").c_str(), "r");
+    if (!pipe) throw std::runtime_error("failed to start benchmark command");
+    while (fgets(buffer.data(), (int) buffer.size(), pipe) != nullptr) output += buffer.data();
+    exit_code = pclose(pipe);
+    return output;
+}
+
+static json parse_first_json_array(const std::string & output) {
+    const auto begin = output.find('[');
+    const auto end = output.rfind(']');
+    if (begin == std::string::npos || end == std::string::npos || end <= begin) {
+        throw std::runtime_error("benchmark did not return JSON output");
+    }
+    return json::parse(output.substr(begin, end - begin + 1));
+}
+
 static std::string isoish_timestamp() {
     using namespace std::chrono;
     const auto now = system_clock::now();
@@ -106,6 +148,187 @@ static std::string hf_repo_from_meta(const server_model_meta & meta) {
     std::string repo;
     if (meta.preset.get_option("LLAMA_ARG_HF_REPO", repo)) return repo;
     return "";
+}
+
+static std::optional<server_model_meta> find_router_model(server_models_routes & router, const std::string & id) {
+    for (const auto & meta : router.models.get_all_meta()) {
+        if (meta.name == id) return meta;
+    }
+    return std::nullopt;
+}
+
+static std::vector<std::string> split_cli_args(const std::string & text) {
+    std::vector<std::string> out;
+    std::string current;
+    char quote = 0;
+    bool escape = false;
+    for (char c : text) {
+        if (escape) {
+            current.push_back(c);
+            escape = false;
+            continue;
+        }
+        if (c == '\\') {
+            escape = true;
+            continue;
+        }
+        if (quote) {
+            if (c == quote) quote = 0;
+            else current.push_back(c);
+            continue;
+        }
+        if (c == '\'' || c == '"') {
+            quote = c;
+            continue;
+        }
+        if (std::isspace((unsigned char) c)) {
+            if (!current.empty()) {
+                out.push_back(current);
+                current.clear();
+            }
+            continue;
+        }
+        current.push_back(c);
+    }
+    if (!current.empty()) out.push_back(current);
+    return out;
+}
+
+static std::string arg_value(const std::vector<std::string> & args, const std::vector<std::string> & names) {
+    for (size_t i = 0; i < args.size(); ++i) {
+        for (const auto & name : names) {
+            if (args[i] == name && i + 1 < args.size()) return args[i + 1];
+            const std::string prefix = name + "=";
+            if (args[i].rfind(prefix, 0) == 0) return args[i].substr(prefix.size());
+        }
+    }
+    return "";
+}
+
+static int arg_int_value(const std::vector<std::string> & args, const std::vector<std::string> & names, int fallback) {
+    const std::string value = arg_value(args, names);
+    if (value.empty()) return fallback;
+    try {
+        return std::stoi(value);
+    } catch (...) {
+        return fallback;
+    }
+}
+
+static void set_int_arg(json & entry, const std::vector<std::string> & args, const std::string & key, const std::vector<std::string> & names) {
+    const std::string value = arg_value(args, names);
+    if (value.empty()) return;
+    try {
+        entry[key] = std::stoi(value);
+    } catch (...) {
+    }
+}
+
+static void set_string_arg(json & entry, const std::vector<std::string> & args, const std::string & key, const std::vector<std::string> & names) {
+    const std::string value = arg_value(args, names);
+    if (!value.empty()) entry[key] = value;
+}
+
+static void apply_runtime_args(json & entry, const std::string & extra_args) {
+    const std::vector<std::string> args = split_cli_args(extra_args);
+    set_int_arg(entry, args, "ctx_size", {"--ctx-size", "-c"});
+    set_int_arg(entry, args, "n_gpu_layers", {"--gpu-layers", "--n-gpu-layers", "-ngl"});
+    set_int_arg(entry, args, "parallel", {"--parallel", "-np"});
+    set_int_arg(entry, args, "batch_size", {"--batch-size", "-b"});
+    set_int_arg(entry, args, "ubatch_size", {"--ubatch-size", "-ub"});
+    set_int_arg(entry, args, "main_gpu", {"--main-gpu", "-mg"});
+    set_int_arg(entry, args, "n_cpu_moe", {"--n-cpu-moe"});
+    set_int_arg(entry, args, "threads", {"--threads", "-t"});
+    set_string_arg(entry, args, "cache_type_k", {"--cache-type-k", "-ctk"});
+    set_string_arg(entry, args, "cache_type_v", {"--cache-type-v", "-ctv"});
+    set_string_arg(entry, args, "flash_attn", {"--flash-attn", "-fa"});
+    set_string_arg(entry, args, "split_mode", {"--split-mode", "-sm"});
+    set_string_arg(entry, args, "tensor_split", {"--tensor-split", "-ts"});
+}
+
+static std::string normalized_tensor_split(std::string value) {
+    std::replace(value.begin(), value.end(), ',', '/');
+    return value;
+}
+
+static std::vector<std::string> llama_bench_args_for_item(const json & item, const json & cfg) {
+    const std::vector<std::string> source = split_cli_args(json_value(item, "extra_args", std::string()));
+    const std::string model_path = json_value(item, "model_path", json_value(item, "path", std::string()));
+    if (model_path.empty()) throw std::runtime_error("plan item has no model path");
+    const std::string workload = json_value(item, "workload_kind", std::string("baseline"));
+    const int ctx = arg_int_value(source, {"--ctx-size", "-c"}, 8192);
+    const int n_predict = json_value(json_value(cfg, "bench", json::object()), "n_predict", 128);
+    int prompt_tokens = 512;
+    if (workload == "prefill") prompt_tokens = std::min(std::max(2048, ctx / 4), std::max(512, ctx - 512));
+    else if (workload == "kv-fill") prompt_tokens = std::min(std::max(2048, (ctx * 3) / 4), std::max(512, ctx - 512));
+
+    std::vector<std::string> out = {
+        "-m", model_path,
+        "-o", "json",
+        "-r", "1",
+        "--no-warmup",
+        "-p", std::to_string(prompt_tokens),
+        "-n", std::to_string(n_predict),
+    };
+
+    auto push_value = [&](const std::string & dst, const std::vector<std::string> & names, bool tensor_split = false) {
+        std::string value = arg_value(source, names);
+        if (value.empty()) return;
+        if (tensor_split) value = normalized_tensor_split(value);
+        out.push_back(dst);
+        out.push_back(value);
+    };
+    push_value("--n-gpu-layers", {"--gpu-layers", "--n-gpu-layers", "-ngl"});
+    push_value("--cache-type-k", {"--cache-type-k", "-ctk"});
+    push_value("--cache-type-v", {"--cache-type-v", "-ctv"});
+    push_value("--n-cpu-moe", {"--n-cpu-moe", "-ncmoe"});
+    push_value("--split-mode", {"--split-mode", "-sm"});
+    push_value("--main-gpu", {"--main-gpu", "-mg"});
+    push_value("--flash-attn", {"--flash-attn", "-fa"});
+    push_value("--tensor-split", {"--tensor-split", "-ts"}, true);
+    push_value("--batch-size", {"--batch-size", "-b"});
+    push_value("--ubatch-size", {"--ubatch-size", "-ub"});
+    push_value("--threads", {"--threads", "-t"});
+    return out;
+}
+
+static json run_llama_bench_item(const json & item, const json & cfg) {
+    const auto args = llama_bench_args_for_item(item, cfg);
+    std::string command = shell_quote((current_executable_dir() / "llama-bench").string());
+    for (const auto & arg : args) command += " " + shell_quote(arg);
+    int exit_code = 0;
+    const std::string output = run_command_capture(command, exit_code);
+    if (exit_code != 0) throw std::runtime_error("llama-bench failed: " + output.substr(0, 2000));
+    json parsed = parse_first_json_array(output);
+    if (!parsed.is_array() || parsed.empty() || !parsed[0].is_object()) {
+        throw std::runtime_error("llama-bench returned no result rows");
+    }
+    json bench = parsed[0];
+    json run = bench;
+    run["ok"] = true;
+    run["eval_tps"] = json_value(bench, "avg_ts", 0.0);
+    run["prompt_tps"] = 0;
+    run["ctx_size"] = arg_int_value(split_cli_args(json_value(item, "extra_args", std::string())), {"--ctx-size", "-c"}, 8192);
+    const double model_size_bytes = json_value(bench, "model_size", 0.0);
+    if (model_size_bytes > 0) run["vram_peak_mib"] = model_size_bytes / 1024.0 / 1024.0;
+    if (!run.contains("shared_peak_mib")) run["shared_peak_mib"] = 0;
+    if (!run.contains("gpu_power_peak_w")) run["gpu_power_peak_w"] = 0;
+    run["benchmark_backend"] = "llama-bench";
+    run["bench_command"] = command;
+    json row = caliber::aggregate_bench_result(item, cfg, {run});
+    row["benchmark_backend"] = "llama-bench";
+    row["bench_command"] = command;
+    return row;
+}
+
+static std::optional<json::iterator> find_model_entry(json & models, const std::string & id) {
+    if (!models.is_array()) return std::nullopt;
+    for (auto it = models.begin(); it != models.end(); ++it) {
+        if (it->is_object() && json_value(*it, "id", json_value(*it, "name", std::string())) == id) {
+            return it;
+        }
+    }
+    return std::nullopt;
 }
 
 static json model_meta_json(const server_model_meta & meta) {
@@ -265,23 +488,68 @@ struct server_caliber_advisor_routes::impl {
                 }
                 publish(job, "started", json::object());
                 json payload = build_plan_payload(body);
-                job->total = (int) payload["plan"].size();
-                job->current = job->total;
+                json plan = payload["plan"];
+                const int requested_limit = json_value(body, "limit_rows", 0);
+                if (requested_limit > 0 && plan.is_array() && (int) plan.size() > requested_limit) {
+                    json limited = json::array();
+                    for (int i = 0; i < requested_limit; ++i) limited.push_back(plan[(size_t) i]);
+                    plan = limited;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(job->mutex);
+                    job->total = (int) plan.size();
+                    job->current = 0;
+                }
                 const std::string model_name = payload["models"].is_array() && !payload["models"].empty()
                     ? json_value(payload["models"][0], "model", std::string("local"))
                     : std::string("local");
                 const std::string report_id = slugify(model_name + "-" + isoish_timestamp());
+                json rows = json::array();
+                std::vector<json> winner_rows;
+                for (const auto & item : plan) {
+                    publish(job, "bench", {{"item", json_value(item, "id", json_value(item, "label", std::string()))}});
+                    try {
+                        json row = run_llama_bench_item(item, payload["cfg"]);
+                        rows.push_back(row);
+                        winner_rows.push_back(row);
+                        publish(job, "row", {{"ok", true}, {"item", json_value(item, "id", json_value(item, "label", std::string()))}, {"eval_tps", json_value(row, "eval_tps", 0.0)}});
+                    } catch (const std::exception & e) {
+                        json row = item;
+                        row["ok"] = false;
+                        row["failure_reason"] = e.what();
+                        row["eval_tps"] = 0;
+                        row["ctx_size"] = caliber::context_size_from_args(json_value(item, "extra_args", std::string()));
+                        row["shared_peak_mib"] = 0;
+                        row["vram_peak_mib"] = 0;
+                        rows.push_back(row);
+                        winner_rows.push_back(row);
+                        publish(job, "row", {{"ok", false}, {"item", json_value(item, "id", json_value(item, "label", std::string()))}, {"error", e.what()}});
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(job->mutex);
+                        job->current += 1;
+                    }
+                }
+                json winners = json::object();
+                for (const std::string profile : {"speed", "efficiency", "safety", "overall"}) {
+                    json grouped = json::object();
+                    for (const auto & [model, winner] : caliber::group_winners(winner_rows, caliber::winner_profile_from_string(profile))) grouped[model] = winner;
+                    winners[profile] = grouped;
+                }
+                const bool has_success = std::any_of(rows.begin(), rows.end(), [](const json & row) {
+                    return json_value(row, "ok", false);
+                });
                 json report = {
                     {"id", report_id},
                     {"created_at", isoish_timestamp()},
-                    {"status", "planned"},
+                    {"status", has_success ? "completed" : "failed"},
                     {"model", model_name},
-                    {"note", "Planner report persisted; real benchmark runner attaches measured rows in the next server slice pass."},
+                    {"note", "Measured with llama-bench through Caliber Advisor."},
                     {"cfg", payload["cfg"]},
                     {"models", payload["models"]},
-                    {"plan", payload["plan"]},
-                    {"rows", json::array()},
-                    {"winners", json::object()},
+                    {"plan", plan},
+                    {"rows", rows},
+                    {"winners", winners},
                 };
                 write_text_file(reports_dir() / (report_id + ".json"), report.dump(2) + "\n");
                 {
@@ -444,13 +712,48 @@ struct server_caliber_advisor_routes::impl {
             res_err(res, "configure requires model/model_id");
             return res;
         }
-        if (!router.models.has_model(model)) {
+        const auto meta = find_router_model(router, model);
+        if (!meta) {
             res_err(res, "model not found", 404);
             return res;
         }
+        const std::string preset_path = router.params.models_preset;
+        if (preset_path.empty() || preset_path.size() < 6 || preset_path.substr(preset_path.size() - 5) != ".json") {
+            res_err(res, "Caliber configure requires a JSON --models-preset file", 501);
+            return res;
+        }
+
+        json root = json::object();
+        if (std::filesystem::exists(preset_path)) root = json::parse(read_text_file(preset_path));
+        if (!root.is_object()) root = json::object();
+        if (!root.contains("version")) root["version"] = 1;
+        if (!root.contains("models") || !root["models"].is_array()) root["models"] = json::array();
+
+        json entry = json::object();
+        auto existing = find_model_entry(root["models"], model);
+        if (existing.has_value()) entry = **existing;
+        entry["id"] = model;
+        const std::string local_path = model_path_from_meta(*meta);
+        const std::string hf_repo = hf_repo_from_meta(*meta);
+        if (!local_path.empty()) entry["model"] = local_path;
+        else if (!hf_repo.empty()) entry["hf_repo"] = hf_repo;
+        if (!entry.contains("alias")) entry["alias"] = meta->name;
+        if (!entry.contains("load_on_startup")) entry["load_on_startup"] = false;
+        const std::string extra_args = json_value(body, "extra_args", std::string());
+        if (!extra_args.empty()) {
+            apply_runtime_args(entry, extra_args);
+            entry["caliber_args"] = extra_args;
+        }
+        if (body.contains("tags")) entry["tags"] = body["tags"];
+
+        if (existing.has_value()) **existing = entry;
+        else root["models"].push_back(entry);
+
+        write_text_file(preset_path, root.dump(2) + "\n");
+        router.models.load_models();
         const bool load_now = json_value(body, "load_now", false);
         if (load_now) router.models.load(model);
-        res_ok(res, {{"success", true}, {"model", model}, {"loaded", load_now}});
+        res_ok(res, {{"success", true}, {"model", model}, {"models_preset", preset_path}, {"entry", entry}, {"loaded", load_now}});
         return res;
     }
 };
