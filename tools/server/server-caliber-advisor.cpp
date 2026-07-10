@@ -19,10 +19,6 @@
 #include <thread>
 #include <unistd.h>
 
-#ifndef LLAMA_CALIBER_REPORTS_DIR
-#define LLAMA_CALIBER_REPORTS_DIR "tools/ui/static/reports/caliber"
-#endif
-
 namespace {
 
 using json = nlohmann::ordered_json;
@@ -54,7 +50,20 @@ static bool caliber_job_status_live(const std::string & status) {
 }
 
 static std::filesystem::path reports_dir() {
-    return std::filesystem::path(LLAMA_CALIBER_REPORTS_DIR);
+    const auto target = server_persistence::state_dir() / "reports" / "caliber";
+    static std::once_flag migrate_once;
+    std::call_once(migrate_once, [&]() {
+        std::filesystem::create_directories(target);
+        const auto legacy = std::filesystem::current_path() / "tools" / "ui" / "static" / "reports" / "caliber";
+        std::error_code ec;
+        if (!std::filesystem::exists(legacy, ec)) return;
+        for (const auto & entry : std::filesystem::directory_iterator(legacy, ec)) {
+            if (ec || !entry.is_regular_file(ec) || entry.path().extension() != ".json") continue;
+            const auto destination = target / entry.path().filename();
+            if (!std::filesystem::exists(destination, ec)) std::filesystem::copy_file(entry.path(), destination, ec);
+        }
+    });
+    return target;
 }
 
 static std::string read_text_file(const std::filesystem::path & path) {
@@ -67,9 +76,19 @@ static std::string read_text_file(const std::filesystem::path & path) {
 
 static void write_text_file(const std::filesystem::path & path, const std::string & text) {
     std::filesystem::create_directories(path.parent_path());
-    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    const auto temporary = std::filesystem::path(path.string() + ".tmp");
+    std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
     if (!out) throw std::runtime_error("failed to write " + path.string());
     out << text;
+    out.close();
+    std::error_code ec;
+    std::filesystem::rename(temporary, path, ec);
+    if (ec) {
+        std::filesystem::remove(path, ec);
+        ec.clear();
+        std::filesystem::rename(temporary, path, ec);
+    }
+    if (ec) throw std::runtime_error("failed to atomically replace " + path.string());
 }
 
 static std::string shell_quote(const std::string & value) {
@@ -848,7 +867,6 @@ struct server_caliber_advisor_routes::impl {
                     {"recommendation_policy", {{"id", "caliber-recommendation"}, {"version", caliber::RECOMMENDATION_POLICY_VERSION}}},
                 };
                 const auto report_path = reports_dir() / (report_id + ".json");
-                write_text_file(report_path, report.dump(2) + "\n");
                 server_persistence::record_report(
                     "caliber-advisor",
                     report_id,
@@ -857,6 +875,7 @@ struct server_caliber_advisor_routes::impl {
                     json_value(report, "model", std::string()),
                     report_path,
                     report);
+                write_text_file(report_path, report.dump(2) + "\n");
                 {
                     std::lock_guard<std::mutex> lock(job->mutex);
                     job->status = cancelled ? "cancelled" : "completed";
@@ -955,13 +974,10 @@ struct server_caliber_advisor_routes::impl {
 
     server_http_res_ptr handle_reports(const server_http_req & req) {
         auto res = std::make_unique<server_http_res>();
-        std::filesystem::create_directories(reports_dir());
         std::vector<json> report_items;
-        for (const auto & entry : std::filesystem::directory_iterator(reports_dir())) {
-            if (!entry.is_regular_file() || entry.path().extension() != ".json") continue;
-            try {
-                report_items.push_back(report_summary(json::parse(read_text_file(entry.path())), entry.path()));
-            } catch (...) {}
+        for (const auto & report : server_persistence::load_reports("caliber-advisor")) {
+            if (!report.is_object()) continue;
+            report_items.push_back(report_summary(report, {}));
         }
         std::sort(report_items.begin(), report_items.end(), [](const json & a, const json & b) {
             return json_value(a, "created_at", std::string()) > json_value(b, "created_at", std::string());
@@ -991,12 +1007,12 @@ struct server_caliber_advisor_routes::impl {
             res_err(res, "report id is required");
             return res;
         }
-        const auto path = reports_dir() / (slugify(id) + ".json");
-        if (!std::filesystem::exists(path)) {
+        const json report = server_persistence::load_report("caliber-advisor", slugify(id));
+        if (!report.is_object()) {
             res_err(res, "report not found", 404);
             return res;
         }
-        res_ok(res, normalize_report_for_api(json::parse(read_text_file(path))));
+        res_ok(res, normalize_report_for_api(report));
         return res;
     }
 
@@ -1008,32 +1024,33 @@ struct server_caliber_advisor_routes::impl {
             return res;
         }
         const auto path = reports_dir() / (slugify(id) + ".json");
-        bool removed = false;
-        if (std::filesystem::exists(path)) removed = std::filesystem::remove(path);
-        if (removed) server_persistence::delete_report("caliber-advisor", slugify(id));
+        const bool removed = server_persistence::load_report("caliber-advisor", slugify(id)).is_object();
+        if (removed) {
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+            server_persistence::delete_report("caliber-advisor", slugify(id));
+        }
         res_ok(res, {{"success", removed}, {"id", id}});
         return res;
     }
 
     server_http_res_ptr handle_results(const server_http_req &) {
         auto res = std::make_unique<server_http_res>();
-        std::filesystem::create_directories(reports_dir());
         json all_rows = json::array();
         json reports = json::array();
         std::vector<json> latest_rows;
         std::string latest_created_at;
         std::string latest_report_id;
-        for (const auto & entry : std::filesystem::directory_iterator(reports_dir())) {
-            if (!entry.is_regular_file() || entry.path().extension() != ".json") continue;
+        for (const auto & stored_report : server_persistence::load_reports("caliber-advisor")) {
             try {
-                json report = normalize_report_for_api(json::parse(read_text_file(entry.path())));
-                reports.push_back(report_summary(report, entry.path()));
+                json report = normalize_report_for_api(stored_report);
+                reports.push_back(report_summary(report, {}));
                 if (report.contains("rows") && report["rows"].is_array()) {
                     for (const auto & row : report["rows"]) all_rows.push_back(row);
                     const std::string created_at = json_value(report, "created_at", std::string());
                     if (created_at >= latest_created_at) {
                         latest_created_at = created_at;
-                        latest_report_id = json_value(report, "id", entry.path().stem().string());
+                        latest_report_id = json_value(report, "id", std::string());
                         latest_rows.clear();
                         for (const auto & row : report["rows"]) {
                             if (row.is_object()) latest_rows.push_back(row);

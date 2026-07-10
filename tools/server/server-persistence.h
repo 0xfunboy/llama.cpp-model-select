@@ -9,6 +9,9 @@
 namespace server_persistence {
 
 std::filesystem::path database_path();
+std::filesystem::path data_dir();
+std::filesystem::path state_dir();
+json redact_for_export(const json & value);
 
 void import_existing_reports_once();
 
@@ -22,6 +25,8 @@ void record_report(
         const json & payload);
 
 void delete_report(const std::string & module, const std::string & id);
+json load_report(const std::string & module, const std::string & id);
+json load_reports(const std::string & module);
 
 void record_download(const json & snapshot);
 void record_fit_recommendations(const json & response);

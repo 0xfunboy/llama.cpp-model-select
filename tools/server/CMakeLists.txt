@@ -61,9 +61,6 @@ add_library(${TARGET}
 set_target_properties(${TARGET} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 target_compile_definitions(${TARGET} PRIVATE
     LLAMA_DS4_EVAL_CASES_PATH="${CMAKE_CURRENT_SOURCE_DIR}/ds4-eval-cases.json"
-    LLAMA_DS4_REPORTS_DIR="${CMAKE_SOURCE_DIR}/tools/ui/static/reports"
-    LLAMA_CALIBER_REPORTS_DIR="${CMAKE_SOURCE_DIR}/tools/ui/static/reports/caliber"
-    LLAMA_PLATFORM_DB_PATH="${CMAKE_SOURCE_DIR}/data/llm-model-select.sqlite"
 )
 
 target_include_directories(${TARGET} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -123,6 +120,12 @@ if(LLAMA_BUILD_TESTS)
     )
     target_link_libraries(test-model-registry PRIVATE ggml)
     add_test(NAME model-registry COMMAND test-model-registry)
+
+    add_executable(test-server-persistence tests/test-server-persistence.cpp)
+    target_compile_features(test-server-persistence PRIVATE cxx_std_17)
+    target_include_directories(test-server-persistence PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(test-server-persistence PRIVATE llama-server-impl SQLite::SQLite3)
+    add_test(NAME server-persistence COMMAND test-server-persistence)
 endif()
 
 # llama-server executable

@@ -27,10 +27,6 @@
 #define LLAMA_DS4_EVAL_CASES_PATH "tools/server/ds4-eval-cases.json"
 #endif
 
-#ifndef LLAMA_DS4_REPORTS_DIR
-#define LLAMA_DS4_REPORTS_DIR "tools/ui/static/reports"
-#endif
-
 namespace {
 
 static constexpr const char * DS4_CHILD_HOST = "127.0.0.1";
@@ -263,7 +259,20 @@ static std::string kind_from_req(const server_http_req & req) {
 }
 
 static std::filesystem::path reports_dir() {
-    return std::filesystem::path(LLAMA_DS4_REPORTS_DIR);
+    const auto target = server_persistence::state_dir() / "reports" / "ds4";
+    static std::once_flag migrate_once;
+    std::call_once(migrate_once, [&]() {
+        std::filesystem::create_directories(target);
+        const auto legacy = std::filesystem::current_path() / "tools" / "ui" / "static" / "reports";
+        std::error_code ec;
+        if (!std::filesystem::exists(legacy, ec)) return;
+        for (const auto & entry : std::filesystem::directory_iterator(legacy, ec)) {
+            if (ec || !entry.is_regular_file(ec) || entry.path().extension() != ".json") continue;
+            const auto destination = target / entry.path().filename();
+            if (!std::filesystem::exists(destination, ec)) std::filesystem::copy_file(entry.path(), destination, ec);
+        }
+    });
+    return target;
 }
 
 static std::string read_text_file(const std::filesystem::path & path) {
@@ -287,12 +296,11 @@ static std::filesystem::path report_path_from_id(std::string id) {
 }
 
 static json read_report_by_id(const std::string & id) {
-    const auto path = report_path_from_id(id);
-    std::error_code ec;
-    if (!std::filesystem::exists(path, ec)) {
-        throw std::runtime_error("DS4 report not found");
-    }
-    return json::parse(read_text_file(path));
+    const std::string report_id = std::filesystem::path(id).stem().string();
+    json report = server_persistence::load_report("ds4-eval", report_id);
+    if (!report.is_object()) report = server_persistence::load_report("ds4-bench", report_id);
+    if (!report.is_object()) throw std::runtime_error("DS4 report not found");
+    return report;
 }
 
 static std::vector<ds4_case> load_eval_cases() {
@@ -1148,11 +1156,6 @@ struct server_ds4_routes::impl {
             std::lock_guard<std::mutex> lock(job->mutex);
             snapshot = job->report;
         }
-        std::ofstream out(path, std::ios::binary);
-        if (!out) {
-            throw std::runtime_error(string_format("cannot write report '%s'", path.string().c_str()));
-        }
-        out << snapshot.dump(2) << "\n";
         const std::string kind = json_value(snapshot, "kind", job->kind);
         server_persistence::record_report(
             kind == "bench" ? "ds4-bench" : "ds4-eval",
@@ -1162,6 +1165,21 @@ struct server_ds4_routes::impl {
             json_value(snapshot, "model_selector", job->model_selector),
             path,
             snapshot);
+        const auto temporary = std::filesystem::path(path.string() + ".tmp");
+        std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            throw std::runtime_error(string_format("cannot write report '%s'", path.string().c_str()));
+        }
+        out << snapshot.dump(2) << "\n";
+        out.close();
+        std::error_code ec;
+        std::filesystem::rename(temporary, path, ec);
+        if (ec) {
+            std::filesystem::remove(path, ec);
+            ec.clear();
+            std::filesystem::rename(temporary, path, ec);
+        }
+        if (ec) throw std::runtime_error(string_format("cannot atomically replace report '%s'", path.string().c_str()));
     }
 
     void store_report(const std::shared_ptr<ds4_job> & job, json report) {
@@ -1928,17 +1946,15 @@ struct server_ds4_routes::impl {
             ds4_res_err(res, format_error_response("invalid report id", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
-        if (!ends_with(id, ".json")) {
-            id += ".json";
-        }
-        const auto path = reports_dir() / id;
-        std::error_code ec;
-        if (!std::filesystem::exists(path, ec)) {
+        const std::string report_id = std::filesystem::path(id).stem().string();
+        json report = server_persistence::load_report("ds4-eval", report_id);
+        if (!report.is_object()) report = server_persistence::load_report("ds4-bench", report_id);
+        if (!report.is_object()) {
             ds4_res_err(res, format_error_response("DS4 report not found", ERROR_TYPE_NOT_FOUND));
             return res;
         }
         res->status = 200;
-        res->data = read_text_file(path);
+        res->data = safe_json_to_str(report);
         return res;
     }
 
@@ -1949,22 +1965,16 @@ struct server_ds4_routes::impl {
             ds4_res_err(res, format_error_response("invalid report id", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
-        const auto path = report_path_from_id(id);
-        std::error_code ec;
-        if (!std::filesystem::exists(path, ec)) {
+        const std::string requested_id = std::filesystem::path(id).stem().string();
+        json report = server_persistence::load_report("ds4-eval", requested_id);
+        if (!report.is_object()) report = server_persistence::load_report("ds4-bench", requested_id);
+        if (!report.is_object()) {
             ds4_res_err(res, format_error_response("DS4 report not found", ERROR_TYPE_NOT_FOUND));
             return res;
         }
-
-        json report;
-        try {
-            report = json::parse(read_text_file(path));
-        } catch (const std::exception & e) {
-            ds4_res_err(res, format_error_response(e.what(), ERROR_TYPE_SERVER));
-            return res;
-        }
-
-        const std::string report_id = json_value(report, "id", std::filesystem::path(path).stem().string());
+        const auto path = report_path_from_id(requested_id);
+        std::error_code ec;
+        const std::string report_id = json_value(report, "id", requested_id);
         const std::string kind = json_value(report, "kind", std::string());
         const std::string status = json_value(report, "status", std::string());
         if (status == "completed" || json_value(report, "resumable", false) == false) {
@@ -1980,10 +1990,7 @@ struct server_ds4_routes::impl {
             }
         }
 
-        if (!std::filesystem::remove(path, ec) || ec) {
-            ds4_res_err(res, format_error_response("failed to delete DS4 report", ERROR_TYPE_SERVER));
-            return res;
-        }
+        std::filesystem::remove(path, ec);
         server_persistence::delete_report(kind == "bench" ? "ds4-bench" : "ds4-eval", report_id);
         ds4_res_ok(res, {{"deleted", true}, {"id", report_id}});
         return res;
@@ -2075,16 +2082,12 @@ void server_ds4_routes::init_routes() {
 
     get_reports = [p = pimpl](const server_http_req &) {
         auto res = std::make_unique<server_http_res>();
-        std::filesystem::create_directories(reports_dir());
         json reports = json::array();
-        for (const auto & entry : std::filesystem::directory_iterator(reports_dir())) {
-            if (!entry.is_regular_file() || entry.path().extension() != ".json") {
-                continue;
-            }
-            try {
-                json report = json::parse(read_text_file(entry.path()));
+        for (const std::string module : {"ds4-eval", "ds4-bench"}) {
+            for (const auto & report : server_persistence::load_reports(module)) {
+                if (!report.is_object()) continue;
                 reports.push_back({
-                    {"id", json_value(report, "id", entry.path().stem().string())},
+                    {"id", json_value(report, "id", std::string())},
                     {"kind", json_value(report, "kind", std::string())},
                     {"status", json_value(report, "status", std::string())},
                     {"resumable", json_value(report, "resumable", false)},
@@ -2094,10 +2097,12 @@ void server_ds4_routes::init_routes() {
                     {"model_selector", json_value(report, "model_selector", std::string())},
                     {"summary", json_value(report, "summary", json::object())},
                 });
-            } catch (const std::exception & e) {
-                SRV_WRN("skipping DS4 report %s: %s\n", entry.path().string().c_str(), e.what());
             }
         }
+        std::sort(reports.begin(), reports.end(), [](const json & a, const json & b) {
+            return json_value(a, "updated_at", json_value(a, "created_at", std::string())) >
+                   json_value(b, "updated_at", json_value(b, "created_at", std::string()));
+        });
         ds4_res_ok(res, {{"data", reports}, {"object", "list"}});
         return res;
     };

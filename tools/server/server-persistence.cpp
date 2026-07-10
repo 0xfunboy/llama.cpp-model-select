@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cstdint>
 #include <ctime>
 #include <filesystem>
@@ -12,18 +13,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <vector>
-
-#ifndef LLAMA_PLATFORM_DB_PATH
-#define LLAMA_PLATFORM_DB_PATH "data/llm-model-select.sqlite"
-#endif
-
-#ifndef LLAMA_DS4_REPORTS_DIR
-#define LLAMA_DS4_REPORTS_DIR "tools/ui/static/reports"
-#endif
-
-#ifndef LLAMA_CALIBER_REPORTS_DIR
-#define LLAMA_CALIBER_REPORTS_DIR "tools/ui/static/reports/caliber"
-#endif
+#include <cstdlib>
 
 namespace server_persistence {
 namespace {
@@ -31,6 +21,16 @@ namespace {
 static std::mutex g_mutex;
 static bool g_schema_ready = false;
 static bool g_imported_reports = false;
+
+static std::filesystem::path xdg_dir(const char * env_name, const std::filesystem::path & home_suffix) {
+    if (const char * configured = std::getenv(env_name); configured && configured[0] != '\0') {
+        return std::filesystem::path(configured) / "llama.cpp-model-select";
+    }
+    if (const char * home = std::getenv("HOME"); home && home[0] != '\0') {
+        return std::filesystem::path(home) / home_suffix / "llama.cpp-model-select";
+    }
+    return std::filesystem::temp_directory_path() / "llama.cpp-model-select";
+}
 
 static std::string isoish_timestamp() {
     const auto now = std::chrono::system_clock::now();
@@ -58,6 +58,18 @@ static std::string read_text_file(const std::filesystem::path & path) {
 
 static std::string json_dump(const json & value) {
     return value.is_discarded() ? "null" : value.dump();
+}
+
+static std::string stable_fingerprint(const json & value) {
+    uint64_t hash = 1469598103934665603ULL;
+    const std::string text = json_dump(value);
+    for (unsigned char c : text) {
+        hash ^= c;
+        hash *= 1099511628211ULL;
+    }
+    std::ostringstream out;
+    out << std::hex << hash;
+    return out.str();
 }
 
 static std::string json_string_value(const json & value, const std::string & key) {
@@ -164,8 +176,37 @@ static void exec_sql(sqlite3 * db, const char * sql) {
     }
 }
 
+static void migrate_legacy_database(const std::filesystem::path & target) {
+    if (std::filesystem::exists(target)) return;
+    std::filesystem::path legacy;
+    if (const char * configured = std::getenv("LLAMA_MODEL_SELECT_LEGACY_DB"); configured && configured[0] != '\0') {
+        legacy = configured;
+    } else {
+        legacy = std::filesystem::current_path() / "data" / "llm-model-select.sqlite";
+    }
+    std::error_code ec;
+    if (!std::filesystem::exists(legacy, ec) || std::filesystem::equivalent(legacy, target, ec)) return;
+    std::filesystem::create_directories(target.parent_path());
+    sqlite3 * source = nullptr;
+    sqlite3 * destination = nullptr;
+    if (sqlite3_open_v2(legacy.string().c_str(), &source, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK ||
+        sqlite3_open_v2(target.string().c_str(), &destination, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) != SQLITE_OK) {
+        if (source) sqlite3_close(source);
+        if (destination) sqlite3_close(destination);
+        std::filesystem::remove(target, ec);
+        return;
+    }
+    sqlite3_backup * backup = sqlite3_backup_init(destination, "main", source, "main");
+    const bool copied = backup && sqlite3_backup_step(backup, -1) == SQLITE_DONE;
+    if (backup) sqlite3_backup_finish(backup);
+    sqlite3_close(source);
+    sqlite3_close(destination);
+    if (!copied) std::filesystem::remove(target, ec);
+}
+
 static db_handle open_database_locked() {
     const auto path = database_path();
+    migrate_legacy_database(path);
     std::filesystem::create_directories(path.parent_path());
 
     db_handle handle;
@@ -264,11 +305,31 @@ static db_handle open_database_locked() {
             "  created_at TEXT NOT NULL,"
             "  payload_json TEXT NOT NULL"
             ");"
+            "CREATE TABLE IF NOT EXISTS samples ("
+            "  module TEXT NOT NULL,"
+            "  report_id TEXT NOT NULL,"
+            "  result_id TEXT NOT NULL,"
+            "  sample_id TEXT NOT NULL,"
+            "  payload_json TEXT NOT NULL,"
+            "  created_at TEXT,"
+            "  PRIMARY KEY(module, report_id, result_id, sample_id)"
+            ");"
+            "CREATE TABLE IF NOT EXISTS archive_imports ("
+            "  fingerprint TEXT PRIMARY KEY,"
+            "  imported_at TEXT NOT NULL"
+            ");"
+            "CREATE TABLE IF NOT EXISTS imported_rows ("
+            "  kind TEXT NOT NULL,"
+            "  fingerprint TEXT NOT NULL,"
+            "  imported_at TEXT NOT NULL,"
+            "  PRIMARY KEY(kind, fingerprint)"
+            ");"
             "CREATE INDEX IF NOT EXISTS idx_results_model ON results(module, model);"
+            "CREATE INDEX IF NOT EXISTS idx_samples_result ON samples(module, report_id, result_id);"
             "CREATE INDEX IF NOT EXISTS idx_downloads_status ON downloads(status);"
             "CREATE INDEX IF NOT EXISTS idx_reports_status ON reports(module, status);");
         exec_sql(handle.db,
-            "INSERT INTO metadata(key, value) VALUES('schema_version', '1') "
+            "INSERT INTO metadata(key, value) VALUES('schema_version', '2') "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value;");
         g_schema_ready = true;
     }
@@ -362,7 +423,7 @@ static std::string result_domain(const json & row) {
 }
 
 static std::string result_model(const json & row) {
-    std::string out = first_string(row, {"model", "model_id", "name"});
+    std::string out = first_string(row, {"artifact_id", "model_id", "model", "name"});
     return out.empty() ? "unknown" : out;
 }
 
@@ -385,6 +446,30 @@ static void insert_event_locked(sqlite3 * db, const std::string & module, const 
     bind_text(stmt.stmt, 4, isoish_timestamp());
     bind_text(stmt.stmt, 5, json_dump(payload));
     step_done(db, stmt.stmt);
+}
+
+static void insert_samples_locked(sqlite3 * db, const std::string & module, const std::string & report_id, const std::string & result_id, const json & row) {
+    if (!row.contains("runs") || !row["runs"].is_array()) return;
+    size_t index = 0;
+    for (const auto & sample : row["runs"]) {
+        if (!sample.is_object()) {
+            ++index;
+            continue;
+        }
+        std::string sample_id = first_string(sample, {"sample_id", "run_id", "run_index"});
+        if (sample_id.empty()) sample_id = std::to_string(index);
+        auto stmt = prepare(db,
+            "INSERT OR IGNORE INTO samples(module, report_id, result_id, sample_id, payload_json, created_at) "
+            "VALUES(?, ?, ?, ?, ?, ?);");
+        bind_text(stmt.stmt, 1, module);
+        bind_text(stmt.stmt, 2, report_id);
+        bind_text(stmt.stmt, 3, result_id);
+        bind_text(stmt.stmt, 4, sample_id);
+        bind_text(stmt.stmt, 5, json_dump(sample));
+        bind_text(stmt.stmt, 6, first_string(sample, {"timestamp", "created_at"}));
+        step_done(db, stmt.stmt);
+        ++index;
+    }
 }
 
 static void insert_result_locked(sqlite3 * db, const std::string & module, const std::string & report_id, const std::string & report_status, const json & row, size_t index) {
@@ -411,6 +496,7 @@ static void insert_result_locked(sqlite3 * db, const std::string & module, const
     bind_text(stmt.stmt, 8, json_dump(row));
     bind_text(stmt.stmt, 9, created_at);
     step_done(db, stmt.stmt);
+    insert_samples_locked(db, module, report_id, rid, row);
 
     const bool eligible = report_status == "completed" && (status == "ok" || status == "pass") && score > 0.0;
     if (!eligible || model == "unknown") {
@@ -433,6 +519,24 @@ static void insert_result_locked(sqlite3 * db, const std::string & module, const
     bind_text(best.stmt, 7, json_dump(row));
     bind_text(best.stmt, 8, isoish_timestamp());
     step_done(db, best.stmt);
+}
+
+static void rebuild_best_results_locked(sqlite3 * db) {
+    exec_sql(db, "DELETE FROM best_results;");
+    auto stmt = prepare(db,
+        "INSERT INTO best_results(module, model, domain, score, report_id, result_id, payload_json, updated_at) "
+        "SELECT r.module, r.model, r.domain, r.score, r.report_id, r.result_id, r.payload_json, ? "
+        "FROM results r JOIN reports p ON p.module = r.module AND p.id = r.report_id "
+        "WHERE p.status = 'completed' AND r.status IN ('ok', 'pass') AND r.score > 0 AND r.model <> 'unknown' "
+        "AND NOT EXISTS ("
+        "  SELECT 1 FROM results better JOIN reports bp ON bp.module = better.module AND bp.id = better.report_id "
+        "  WHERE better.module = r.module AND better.model = r.model AND better.domain = r.domain "
+        "    AND bp.status = 'completed' AND better.status IN ('ok', 'pass') AND better.score > 0 "
+        "    AND (better.score > r.score OR (better.score = r.score AND (better.result_id < r.result_id OR "
+        "         (better.result_id = r.result_id AND better.report_id < r.report_id))))"
+        ");");
+    bind_text(stmt.stmt, 1, isoish_timestamp());
+    step_done(db, stmt.stmt);
 }
 
 static void record_report_locked(sqlite3 * db,
@@ -533,14 +637,14 @@ static void import_reports_table_locked(sqlite3 * db, const json & rows) {
     if (!rows.is_array()) return;
     for (const auto & row : rows) {
         if (!row.is_object()) continue;
-        const json payload = row.value("payload_json", json::object());
+        const json payload = redact_for_export(row.value("payload_json", json::object()));
         record_report_locked(db,
             json_string_value(row, "module"),
             json_string_value(row, "id"),
             json_string_value(row, "kind"),
             json_string_value(row, "status"),
             json_string_value(row, "title"),
-            json_string_value(row, "path"),
+            std::filesystem::path(),
             payload);
     }
 }
@@ -549,7 +653,7 @@ static void import_downloads_table_locked(sqlite3 * db, const json & rows) {
     if (!rows.is_array()) return;
     for (const auto & row : rows) {
         if (!row.is_object()) continue;
-        const json payload = row.value("payload_json", row);
+        const json payload = redact_for_export(row.value("payload_json", row));
         auto stmt = prepare(db,
             "INSERT INTO downloads(id, model_id, repo, hf_ref, quant, status, target_dir, local_path, downloaded_bytes, total_bytes, percent, started_at, updated_at, finished_at, payload_json) "
             "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
@@ -564,8 +668,8 @@ static void import_downloads_table_locked(sqlite3 * db, const json & rows) {
         bind_text(stmt.stmt, 4, json_string_value(row, "hf_ref"));
         bind_text(stmt.stmt, 5, json_string_value(row, "quant"));
         bind_text(stmt.stmt, 6, json_string_value(row, "status"));
-        bind_text(stmt.stmt, 7, json_string_value(row, "target_dir"));
-        bind_text(stmt.stmt, 8, json_string_value(row, "local_path"));
+        bind_text(stmt.stmt, 7, "");
+        bind_text(stmt.stmt, 8, "");
         bind_i64(stmt.stmt, 9, json_i64_value(row, "downloaded_bytes"));
         bind_i64(stmt.stmt, 10, json_i64_value(row, "total_bytes"));
         bind_double(stmt.stmt, 11, json_number_value(row, "percent"));
@@ -581,7 +685,7 @@ static void import_fit_table_locked(sqlite3 * db, const json & rows) {
     if (!rows.is_array()) return;
     for (const auto & row : rows) {
         if (!row.is_object()) continue;
-        const json payload = row.value("payload_json", row);
+        const json payload = redact_for_export(row.value("payload_json", row));
         auto stmt = prepare(db,
             "INSERT INTO fit_recommendations(id, quant, strategy, score, fit_level, use_case, context_length, payload_json, updated_at) "
             "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?) "
@@ -605,7 +709,20 @@ static void import_configurations_table_locked(sqlite3 * db, const json & rows) 
     if (!rows.is_array()) return;
     for (const auto & row : rows) {
         if (!row.is_object()) continue;
-        const json payload = row.value("payload_json", row);
+        const std::string fingerprint = stable_fingerprint(row);
+        auto imported = prepare(db, "INSERT OR IGNORE INTO imported_rows(kind, fingerprint, imported_at) VALUES('configuration', ?, ?);");
+        bind_text(imported.stmt, 1, fingerprint);
+        bind_text(imported.stmt, 2, isoish_timestamp());
+        step_done(db, imported.stmt);
+        if (sqlite3_changes(db) == 0) continue;
+        const json payload = redact_for_export(row.value("payload_json", row));
+        auto existing = prepare(db,
+            "SELECT 1 FROM configurations WHERE module = ? AND model_id = ? AND preset_id = ? AND created_at = ? LIMIT 1;");
+        bind_text(existing.stmt, 1, json_string_value(row, "module"));
+        bind_text(existing.stmt, 2, json_string_value(row, "model_id"));
+        bind_text(existing.stmt, 3, json_string_value(row, "preset_id"));
+        bind_text(existing.stmt, 4, json_string_value(row, "created_at"));
+        if (sqlite3_step(existing.stmt) == SQLITE_ROW) continue;
         auto stmt = prepare(db,
             "INSERT INTO configurations(module, model_id, preset_id, created_at, payload_json) "
             "VALUES(?, ?, ?, ?, ?);");
@@ -622,7 +739,20 @@ static void import_events_table_locked(sqlite3 * db, const json & rows) {
     if (!rows.is_array()) return;
     for (const auto & row : rows) {
         if (!row.is_object()) continue;
-        const json payload = row.value("payload_json", row);
+        const std::string fingerprint = stable_fingerprint(row);
+        auto imported = prepare(db, "INSERT OR IGNORE INTO imported_rows(kind, fingerprint, imported_at) VALUES('event', ?, ?);");
+        bind_text(imported.stmt, 1, fingerprint);
+        bind_text(imported.stmt, 2, isoish_timestamp());
+        step_done(db, imported.stmt);
+        if (sqlite3_changes(db) == 0) continue;
+        const json payload = redact_for_export(row.value("payload_json", row));
+        auto existing = prepare(db,
+            "SELECT 1 FROM events WHERE module = ? AND event_type = ? AND object_id = ? AND created_at = ? LIMIT 1;");
+        bind_text(existing.stmt, 1, json_string_value(row, "module"));
+        bind_text(existing.stmt, 2, json_string_value(row, "event_type"));
+        bind_text(existing.stmt, 3, json_string_value(row, "object_id"));
+        bind_text(existing.stmt, 4, json_string_value(row, "created_at"));
+        if (sqlite3_step(existing.stmt) == SQLITE_ROW) continue;
         auto stmt = prepare(db,
             "INSERT INTO events(module, event_type, object_id, created_at, payload_json) "
             "VALUES(?, ?, ?, ?, ?);");
@@ -637,8 +767,84 @@ static void import_events_table_locked(sqlite3 * db, const json & rows) {
 
 } // namespace
 
+std::filesystem::path data_dir() {
+    return xdg_dir("XDG_DATA_HOME", ".local/share");
+}
+
+std::filesystem::path state_dir() {
+    return xdg_dir("XDG_STATE_HOME", ".local/state");
+}
+
 std::filesystem::path database_path() {
-    return std::filesystem::path(LLAMA_PLATFORM_DB_PATH);
+    if (const char * configured = std::getenv("LLAMA_MODEL_SELECT_DB_PATH"); configured && configured[0] != '\0') {
+        return configured;
+    }
+    return data_dir() / "platform.sqlite";
+}
+
+json redact_for_export(const json & value) {
+    if (value.is_string()) {
+        const std::string text = value.get<std::string>();
+        const bool windows_path = text.size() > 3 && std::isalpha((unsigned char) text[0]) && text[1] == ':' && (text[2] == '\\' || text[2] == '/');
+        const bool absolute_path = !text.empty() && text[0] == '/';
+        if (windows_path || absolute_path) {
+            const std::filesystem::path source(text);
+            return source.filename().empty() ? json("<local>") : json("<local>/" + source.filename().string());
+        }
+        return value;
+    }
+    if (value.is_array()) {
+        json out = json::array();
+        bool redact_next = false;
+        for (const auto & item : value) {
+            if (redact_next) {
+                out.push_back("[REDACTED]");
+                redact_next = false;
+                continue;
+            }
+            if (item.is_string()) {
+                const std::string token = item.get<std::string>();
+                if (token == "--api-key" || token == "--admin-api-key" || token == "--api-key-file" || token == "--admin-api-key-file") {
+                    out.push_back(token);
+                    redact_next = true;
+                    continue;
+                }
+            }
+            out.push_back(redact_for_export(item));
+        }
+        return out;
+    }
+    if (!value.is_object()) return value;
+    json out = json::object();
+    for (auto it = value.begin(); it != value.end(); ++it) {
+        std::string key = it.key();
+        std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return (char) std::tolower(c); });
+        const bool secret = key.find("api_key") != std::string::npos || key.find("authorization") != std::string::npos ||
+            key.find("password") != std::string::npos || key.find("secret") != std::string::npos || key == "token" || key.find("access_token") != std::string::npos;
+        const bool command = key.find("command") != std::string::npos;
+        const bool path = key == "path" || key == "paths" || key.find("_path") != std::string::npos || key.find("_dir") != std::string::npos || key == "database_path";
+        if (secret) {
+            out[it.key()] = "[REDACTED]";
+        } else if (command && it.value().is_string()) {
+            out[it.key()] = "[REDACTED_COMMAND]";
+        } else if (path && it.value().is_string()) {
+            const std::filesystem::path source(it.value().get<std::string>());
+            out[it.key()] = source.empty() ? "" : (source.filename().empty() ? "<local>" : "<local>/" + source.filename().string());
+        } else if (path && it.value().is_array()) {
+            out[it.key()] = json::array();
+            for (const auto & item : it.value()) {
+                if (!item.is_string()) {
+                    out[it.key()].push_back(redact_for_export(item));
+                    continue;
+                }
+                const std::filesystem::path source(item.get<std::string>());
+                out[it.key()].push_back(source.empty() ? "" : (source.filename().empty() ? "<local>" : "<local>/" + source.filename().string()));
+            }
+        } else {
+            out[it.key()] = redact_for_export(it.value());
+        }
+    }
+    return out;
 }
 
 void import_existing_reports_once() {
@@ -648,33 +854,27 @@ void import_existing_reports_once() {
     }
     try {
         auto db = open_database_locked();
+        exec_sql(db.db, "BEGIN IMMEDIATE;");
         std::error_code ec;
-        const std::filesystem::path ds4_dir(LLAMA_DS4_REPORTS_DIR);
-        if (std::filesystem::exists(ds4_dir, ec)) {
-            for (const auto & entry : std::filesystem::directory_iterator(ds4_dir, ec)) {
-                if (ec || !entry.is_regular_file(ec) || entry.path().extension() != ".json") {
-                    continue;
-                }
+        const std::vector<std::pair<std::filesystem::path, std::string>> report_dirs = {
+            {state_dir() / "reports" / "ds4", "ds4"},
+            {state_dir() / "reports" / "caliber", "caliber-advisor"},
+            {std::filesystem::current_path() / "tools" / "ui" / "static" / "reports", "ds4"},
+            {std::filesystem::current_path() / "tools" / "ui" / "static" / "reports" / "caliber", "caliber-advisor"},
+        };
+        for (const auto & [directory, module] : report_dirs) {
+            if (!std::filesystem::exists(directory, ec)) continue;
+            for (const auto & entry : std::filesystem::directory_iterator(directory, ec)) {
+                if (ec || !entry.is_regular_file(ec) || entry.path().extension() != ".json") continue;
                 try {
-                    import_report_file_locked(db.db, entry.path(), "ds4");
+                    import_report_file_locked(db.db, entry.path(), module);
                 } catch (const std::exception & e) {
                     SRV_WRN("archive import skipped %s: %s\n", entry.path().string().c_str(), e.what());
                 }
             }
         }
-        const std::filesystem::path caliber_dir(LLAMA_CALIBER_REPORTS_DIR);
-        if (std::filesystem::exists(caliber_dir, ec)) {
-            for (const auto & entry : std::filesystem::directory_iterator(caliber_dir, ec)) {
-                if (ec || !entry.is_regular_file(ec) || entry.path().extension() != ".json") {
-                    continue;
-                }
-                try {
-                    import_report_file_locked(db.db, entry.path(), "caliber-advisor");
-                } catch (const std::exception & e) {
-                    SRV_WRN("archive import skipped %s: %s\n", entry.path().string().c_str(), e.what());
-                }
-            }
-        }
+        rebuild_best_results_locked(db.db);
+        exec_sql(db.db, "COMMIT;");
         g_imported_reports = true;
     } catch (const std::exception & e) {
         SRV_WRN("archive import initialization failed: %s\n", e.what());
@@ -692,8 +892,11 @@ void record_report(
     std::lock_guard<std::mutex> lock(g_mutex);
     try {
         auto db = open_database_locked();
+        exec_sql(db.db, "BEGIN IMMEDIATE;");
         record_report_locked(db.db, module, id, kind, status, title, path, payload);
         insert_event_locked(db.db, module, "report_saved", id, {{"status", status}, {"path", path.string()}});
+        rebuild_best_results_locked(db.db);
+        exec_sql(db.db, "COMMIT;");
     } catch (const std::exception & e) {
         SRV_WRN("archive report write failed: %s\n", e.what());
     }
@@ -703,10 +906,11 @@ void delete_report(const std::string & module, const std::string & id) {
     std::lock_guard<std::mutex> lock(g_mutex);
     try {
         auto db = open_database_locked();
-        auto del_best = prepare(db.db, "DELETE FROM best_results WHERE module = ? AND report_id = ?;");
-        bind_text(del_best.stmt, 1, module);
-        bind_text(del_best.stmt, 2, id);
-        step_done(db.db, del_best.stmt);
+        exec_sql(db.db, "BEGIN IMMEDIATE;");
+        auto del_samples = prepare(db.db, "DELETE FROM samples WHERE module = ? AND report_id = ?;");
+        bind_text(del_samples.stmt, 1, module);
+        bind_text(del_samples.stmt, 2, id);
+        step_done(db.db, del_samples.stmt);
         auto del_results = prepare(db.db, "DELETE FROM results WHERE module = ? AND report_id = ?;");
         bind_text(del_results.stmt, 1, module);
         bind_text(del_results.stmt, 2, id);
@@ -715,10 +919,35 @@ void delete_report(const std::string & module, const std::string & id) {
         bind_text(del_report.stmt, 1, module);
         bind_text(del_report.stmt, 2, id);
         step_done(db.db, del_report.stmt);
+        rebuild_best_results_locked(db.db);
         insert_event_locked(db.db, module, "report_deleted", id, json::object());
+        exec_sql(db.db, "COMMIT;");
     } catch (const std::exception & e) {
         SRV_WRN("archive report delete failed: %s\n", e.what());
     }
+}
+
+json load_report(const std::string & module, const std::string & id) {
+    import_existing_reports_once();
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto db = open_database_locked();
+    auto stmt = prepare(db.db, "SELECT payload_json FROM reports WHERE module = ? AND id = ?;");
+    bind_text(stmt.stmt, 1, module);
+    bind_text(stmt.stmt, 2, id);
+    if (sqlite3_step(stmt.stmt) != SQLITE_ROW) return nullptr;
+    return col_json(stmt.stmt, 0);
+}
+
+json load_reports(const std::string & module) {
+    import_existing_reports_once();
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto db = open_database_locked();
+    auto stmt = prepare(db.db,
+        "SELECT payload_json FROM reports WHERE module = ? ORDER BY updated_at DESC, created_at DESC, id DESC;");
+    bind_text(stmt.stmt, 1, module);
+    json out = json::array();
+    while (sqlite3_step(stmt.stmt) == SQLITE_ROW) out.push_back(col_json(stmt.stmt, 0));
+    return out;
 }
 
 void record_download(const json & snapshot) {
@@ -835,6 +1064,7 @@ server_http_res_ptr handle_archive_status(const server_http_req &) {
         {"database_path", database_path().string()},
         {"reports", scalar_count(db.db, "SELECT COUNT(*) FROM reports")},
         {"results", scalar_count(db.db, "SELECT COUNT(*) FROM results")},
+        {"samples", scalar_count(db.db, "SELECT COUNT(*) FROM samples")},
         {"best_results", scalar_count(db.db, "SELECT COUNT(*) FROM best_results")},
         {"downloads", scalar_count(db.db, "SELECT COUNT(*) FROM downloads")},
         {"fit_recommendations", scalar_count(db.db, "SELECT COUNT(*) FROM fit_recommendations")},
@@ -852,7 +1082,7 @@ server_http_res_ptr handle_archive_export(const server_http_req &) {
     auto db = open_database_locked();
     json archive = {
         {"object", "llm-model-select.archive"},
-        {"version", 1},
+        {"version", 2},
         {"exported_at", isoish_timestamp()},
         {"database_path", database_path().string()},
         {"tables", {
@@ -863,6 +1093,10 @@ server_http_res_ptr handle_archive_export(const server_http_req &) {
             {"results", select_rows(db.db,
                 "SELECT module, report_id, result_id, model, domain, status, score, payload_json, created_at FROM results ORDER BY module, report_id, result_id",
                 {"module", "report_id", "result_id", "model", "domain", "status", "score", "payload_json", "created_at"},
+                {"payload_json"})},
+            {"samples", select_rows(db.db,
+                "SELECT module, report_id, result_id, sample_id, payload_json, created_at FROM samples ORDER BY module, report_id, result_id, sample_id",
+                {"module", "report_id", "result_id", "sample_id", "payload_json", "created_at"},
                 {"payload_json"})},
             {"best_results", select_rows(db.db,
                 "SELECT module, model, domain, score, report_id, result_id, payload_json, updated_at FROM best_results ORDER BY module, domain, score DESC",
@@ -886,6 +1120,8 @@ server_http_res_ptr handle_archive_export(const server_http_req &) {
                 {"payload_json"})},
         }},
     };
+    archive.erase("database_path");
+    archive = redact_for_export(archive);
     res->headers["Content-Disposition"] = "attachment; filename=\"llm-model-select-archive.json\"";
     res->data = archive.dump(2);
     return res;
@@ -903,13 +1139,23 @@ server_http_res_ptr handle_archive_import(const server_http_req & req) {
     auto db = open_database_locked();
     exec_sql(db.db, "BEGIN IMMEDIATE;");
     try {
+        const std::string archive_fingerprint = stable_fingerprint(archive);
+        auto imported = prepare(db.db, "INSERT OR IGNORE INTO archive_imports(fingerprint, imported_at) VALUES(?, ?);");
+        bind_text(imported.stmt, 1, archive_fingerprint);
+        bind_text(imported.stmt, 2, isoish_timestamp());
+        step_done(db.db, imported.stmt);
+        const bool already_imported = sqlite3_changes(db.db) == 0;
         const json tables = archive.value("tables", json::object());
-        import_reports_table_locked(db.db, tables.value("reports", json::array()));
-        import_downloads_table_locked(db.db, tables.value("downloads", json::array()));
-        import_fit_table_locked(db.db, tables.value("fit_recommendations", json::array()));
-        import_configurations_table_locked(db.db, tables.value("configurations", json::array()));
-        import_events_table_locked(db.db, tables.value("events", json::array()));
+        if (!already_imported) {
+            import_reports_table_locked(db.db, tables.value("reports", json::array()));
+            import_downloads_table_locked(db.db, tables.value("downloads", json::array()));
+            import_fit_table_locked(db.db, tables.value("fit_recommendations", json::array()));
+            import_configurations_table_locked(db.db, tables.value("configurations", json::array()));
+            import_events_table_locked(db.db, tables.value("events", json::array()));
+            rebuild_best_results_locked(db.db);
+        }
         exec_sql(db.db, "COMMIT;");
+        res->headers["X-Archive-Already-Imported"] = already_imported ? "true" : "false";
     } catch (...) {
         exec_sql(db.db, "ROLLBACK;");
         throw;
@@ -919,6 +1165,7 @@ server_http_res_ptr handle_archive_import(const server_http_req & req) {
         {"database_path", database_path().string()},
         {"reports", scalar_count(db.db, "SELECT COUNT(*) FROM reports")},
         {"results", scalar_count(db.db, "SELECT COUNT(*) FROM results")},
+        {"samples", scalar_count(db.db, "SELECT COUNT(*) FROM samples")},
         {"downloads", scalar_count(db.db, "SELECT COUNT(*) FROM downloads")},
         {"fit_recommendations", scalar_count(db.db, "SELECT COUNT(*) FROM fit_recommendations")},
     });

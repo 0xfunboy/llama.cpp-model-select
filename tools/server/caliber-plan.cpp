@@ -522,6 +522,9 @@ json new_plan_item(const json & meta, const std::string & sweep, const json & le
     const std::string identity_label = workload_identity.empty() ? label : label + "_" + workload_identity;
     json item = {
         {"id", sanitize(str_value(meta, "model") + "_" + str_value(meta, "variant"), 40) + "__" + sanitize(identity_label, 80)},
+        {"artifact_id", has_key(meta, "artifact_id") ? meta.at("artifact_id") : json(nullptr)},
+        {"model_id", has_key(meta, "model_id") ? meta.at("model_id") : json(nullptr)},
+        {"preset_id", has_key(meta, "preset_id") ? meta.at("preset_id") : json(nullptr)},
         {"model_path", str_value(meta, "path")},
         {"mmproj_path", has_key(meta, "mmproj") ? meta.at("mmproj") : json(nullptr)},
         {"model", str_value(meta, "model")},

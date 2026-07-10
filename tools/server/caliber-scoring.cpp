@@ -1229,6 +1229,9 @@ json aggregate_bench_result(const json & item, const json & cfg, const std::vect
     json result = {
         {"metric_schema_version", METRIC_SCHEMA_VERSION},
         {"id", item.value("id", json(nullptr))},
+        {"artifact_id", item.value("artifact_id", json(nullptr))},
+        {"model_id", item.value("model_id", json(nullptr))},
+        {"preset_id", item.value("preset_id", json(nullptr))},
         {"label", item.value("label", json(nullptr))},
         {"model", item.value("model", json(nullptr))},
         {"variant", item.value("variant", json(nullptr))},
