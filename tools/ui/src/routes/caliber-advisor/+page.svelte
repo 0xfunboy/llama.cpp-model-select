@@ -38,6 +38,7 @@
 	type ReportMetric = 'eval' | 'prompt' | 'memory' | 'latency' | 'vram';
 	type CaliberRow = Record<string, unknown>;
 	type ReportModelGroup = { model: string; rows: CaliberRow[]; winner: CaliberRow | null };
+	type RecommendationDecision = Record<string, unknown>;
 
 	const contextOptions = [
 		{ label: '8k', value: 8192, hint: 'Short chat and smoke tests' },
@@ -140,18 +141,19 @@
 	const resultRows = $derived(asRows(results?.rows).filter((row) => rowNum(row, ['eval_tps', 'tps']) > 0));
 	const reportRows = $derived(asRows(selectedReport?.rows));
 	const reportPlan = $derived(asRows(selectedReport?.plan));
-	const analyticsRows = $derived(resultRows.length > 0 ? resultRows : reportRows);
-	const scopedAnalyticsRows = $derived(filterReportScope(analyticsRows, reportScope));
+	const analyticsRows = $derived(selectedReport ? reportRows : resultRows);
+	const scopedAnalyticsRows = $derived(selectedReport ? analyticsRows : filterReportScope(analyticsRows, reportScope));
 	const okAnalyticsRows = $derived(scopedAnalyticsRows.filter((row) => rowText(row, ['ok']) !== 'false' && rowNum(row, ['eval_tps', 'tps']) > 0));
-	const reportGroups = $derived(buildReportGroups(scopedAnalyticsRows));
+	const recommendationSource = $derived(selectedReport ?? recommendationScope(results, reportScope));
+	const activeDecision = $derived(profileDecision(recommendationSource, profile));
+	const reportGroups = $derived(buildReportGroups(scopedAnalyticsRows, activeDecision));
 	const reportLeaderboard = $derived(rankRowsByMetric(reportGroups.map((group) => group.winner).filter(Boolean) as CaliberRow[]));
 	const reportMetricMax = $derived(Math.max(1, ...reportLeaderboard.map((row) => reportMetricValue(row, reportMetric))));
 	const reportScatterRows = $derived(okAnalyticsRows.filter((row) => reportTimeSec(row) > 0));
 	const reportMaxTime = $derived(Math.max(1, ...reportScatterRows.map(reportTimeSec)));
 	const reportMaxMemory = $derived(Math.max(1, ...reportScatterRows.map((row) => reportMemoryMib(row))));
 	const syntheticRows = $derived(scopedAnalyticsRows.filter((row) => rowText(row, ['benchmark_backend']) === 'llama-bench').length);
-	const profileWinners = $derived(buildProfileWinners(resultRows));
-	const bestWinner = $derived(profileWinners[0]?.[1] ?? null);
+	const bestWinner = $derived((asRecord(activeDecision?.winner) as CaliberRow | null) ?? null);
 	const completedReports = $derived(reports.filter((report) => report.rows > 0 && isCompleteStatus(report.status)));
 	const pendingReports = $derived(reports.filter((report) => canDeleteReport(report)));
 	const failedReports = $derived(reports.filter((report) => report.status === 'failed'));
@@ -179,6 +181,23 @@
 
 	function asRows(value: unknown): CaliberRow[] {
 		return Array.isArray(value) ? (value.filter((row) => row && typeof row === 'object') as CaliberRow[]) : [];
+	}
+
+	function asRecord(value: unknown): Record<string, unknown> | null {
+		return value && typeof value === 'object' && !Array.isArray(value)
+			? (value as Record<string, unknown>)
+			: null;
+	}
+
+	function recommendationScope(source: Record<string, unknown> | null, scope: ReportScope): Record<string, unknown> | null {
+		if (!source || scope === 'all') return source;
+		const scopes = asRecord(source.scopes);
+		return asRecord(scopes?.latest_campaign) ?? source;
+	}
+
+	function profileDecision(source: Record<string, unknown> | null, selectedProfile: ProfileId): RecommendationDecision | null {
+		const recommendations = asRecord(source?.recommendations);
+		return asRecord(recommendations?.[selectedProfile]);
 	}
 
 	function uniqueStrings(values: string[]): string[] {
@@ -282,36 +301,31 @@
 		});
 	}
 
-	function reportScore(row: CaliberRow): number {
-		const evalTps = rowNum(row, ['eval_tps', 'tps']);
-		const promptTps = rowNum(row, ['prompt_tps']);
-		const memory = Math.max(1, reportMemoryMib(row));
-		const shared = rowNum(row, ['shared_peak_mib']);
-		if (profile === 'speed') return evalTps;
-		if (profile === 'efficiency') return evalTps / memory;
-		if (profile === 'safety') return evalTps - shared * 0.02;
-		return evalTps * 0.62 + promptTps * 0.03 - shared * 0.03 + rowNum(row, ['ctx_size']) / 8192;
-	}
-
-	function buildReportGroups(rows: CaliberRow[]): ReportModelGroup[] {
+	function buildReportGroups(rows: CaliberRow[], decision: RecommendationDecision | null): ReportModelGroup[] {
 		const map = new Map<string, CaliberRow[]>();
 		for (const row of rows) {
 			const model = rowText(row, ['model', 'model_id'], 'unknown model');
 			map.set(model, [...(map.get(model) ?? []), row]);
 		}
+		const bestByModel = asRecord(decision?.best_by_model) ?? {};
+		const ordered = [decision?.winner, ...asRows(decision?.alternatives)]
+			.map((row) => asRecord(row))
+			.filter(Boolean)
+			.map((row) => rowText(row as CaliberRow, ['model', 'model_id']));
 		return [...map.entries()]
-			.map(([model, groupRows]) => {
-				const candidates = groupRows.filter(isReportCandidate);
-				const winner = candidates.sort((a, b) => reportScore(b) - reportScore(a))[0] ?? null;
-				return { model, rows: groupRows, winner };
-			})
-			.sort((a, b) => reportScore(b.winner ?? {}) - reportScore(a.winner ?? {}));
-	}
-
-	function buildProfileWinners(rows: CaliberRow[]): [string, CaliberRow][] {
-		return buildReportGroups(rows)
-			.filter((group) => Boolean(group.winner))
-			.map((group) => [group.model, group.winner as CaliberRow]);
+			.map(([model, groupRows]) => ({
+				model,
+				rows: groupRows,
+				winner: asRecord(bestByModel[model]) as CaliberRow | null
+			}))
+			.sort((a, b) => {
+				const ai = ordered.indexOf(a.model);
+				const bi = ordered.indexOf(b.model);
+				if (ai === -1 && bi === -1) return a.model.localeCompare(b.model);
+				if (ai === -1) return 1;
+				if (bi === -1) return -1;
+				return ai - bi;
+			});
 	}
 
 	function rowIdentity(row: CaliberRow): string {
@@ -884,7 +898,7 @@
 		<div>
 			<span>Best answer</span>
 			<strong>{bestWinner ? rowText(bestWinner, ['model'], '-') : 'No winner yet'}</strong>
-			<p>{bestWinner ? `${fmtNumber(rowNum(bestWinner, ['eval_tps', 'tps']), 1)} tok/s at ${rowNum(bestWinner, ['ctx_size'], contextSize)} ctx` : 'Run a campaign to populate this.'}</p>
+			<p>{bestWinner ? rowText(bestWinner, ['selection_reason'], `${fmtNumber(rowNum(bestWinner, ['eval_tps', 'tps']), 1)} tok/s at ${rowNum(bestWinner, ['ctx_size'], contextSize)} ctx`) : 'Run a campaign to populate this.'}</p>
 		</div>
 		<div>
 			<span>Hardware</span>
@@ -1235,6 +1249,11 @@
 						<h2>Report detail</h2>
 						<p>{selectedReportId || 'Select a report'}</p>
 					</div>
+					{#if selectedReport}
+						<button type="button" onclick={() => { selectedReport = null; selectedReportId = ''; }}>
+							Compare archive
+						</button>
+					{/if}
 				</div>
 				{#if selectedReport}
 					<div class="detail report-summary-strip">
@@ -1280,8 +1299,12 @@
 						<div class="filter-bar">
 							<span>Data scope:</span>
 							<div class="segmented">
-								<button type="button" class:active={reportScope === 'latest'} onclick={() => (reportScope = 'latest')}>Latest session</button>
-								<button type="button" class:active={reportScope === 'all'} onclick={() => (reportScope = 'all')}>All sessions</button>
+								{#if selectedReport}
+									<button type="button" class:active={true}>Selected report</button>
+								{:else}
+									<button type="button" class:active={reportScope === 'latest'} onclick={() => (reportScope = 'latest')}>Latest campaign</button>
+									<button type="button" class:active={reportScope === 'all'} onclick={() => (reportScope = 'all')}>Compatible history</button>
+								{/if}
 							</div>
 							<em>{reportGroups.length} models, {okAnalyticsRows.length} configs in view</em>
 						</div>
@@ -1293,7 +1316,7 @@
 									<button type="button" class:active={profile === id} onclick={() => (profile = id as ProfileId)}>{item.title}</button>
 								{/each}
 							</div>
-							<em>{profileLabels[profile].help}</em>
+							<em>{String(activeDecision?.reason ?? profileLabels[profile].help)}</em>
 						</div>
 
 						{#if syntheticRows > 0}

@@ -13,6 +13,7 @@ using json = nlohmann::ordered_json;
 static constexpr int DEFAULT_CONFIRM_MIB = 500;
 static constexpr double DEFAULT_TIE_BAND_PCT = 0.05;
 static constexpr int METRIC_SCHEMA_VERSION = 8;
+static constexpr int RECOMMENDATION_POLICY_VERSION = 1;
 
 enum class winner_profile {
     speed,
@@ -56,6 +57,8 @@ double winner_score(const json & result, winner_profile profile, const winner_po
 bool is_better_winner(const json & candidate, const json * current, winner_profile profile, const winner_policy_options & options = {});
 std::map<std::string, json> group_winners(const std::vector<json> & results, winner_profile profile, const winner_policy_options & options = {});
 winner_profile winner_profile_from_string(const std::string & profile);
+json build_recommendation(const std::vector<json> & results, winner_profile profile, const winner_policy_options & options = {});
+json build_recommendations(const std::vector<json> & results, const winner_policy_options & options = {});
 
 struct memory_policy_options {
     double shared_threshold_mib = 500.0;

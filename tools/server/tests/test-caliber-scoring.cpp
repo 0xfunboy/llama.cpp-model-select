@@ -245,6 +245,22 @@ void test_memory_policy() {
     require_eq(policies.at("p").at("vram_available_for_run_mib"), 6782, "budget minus baseline");
 }
 
+void test_recommendations() {
+    const std::vector<json> rows = {
+        {{"id", "a-fast"}, {"model", "A"}, {"ok", true}, {"eval_tps", 80}, {"gpu_power_peak_w", 200}, {"vram_peak_mib", 6000}, {"shared_peak_mib", 0}, {"memory_measurement_kind", "observed"}},
+        {{"id", "a-efficient"}, {"model", "A"}, {"ok", true}, {"eval_tps", 70}, {"gpu_power_peak_w", 100}, {"vram_peak_mib", 5800}, {"shared_peak_mib", 0}, {"memory_measurement_kind", "observed"}},
+        {{"id", "b-balanced"}, {"model", "B"}, {"ok", true}, {"eval_tps", 75}, {"gpu_power_peak_w", 120}, {"vram_peak_mib", 5900}, {"shared_peak_mib", 0}, {"memory_measurement_kind", "observed"}},
+    };
+    const json recommendations = caliber::build_recommendations(rows);
+    require_eq(recommendations.at("speed").at("best_by_model").at("A").at("id"), "a-fast", "speed best preset per model");
+    require_eq(recommendations.at("speed").at("winner").at("id"), "a-fast", "speed global winner");
+    require_eq(recommendations.at("efficiency").at("winner").at("id"), "a-efficient", "efficiency global winner");
+    require_eq(recommendations.at("speed").at("alternatives").at(0).at("id"), "b-balanced", "global alternatives ordered by backend policy");
+    require_eq(recommendations.at("speed").at("policy_version"), caliber::RECOMMENDATION_POLICY_VERSION, "recommendation policy version");
+    require(recommendations.at("speed").at("reason").get<std::string>().find("throughput") != std::string::npos,
+            "recommendation explains selection");
+}
+
 void test_result_core() {
     require(caliber::median({42}) == 42, "single median");
     require(caliber::median({12, 7, 10}) == 10, "odd median");
@@ -338,6 +354,7 @@ void test_result_core() {
 int main() {
     test_winner_policy();
     test_memory_policy();
+    test_recommendations();
     test_result_core();
     if (failures != 0) {
         std::cerr << failures << " caliber scoring test(s) failed\n";

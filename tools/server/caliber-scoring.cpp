@@ -740,6 +740,109 @@ winner_profile winner_profile_from_string(const std::string & profile) {
     return winner_profile::speed;
 }
 
+namespace {
+
+const char * winner_profile_name(winner_profile profile) {
+    switch (profile) {
+        case winner_profile::speed: return "speed";
+        case winner_profile::efficiency: return "efficiency";
+        case winner_profile::safety: return "safety";
+        case winner_profile::overall: return "overall";
+    }
+    return "speed";
+}
+
+std::string winner_reason(winner_profile profile, const json & row) {
+    const bool fallback = bool_value(row, "_fallback", false);
+    const std::string prefix = fallback ? "Provisional fallback: " : "";
+    switch (profile) {
+        case winner_profile::speed:
+            return prefix + "highest eligible measured decode throughput.";
+        case winner_profile::efficiency:
+            return prefix + "highest eligible measured decode throughput per watt.";
+        case winner_profile::safety:
+            return prefix + "best eligible measured fit, then throughput, KV quality, context and memory pressure.";
+        case winner_profile::overall:
+            return prefix + "best policy balance of measured speed, memory safety and available power efficiency.";
+    }
+    return prefix + "selected by the active recommendation policy.";
+}
+
+json decision_row(json row, winner_profile profile) {
+    const std::string reason = winner_reason(profile, row);
+    if (row.contains("_score")) {
+        row["selection_score"] = row["_score"];
+        row.erase("_score");
+    }
+    row["selection_fallback"] = bool_value(row, "_fallback", false);
+    row.erase("_fallback");
+    row["selection_reason"] = reason;
+    return row;
+}
+
+} // namespace
+
+json build_recommendation(const std::vector<json> & results, winner_profile profile, const winner_policy_options & requested_options) {
+    winner_policy_options options = requested_options;
+    if (!options.has_anchors) {
+        options.anchors = compute_anchors(results);
+        options.has_anchors = true;
+    }
+
+    const auto winners = group_winners(results, profile, options);
+    json best_by_model = json::object();
+    std::vector<json> remaining;
+    remaining.reserve(winners.size());
+    for (const auto & [model, winner] : winners) {
+        json candidate = winner;
+        candidate["_recommendation_model"] = model;
+        remaining.push_back(candidate);
+        best_by_model[model] = decision_row(winner, profile);
+    }
+
+    json ranking = json::array();
+    while (!remaining.empty()) {
+        std::vector<json> global_candidates;
+        global_candidates.reserve(remaining.size());
+        for (json candidate : remaining) {
+            candidate["model"] = "__all_models__";
+            global_candidates.push_back(std::move(candidate));
+        }
+        const auto picked = group_winners(global_candidates, profile, options);
+        const auto it = picked.find("__all_models__");
+        if (it == picked.end()) break;
+        const std::string selected_model = str_value(it->second, "_recommendation_model");
+        const auto original = winners.find(selected_model);
+        if (original == winners.end()) break;
+        ranking.push_back(decision_row(original->second, profile));
+        remaining.erase(std::remove_if(remaining.begin(), remaining.end(), [&](const json & row) {
+            return str_value(row, "_recommendation_model") == selected_model;
+        }), remaining.end());
+    }
+
+    json winner = ranking.empty() ? json(nullptr) : ranking.front();
+    json alternatives = json::array();
+    for (size_t i = 1; i < ranking.size(); ++i) alternatives.push_back(ranking[i]);
+    return {
+        {"policy_id", "caliber-recommendation"},
+        {"policy_version", RECOMMENDATION_POLICY_VERSION},
+        {"profile", winner_profile_name(profile)},
+        {"winner", winner},
+        {"alternatives", alternatives},
+        {"best_by_model", best_by_model},
+        {"eligible_models", best_by_model.size()},
+        {"reason", winner.is_object() ? str_value(winner, "selection_reason") : "No row has the evidence required by this profile."},
+    };
+}
+
+json build_recommendations(const std::vector<json> & results, const winner_policy_options & options) {
+    json out = json::object();
+    for (const auto profile : {winner_profile::speed, winner_profile::efficiency, winner_profile::safety, winner_profile::overall}) {
+        out[winner_profile_name(profile)] = build_recommendation(results, profile, options);
+    }
+    return out;
+}
+
 std::map<std::string, json> derive_memory_policies(const std::vector<json> & rows, double vram_total_mib, const memory_policy_options & options) {
     const double shared_threshold = options.shared_threshold_mib;
     const double shared_minor = options.shared_minor_upper_mib;

@@ -43,12 +43,16 @@ export interface CaliberReportSummary {
 	model: string;
 	plan_items: number;
 	rows: number;
-	path: string;
+	path?: string;
 }
 
 export interface CaliberReportsResponse {
 	object: 'list';
 	data: CaliberReportSummary[];
+	offset: number;
+	limit: number;
+	total: number;
+	has_more: boolean;
 }
 
 export interface CaliberDeleteReportResponse {
@@ -177,8 +181,11 @@ export class CaliberAdvisorService {
 		}
 	}
 
-	static reports(): Promise<CaliberReportsResponse> {
-		return apiFetch<CaliberReportsResponse>('/api/caliber-advisor/reports', { authOnly: true });
+	static reports(limit = 50, offset = 0): Promise<CaliberReportsResponse> {
+		return apiFetch<CaliberReportsResponse>(
+			`/api/caliber-advisor/reports?limit=${limit}&offset=${offset}`,
+			{ authOnly: true }
+		);
 	}
 
 	static report(id: string): Promise<Record<string, unknown>> {

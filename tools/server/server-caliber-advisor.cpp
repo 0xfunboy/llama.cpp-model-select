@@ -516,7 +516,6 @@ static json report_summary(const json & report, const std::filesystem::path & pa
         {"model", json_value(report, "model", std::string())},
         {"plan_items", report.contains("plan") && report["plan"].is_array() ? report["plan"].size() : 0},
         {"rows", report.contains("rows") && report["rows"].is_array() ? report["rows"].size() : 0},
-        {"path", path.string()},
     };
 }
 
@@ -569,6 +568,15 @@ static json normalize_report_for_api(json report) {
         report["legacy_invalid_rows"] = invalid;
         report["status_note"] = "Contains legacy invalid llama-bench rows; rerun required for comparison/FIT.";
     }
+    std::vector<json> rows;
+    for (const auto & row : report["rows"]) {
+        if (row.is_object()) rows.push_back(row);
+    }
+    report["recommendations"] = caliber::build_recommendations(rows);
+    report["recommendation_policy"] = {
+        {"id", "caliber-recommendation"},
+        {"version", caliber::RECOMMENDATION_POLICY_VERSION},
+    };
     return report;
 }
 
@@ -805,12 +813,7 @@ struct server_caliber_advisor_routes::impl {
                 rows = json::array();
                 for (const auto & row : winner_rows) rows.push_back(row);
 
-                json winners = json::object();
-                for (const std::string profile : {"speed", "efficiency", "safety", "overall"}) {
-                    json grouped = json::object();
-                    for (const auto & [model, winner] : caliber::group_winners(winner_rows, caliber::winner_profile_from_string(profile))) grouped[model] = winner;
-                    winners[profile] = grouped;
-                }
+                const json recommendations = caliber::build_recommendations(winner_rows);
                 const bool has_success = std::any_of(rows.begin(), rows.end(), [](const json & row) {
                     return json_value(row, "ok", false);
                 });
@@ -828,7 +831,8 @@ struct server_caliber_advisor_routes::impl {
                     {"models", payload["models"]},
                     {"plan", plan},
                     {"rows", rows},
-                    {"winners", winners},
+                    {"recommendations", recommendations},
+                    {"recommendation_policy", {{"id", "caliber-recommendation"}, {"version", caliber::RECOMMENDATION_POLICY_VERSION}}},
                 };
                 const auto report_path = reports_dir() / (report_id + ".json");
                 write_text_file(report_path, report.dump(2) + "\n");
@@ -936,17 +940,33 @@ struct server_caliber_advisor_routes::impl {
         return res;
     }
 
-    server_http_res_ptr handle_reports(const server_http_req &) {
+    server_http_res_ptr handle_reports(const server_http_req & req) {
         auto res = std::make_unique<server_http_res>();
         std::filesystem::create_directories(reports_dir());
-        json reports = json::array();
+        std::vector<json> report_items;
         for (const auto & entry : std::filesystem::directory_iterator(reports_dir())) {
             if (!entry.is_regular_file() || entry.path().extension() != ".json") continue;
             try {
-                reports.push_back(report_summary(json::parse(read_text_file(entry.path())), entry.path()));
+                report_items.push_back(report_summary(json::parse(read_text_file(entry.path())), entry.path()));
             } catch (...) {}
         }
-        res_ok(res, {{"object", "list"}, {"data", reports}});
+        std::sort(report_items.begin(), report_items.end(), [](const json & a, const json & b) {
+            return json_value(a, "created_at", std::string()) > json_value(b, "created_at", std::string());
+        });
+        const int offset = std::max(0, std::atoi(req.get_param("offset", "0").c_str()));
+        const int limit = std::clamp(std::atoi(req.get_param("limit", "50").c_str()), 1, 200);
+        json reports = json::array();
+        const size_t begin = std::min(report_items.size(), (size_t) offset);
+        const size_t end = std::min(report_items.size(), begin + (size_t) limit);
+        for (size_t i = begin; i < end; ++i) reports.push_back(report_items[i]);
+        res_ok(res, {
+            {"object", "list"},
+            {"data", reports},
+            {"offset", offset},
+            {"limit", limit},
+            {"total", report_items.size()},
+            {"has_more", end < report_items.size()},
+        });
         return res;
     }
 
@@ -987,6 +1007,9 @@ struct server_caliber_advisor_routes::impl {
         std::filesystem::create_directories(reports_dir());
         json all_rows = json::array();
         json reports = json::array();
+        std::vector<json> latest_rows;
+        std::string latest_created_at;
+        std::string latest_report_id;
         for (const auto & entry : std::filesystem::directory_iterator(reports_dir())) {
             if (!entry.is_regular_file() || entry.path().extension() != ".json") continue;
             try {
@@ -994,18 +1017,41 @@ struct server_caliber_advisor_routes::impl {
                 reports.push_back(report_summary(report, entry.path()));
                 if (report.contains("rows") && report["rows"].is_array()) {
                     for (const auto & row : report["rows"]) all_rows.push_back(row);
+                    const std::string created_at = json_value(report, "created_at", std::string());
+                    if (created_at >= latest_created_at) {
+                        latest_created_at = created_at;
+                        latest_report_id = json_value(report, "id", entry.path().stem().string());
+                        latest_rows.clear();
+                        for (const auto & row : report["rows"]) {
+                            if (row.is_object()) latest_rows.push_back(row);
+                        }
+                    }
                 }
             } catch (...) {}
         }
         std::vector<json> rows;
         for (const auto & row : all_rows) rows.push_back(row);
-        json winners = json::object();
-        for (const std::string profile : {"speed", "efficiency", "safety", "overall"}) {
-            json grouped = json::object();
-            for (const auto & [model, winner] : caliber::group_winners(rows, caliber::winner_profile_from_string(profile))) grouped[model] = winner;
-            winners[profile] = grouped;
-        }
-        res_ok(res, {{"reports", reports}, {"rows", all_rows}, {"winners", winners}});
+        const json recommendations = caliber::build_recommendations(rows);
+        const json latest_recommendations = caliber::build_recommendations(latest_rows);
+        res_ok(res, {
+            {"scope", "compatible-history"},
+            {"reports", reports},
+            {"rows", all_rows},
+            {"recommendations", recommendations},
+            {"recommendation_policy", {{"id", "caliber-recommendation"}, {"version", caliber::RECOMMENDATION_POLICY_VERSION}}},
+            {"scopes", {
+                {"compatible_history", {
+                    {"scope", "compatible-history"},
+                    {"recommendations", recommendations},
+                }},
+                {"latest_campaign", {
+                    {"scope", "latest-campaign"},
+                    {"report_id", latest_report_id.empty() ? json(nullptr) : json(latest_report_id)},
+                    {"created_at", latest_created_at.empty() ? json(nullptr) : json(latest_created_at)},
+                    {"recommendations", latest_recommendations},
+                }},
+            }},
+        });
         return res;
     }
 
