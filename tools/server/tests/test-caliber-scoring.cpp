@@ -194,6 +194,26 @@ void test_winner_policy() {
         {{"id", "chat-slower"}, {"model", "m"}, {"ok", true}, {"eval_tps", 20}, {"decode_usability", "chat"}},
     }, caliber::winner_profile::speed);
     require_eq(winners["m"]["id"], "chat-slower", "crawl band excluded");
+
+    const json synthetic = {
+        {"id", "synthetic"},
+        {"model", "m"},
+        {"ok", true},
+        {"eval_tps", 80},
+        {"benchmark_backend", "llama-bench"},
+        {"memory_measurement_kind", "unavailable"},
+        {"measurement_confidence", "provisional"},
+        {"gpu_power_peak_w", 0},
+    };
+    require(!caliber::is_fit_eligible(synthetic), "synthetic benchmark is not FIT eligible");
+    require(caliber::group_winners({synthetic}, caliber::winner_profile::speed).count("m") == 1,
+            "synthetic throughput remains a provisional speed fallback");
+    require(caliber::group_winners({synthetic}, caliber::winner_profile::efficiency).empty(),
+            "efficiency requires measured power");
+    require(caliber::group_winners({synthetic}, caliber::winner_profile::safety).empty(),
+            "safety requires observed memory");
+    require(caliber::group_winners({synthetic}, caliber::winner_profile::overall).empty(),
+            "overall requires observed memory");
 }
 
 void test_memory_policy() {
@@ -277,6 +297,40 @@ void test_result_core() {
     require_eq(derived.at("time_total_sec"), 3.36, "derive time total");
     require_eq(derived.at("headroom_mib"), 6192, "derive headroom");
     require_eq(derived.at("ctx_size"), 16384, "derive ctx");
+
+    const json measured_context = caliber::derive_result_fields({
+        {"ctx_size", 640},
+        {"requested_context_size", 131072},
+        {"extra_args", "--ctx-size 131072"},
+    }, 8192);
+    require_eq(measured_context.at("ctx_size"), 640, "measured context wins over requested CLI context");
+
+    json synthetic_item = item({
+        {"sweep", "context"},
+        {"workload_kind", "baseline"},
+        {"extra_args", "--ctx-size 131072"},
+    });
+    json synthetic_run = {
+        {"run_index", 0},
+        {"ok", true},
+        {"eval_tps", 50.0},
+        {"prompt_tps", 500.0},
+        {"prompt_n", 512},
+        {"eval_n", 128},
+        {"ctx_size", 640},
+        {"measured_context_size", 640},
+        {"benchmark_allocated_context_size", 640},
+        {"benchmark_backend", "llama-bench"},
+        {"memory_measurement_kind", "unavailable"},
+    };
+    const json synthetic_result = caliber::aggregate_bench_result(synthetic_item, cfg(), {synthetic_run});
+    require_eq(synthetic_result.at("ctx_size"), 640, "synthetic aggregate reports allocated context");
+    require_eq(synthetic_result.at("requested_context_size"), 131072, "synthetic aggregate preserves requested context");
+    require_eq(synthetic_result.at("context_target_met"), false, "synthetic aggregate exposes unmet context target");
+    require_eq(synthetic_result.at("measurement_confidence"), "provisional", "single sample is provisional");
+    require_eq(synthetic_result.at("memory_state"), "unavailable", "missing telemetry is explicit");
+    require_eq(synthetic_result.at("resource_fit"), "unknown", "resource fit is unknown without telemetry");
+    require_eq(synthetic_result.at("fit_eligible"), false, "unobserved synthetic result cannot configure FIT");
 }
 
 } // namespace

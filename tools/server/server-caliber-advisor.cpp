@@ -261,6 +261,7 @@ static std::string normalized_tensor_split(std::string value) {
 struct llama_bench_dims {
     int requested_context = 0;
     int allocated_context = 0;
+    int filled_context = 0;
     int prompt_tokens = 512;
     int generate_tokens = 128;
     int depth_tokens = 0;
@@ -301,7 +302,8 @@ static llama_bench_dims llama_bench_dims_for_item(const json & item, const json 
         const int max_depth = std::max(0, dims.requested_context - dims.prompt_tokens - dims.generate_tokens);
         dims.depth_tokens = std::min(std::max(0, dims.depth_tokens), max_depth);
     }
-    dims.allocated_context = dims.prompt_tokens + dims.generate_tokens + dims.depth_tokens;
+    dims.filled_context = dims.prompt_tokens + dims.depth_tokens;
+    dims.allocated_context = dims.filled_context + dims.generate_tokens;
     return dims;
 }
 
@@ -314,11 +316,13 @@ static std::vector<std::string> llama_bench_args_for_item(const json & item, con
     std::vector<std::string> out = {
         "-m", model_path,
         "-o", "json",
-        "-r", "1",
-        "--no-warmup",
+        "-r", std::to_string(std::max(1, json_value(json_value(cfg, "bench", json::object()), "repetitions", 3))),
         "-p", std::to_string(dims.prompt_tokens),
         "-n", std::to_string(dims.generate_tokens),
     };
+    if (!json_value(json_value(cfg, "bench", json::object()), "warmup", true)) {
+        out.push_back("--no-warmup");
+    }
     if (dims.depth_tokens > 0) {
         out.push_back("-d");
         out.push_back(std::to_string(dims.depth_tokens));
@@ -357,6 +361,35 @@ static json first_bench_row(const json & rows, bool generation) {
     return nullptr;
 }
 
+static std::vector<double> bench_samples(const json & row) {
+    std::vector<double> out;
+    if (row.is_object() && row.contains("samples_ts") && row["samples_ts"].is_array()) {
+        for (const auto & value : row["samples_ts"]) {
+            if (value.is_number()) out.push_back(value.get<double>());
+        }
+    }
+    if (out.empty() && row.is_object()) {
+        const double avg = json_value(row, "avg_ts", 0.0);
+        if (avg > 0) out.push_back(avg);
+    }
+    return out;
+}
+
+static json sanitized_bench_args(const std::vector<std::string> & args) {
+    json out = json::array();
+    bool redact_next = false;
+    for (const auto & arg : args) {
+        if (redact_next) {
+            out.push_back("<model>");
+            redact_next = false;
+            continue;
+        }
+        out.push_back(arg);
+        if (arg == "-m" || arg == "--model") redact_next = true;
+    }
+    return out;
+}
+
 static json run_llama_bench_item(const json & item, const json & cfg) {
     llama_bench_dims dims;
     const auto args = llama_bench_args_for_item(item, cfg, dims);
@@ -374,35 +407,44 @@ static json run_llama_bench_item(const json & item, const json & cfg) {
     if (!prompt_row.is_object() && !gen_row.is_object()) {
         throw std::runtime_error("llama-bench returned neither prompt nor generation rows");
     }
-    json bench = gen_row.is_object() ? gen_row : prompt_row;
-    json run = bench;
-    run["ok"] = true;
-    run["eval_tps"] = gen_row.is_object() ? json_value(gen_row, "avg_ts", 0.0) : 0.0;
-    run["prompt_tps"] = prompt_row.is_object() ? json_value(prompt_row, "avg_ts", 0.0) : 0.0;
-    run["prompt_n"] = prompt_row.is_object() ? json_value(prompt_row, "n_prompt", dims.prompt_tokens) : dims.prompt_tokens;
-    run["eval_n"] = gen_row.is_object() ? json_value(gen_row, "n_gen", dims.generate_tokens) : 0;
-    run["n_prompt"] = dims.prompt_tokens;
-    run["n_gen"] = dims.generate_tokens;
-    run["n_depth"] = dims.depth_tokens;
-    run["ctx_size"] = dims.requested_context > 0 ? dims.requested_context : dims.allocated_context;
-    run["requested_context_size"] = dims.requested_context > 0 ? json(dims.requested_context) : json(nullptr);
-    run["benchmark_allocated_context_size"] = dims.allocated_context;
-    run["benchmark_depth_tokens"] = dims.depth_tokens;
-    run["benchmark_prompt_tokens"] = dims.prompt_tokens;
-    run["benchmark_generate_tokens"] = dims.generate_tokens;
-    run["benchmark_rows"] = parsed;
-    if (prompt_row.is_object()) run["llama_bench_prompt_row"] = prompt_row;
-    if (gen_row.is_object()) run["llama_bench_generation_row"] = gen_row;
-    run["benchmark_note"] = "llama-bench synthetic benchmark; eval_tps is the tg row, prompt_tps is the pp row";
-    const double model_size_bytes = json_value(bench, "model_size", 0.0);
-    if (model_size_bytes > 0) run["vram_peak_mib"] = model_size_bytes / 1024.0 / 1024.0;
-    if (!run.contains("shared_peak_mib")) run["shared_peak_mib"] = 0;
-    if (!run.contains("gpu_power_peak_w")) run["gpu_power_peak_w"] = 0;
-    run["benchmark_backend"] = "llama-bench";
-    run["bench_command"] = command;
-    json row = caliber::aggregate_bench_result(item, cfg, {run});
+    const auto prompt_samples = bench_samples(prompt_row);
+    const auto eval_samples = bench_samples(gen_row);
+    const size_t sample_count = std::max<size_t>(1, std::max(prompt_samples.size(), eval_samples.size()));
+    std::vector<json> runs;
+    runs.reserve(sample_count);
+    for (size_t i = 0; i < sample_count; ++i) {
+        json run = json::object();
+        run["run_index"] = i;
+        run["ok"] = true;
+        run["eval_tps"] = i < eval_samples.size() ? eval_samples[i] : (eval_samples.empty() ? 0.0 : eval_samples.back());
+        run["prompt_tps"] = i < prompt_samples.size() ? prompt_samples[i] : (prompt_samples.empty() ? 0.0 : prompt_samples.back());
+        run["prompt_n"] = prompt_row.is_object() ? json_value(prompt_row, "n_prompt", dims.prompt_tokens) : dims.prompt_tokens;
+        run["eval_n"] = gen_row.is_object() ? json_value(gen_row, "n_gen", dims.generate_tokens) : 0;
+        run["n_prompt"] = dims.prompt_tokens;
+        run["n_gen"] = dims.generate_tokens;
+        run["n_depth"] = dims.depth_tokens;
+        run["ctx_size"] = dims.allocated_context;
+        run["measured_context_size"] = dims.allocated_context;
+        run["requested_context_size"] = dims.requested_context > 0 ? json(dims.requested_context) : json(nullptr);
+        run["context_target_met"] = dims.requested_context <= 0 || dims.allocated_context >= dims.requested_context;
+        run["context_measurement_kind"] = "synthetic-test-shape";
+        run["benchmark_allocated_context_size"] = dims.allocated_context;
+        run["benchmark_filled_context_size"] = dims.filled_context;
+        run["benchmark_depth_tokens"] = dims.depth_tokens;
+        run["benchmark_prompt_tokens"] = dims.prompt_tokens;
+        run["benchmark_generate_tokens"] = dims.generate_tokens;
+        run["benchmark_note"] = "llama-bench synthetic benchmark; excludes tokenization and sampling; context is the executed test shape";
+        run["memory_measurement_kind"] = "unavailable";
+        run["benchmark_backend"] = "llama-bench";
+        runs.push_back(std::move(run));
+    }
+    json row = caliber::aggregate_bench_result(item, cfg, runs);
     row["benchmark_backend"] = "llama-bench";
-    row["bench_command"] = command;
+    row["benchmark_rows"] = parsed;
+    if (prompt_row.is_object()) row["llama_bench_prompt_row"] = prompt_row;
+    if (gen_row.is_object()) row["llama_bench_generation_row"] = gen_row;
+    row["bench_executable"] = "llama-bench";
+    row["bench_args"] = sanitized_bench_args(args);
     return row;
 }
 
@@ -454,7 +496,7 @@ static json default_plan_cfg() {
             {"kv_rescue", {{"enabled", true}, {"min_context_tokens", 65536}, {"kv_k", "q4_0"}, {"kv_v", "q4_0"}}},
             {"workload_sweeps", {{"context_reserve_tokens", 512}, {"kv_fill_ratios", {0.25, 0.5, 0.75, 0.9}}, {"prefill_micro_tokens", {2048}}, {"prefill_ratios", {0.25, 0.9}}}},
         }},
-        {"bench", {{"n_predict", 128}}},
+        {"bench", {{"n_predict", 128}, {"repetitions", 3}, {"warmup", true}}},
         {"context_candidates", {{{"ctx", 8192}, {"kv", "q8_0"}}, {{"ctx", 32768}, {"kv", "q8_0"}}, {{"ctx", 131072}, {"kv", "q8_0"}}}},
         {"max_context_cap", 262144},
         {"base_args", "--flash-attn auto --parallel 1 --batch-size 512 --ubatch-size 512"},
@@ -494,14 +536,34 @@ static json normalize_report_for_api(json report) {
     if (!report.contains("rows") || !report["rows"].is_array()) return report;
     int invalid = 0;
     for (auto & row : report["rows"]) {
-        if (!row.is_object() || !is_legacy_invalid_llama_bench_row(row)) continue;
-        row["ok"] = false;
-        row["eval_tps"] = 0;
-        row["measurement_confidence"] = "invalid";
-        row["failure_reason"] = "legacy_invalid_llama_bench_prompt_row";
-        row["recommendation"] = "rerun-required";
-        row["recommendation_reason"] = "This row was produced before llama-bench prompt/generation rows were separated; rerun the benchmark.";
-        ++invalid;
+        if (!row.is_object()) continue;
+        if (json_value(row, "benchmark_backend", std::string()) == "llama-bench") {
+            const int allocated = json_value(row, "benchmark_allocated_context_size", 0);
+            const int requested = json_value(row, "requested_context_size", 0);
+            const int reported = json_value(row, "ctx_size", 0);
+            if (allocated > 0) {
+                if (reported > 0 && reported != allocated) row["legacy_reported_context_size"] = reported;
+                row["ctx_size"] = allocated;
+                row["measured_context_size"] = allocated;
+                row["context_target_met"] = requested <= 0 || allocated >= requested;
+                row["context_measurement_kind"] = "synthetic-test-shape";
+            }
+            row["memory_measurement_kind"] = "unavailable";
+            row["evidence_level"] = "synthetic-measured";
+            row["fit_eligible"] = false;
+            if (json_value(row, "run_count", 0) < 2 && json_value(row, "measurement_confidence", std::string()) == "reliable") {
+                row["measurement_confidence"] = "provisional";
+            }
+        }
+        if (is_legacy_invalid_llama_bench_row(row)) {
+            row["ok"] = false;
+            row["eval_tps"] = 0;
+            row["measurement_confidence"] = "invalid";
+            row["failure_reason"] = "legacy_invalid_llama_bench_prompt_row";
+            row["recommendation"] = "rerun-required";
+            row["recommendation_reason"] = "This row was produced before llama-bench prompt/generation rows were separated; rerun the benchmark.";
+            ++invalid;
+        }
     }
     if (invalid > 0) {
         report["legacy_invalid_rows"] = invalid;
@@ -712,6 +774,9 @@ struct server_caliber_advisor_routes::impl {
                         row["requested_context_size"] = requested_ctx > 0 ? json(requested_ctx) : json(nullptr);
                         row["shared_peak_mib"] = 0;
                         row["vram_peak_mib"] = 0;
+                        row["memory_measurement_kind"] = "unavailable";
+                        row["evidence_level"] = "failed";
+                        row["fit_eligible"] = false;
                         rows.push_back(row);
                         winner_rows.push_back(row);
                         publish(job, "row", {{"ok", false}, {"item", item_id}, {"error", e.what()}});
@@ -728,6 +793,18 @@ struct server_caliber_advisor_routes::impl {
                         break;
                     }
                 }
+                const json hardware = json_value(payload["cfg"], "hardware", json::object());
+                const double vram_total_mib = json_value(
+                    hardware,
+                    "vram_total_mib",
+                    json_value(hardware, "vram_budget_mib", 0.0));
+                caliber::memory_policy_options memory_options;
+                memory_options.vram_budget_mib = json_value(hardware, "vram_budget_mib", -1.0);
+                memory_options.vram_driver_usable_mib = json_value(hardware, "vram_driver_usable_mib", -1.0);
+                winner_rows = caliber::build_report_rows(winner_rows, vram_total_mib, memory_options);
+                rows = json::array();
+                for (const auto & row : winner_rows) rows.push_back(row);
+
                 json winners = json::object();
                 for (const std::string profile : {"speed", "efficiency", "safety", "overall"}) {
                     json grouped = json::object();
@@ -744,6 +821,9 @@ struct server_caliber_advisor_routes::impl {
                     {"status", report_status},
                     {"model", model_name},
                     {"note", "Measured with llama-bench through Caliber Advisor."},
+                    {"metric_schema_version", caliber::METRIC_SCHEMA_VERSION},
+                    {"evidence_level", "synthetic-measured"},
+                    {"automatic_fit_allowed", false},
                     {"cfg", payload["cfg"]},
                     {"models", payload["models"]},
                     {"plan", plan},

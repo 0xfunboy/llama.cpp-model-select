@@ -12,7 +12,7 @@ using json = nlohmann::ordered_json;
 
 static constexpr int DEFAULT_CONFIRM_MIB = 500;
 static constexpr double DEFAULT_TIE_BAND_PCT = 0.05;
-static constexpr int METRIC_SCHEMA_VERSION = 7;
+static constexpr int METRIC_SCHEMA_VERSION = 8;
 
 enum class winner_profile {
     speed,
@@ -43,6 +43,7 @@ std::string infer_row_role(const json & source);
 std::string row_role(const json & result);
 bool is_candidate_row(const json & source);
 bool is_winner_eligible(const json & result);
+bool is_fit_eligible(const json & result);
 
 std::string measurement_confidence(const json & result);
 std::string decode_usability(const json & result);

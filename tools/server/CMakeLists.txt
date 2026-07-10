@@ -72,32 +72,37 @@ if(LLAMA_TOOLS_INSTALL)
     install(TARGETS ${TARGET} LIBRARY)
 endif()
 
-add_executable(test-caliber-scoring EXCLUDE_FROM_ALL
-    tests/test-caliber-scoring.cpp
-    caliber-scoring.cpp
-    caliber-scoring.h
-)
-target_compile_features(test-caliber-scoring PRIVATE cxx_std_17)
-target_compile_definitions(test-caliber-scoring PRIVATE
-    CALIBER_WINNER_FIXTURE_PATH="/home/cooper/calibr/tests/fixtures/winner-policy-cases.json"
-)
-target_include_directories(test-caliber-scoring PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/vendor)
+if(LLAMA_BUILD_TESTS)
+    add_executable(test-caliber-scoring
+        tests/test-caliber-scoring.cpp
+        caliber-scoring.cpp
+        caliber-scoring.h
+    )
+    target_compile_features(test-caliber-scoring PRIVATE cxx_std_17)
+    target_compile_definitions(test-caliber-scoring PRIVATE
+        CALIBER_WINNER_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/caliber-winner-policy-cases.json"
+    )
+    target_include_directories(test-caliber-scoring PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/vendor)
 
-add_executable(test-caliber-plan EXCLUDE_FROM_ALL
-    tests/test-caliber-plan.cpp
-    caliber-plan.cpp
-    caliber-plan.h
-    caliber-scoring.cpp
-    caliber-scoring.h
-)
-target_compile_features(test-caliber-plan PRIVATE cxx_std_17)
-target_include_directories(test-caliber-plan PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_SOURCE_DIR}
-    ${CMAKE_SOURCE_DIR}/vendor
-    ${CMAKE_SOURCE_DIR}/ggml/include
-)
-target_link_libraries(test-caliber-plan PRIVATE ggml)
+    add_executable(test-caliber-plan
+        tests/test-caliber-plan.cpp
+        caliber-plan.cpp
+        caliber-plan.h
+        caliber-scoring.cpp
+        caliber-scoring.h
+    )
+    target_compile_features(test-caliber-plan PRIVATE cxx_std_17)
+    target_include_directories(test-caliber-plan PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_SOURCE_DIR}
+        ${CMAKE_SOURCE_DIR}/vendor
+        ${CMAKE_SOURCE_DIR}/ggml/include
+    )
+    target_link_libraries(test-caliber-plan PRIVATE ggml)
+
+    add_test(NAME caliber-scoring COMMAND test-caliber-scoring)
+    add_test(NAME caliber-plan COMMAND test-caliber-plan)
+endif()
 
 # llama-server executable
 

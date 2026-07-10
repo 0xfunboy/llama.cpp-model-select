@@ -202,6 +202,18 @@
 		return fallback;
 	}
 
+	function rowBool(row: CaliberRow, key: string, fallback = false): boolean {
+		const value = row[key];
+		if (typeof value === 'boolean') return value;
+		if (value === 'true') return true;
+		if (value === 'false') return false;
+		return fallback;
+	}
+
+	function canFitCaliberRow(row: CaliberRow): boolean {
+		return rowBool(row, 'fit_eligible', false) && rowText(row, ['ok']) !== 'false';
+	}
+
 	function reportSessionKey(row: CaliberRow): string {
 		return rowText(row, ['bench_session_started_at', 'run_started_at', 'timestamp'], '');
 	}
@@ -803,6 +815,10 @@
 	}
 
 	async function configureCaliberRow(row: CaliberRow) {
+		if (!canFitCaliberRow(row)) {
+			error = 'This row is synthetic or lacks complete context/memory evidence. Run a decision-grade streaming benchmark before FIT.';
+			return;
+		}
 		const model = rowText(row, ['model', 'model_id']);
 		if (!model) return;
 		error = '';
@@ -1356,7 +1372,12 @@
 													<span>{fmtNumber(rowNum(group.winner, ['eval_tps', 'tps']), 1)} t/s</span>
 													<span>{fmtMib(reportMemoryMib(group.winner))}</span>
 													<span>{rowNum(group.winner, ['ctx_size']) || '-'} ctx</span>
-													<button type="button" onclick={() => configureCaliberRow(group.winner as CaliberRow)}>
+													<button
+														type="button"
+														onclick={() => configureCaliberRow(group.winner as CaliberRow)}
+														disabled={!canFitCaliberRow(group.winner as CaliberRow)}
+														title={canFitCaliberRow(group.winner as CaliberRow) ? 'Apply measured winner' : 'Requires decision-grade streaming evidence'}
+													>
 														<CheckCircle2 size={14} />
 														FIT winner
 													</button>

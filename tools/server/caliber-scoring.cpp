@@ -291,6 +291,8 @@ bool is_limited_row(const json & row, const std::string & residency) {
 
 std::string confidence_for_row(const json & row, const std::string & residency) {
     if (!bool_value(row, "ok", false)) return is_memory_failure(row) ? "failed" : "partial";
+    const double run_count = nullable_num(row, "run_count");
+    if (std::isfinite(run_count) && run_count < 2) return "provisional";
     if (eval_spread_pct(row) > 15) return "noisy";
     if (is_limited_row(row, residency)) return "limited";
     return "reliable";
@@ -465,6 +467,24 @@ double metric_median(const std::vector<json> & runs, const char * key) {
     return values.empty() ? std::numeric_limits<double>::quiet_NaN() : median(values);
 }
 
+bool has_observed_memory(const json & row) {
+    const std::string kind = to_lower(str_value(row, "memory_measurement_kind"));
+    if (kind == "observed") return true;
+    if (kind == "unavailable" || kind == "estimated") return false;
+    return str_value(row, "benchmark_backend") != "llama-bench" &&
+           std::isfinite(nullable_num(row, "vram_peak_mib"));
+}
+
+bool profile_supported(const json & row, winner_profile profile) {
+    if (num_value(row, "eval_tps", 0.0) <= 0.0) return false;
+    if (profile == winner_profile::speed) return true;
+    if (profile == winner_profile::efficiency) {
+        return num_value(row, "gpu_power_peak_w", 0.0) > 0.0;
+    }
+    if (profile == winner_profile::safety) return has_observed_memory(row);
+    return has_observed_memory(row);
+}
+
 } // namespace
 
 double finite_number(const json & value, double fallback) {
@@ -538,6 +558,16 @@ bool is_winner_eligible(const json & result) {
     return row_role(result) == "candidate";
 }
 
+bool is_fit_eligible(const json & result) {
+    if (!bool_value(result, "ok", false) || !is_winner_eligible(result)) return false;
+    if (has_key(result, "fit_eligible") && result.at("fit_eligible").is_boolean()) {
+        return result.at("fit_eligible").get<bool>();
+    }
+    if (str_value(result, "benchmark_backend") == "llama-bench") return false;
+    const std::string confidence = measurement_confidence(result);
+    return confidence == "reliable" || confidence == "noisy";
+}
+
 std::string measurement_confidence(const json & result) {
     return to_lower(trim(str_value(result, "measurement_confidence")));
 }
@@ -564,7 +594,9 @@ bool is_normal_winner_eligible(const json & result) {
 }
 
 bool is_limited_winner_fallback_eligible(const json & result) {
-    return is_winner_eligible(result) && is_usability_winner_eligible(result) && measurement_confidence(result) == "limited";
+    const std::string confidence = measurement_confidence(result);
+    return is_winner_eligible(result) && is_usability_winner_eligible(result) &&
+           (confidence == "limited" || confidence == "provisional");
 }
 
 winner_policy_anchors compute_anchors(const std::vector<json> & results) {
@@ -652,6 +684,7 @@ std::map<std::string, json> group_winners(const std::vector<json> & results, win
 
     for (const auto & result : results) {
         if (!bool_value(result, "ok", false) || !is_winner_eligible(result)) continue;
+        if (!profile_supported(result, profile)) continue;
         std::string model = str_value(result, "model");
         if (model.empty()) model = str_value(result, "id");
         if (model.empty()) continue;
@@ -778,6 +811,7 @@ std::map<std::string, json> derive_memory_policies(const std::vector<json> & row
         }
 
         for (const auto & row : group) {
+            const bool memory_observed = has_observed_memory(row);
             const double shared = num_value(row, "shared_peak_mib", 0.0);
             const double baseline = num_value(row, "vram_baseline_mib", 0.0);
             const double budget_mib = vram_budget_input >= 0 ? vram_budget_input : (vram_driver_usable >= 0 ? vram_driver_usable : (vram_total_mib > 0 ? vram_total_mib : std::numeric_limits<double>::quiet_NaN()));
@@ -807,15 +841,18 @@ std::map<std::string, json> derive_memory_policies(const std::vector<json> & row
             else if (next_risk == "imminent") next_reason = "The measured context-growth slope predicts significant shared-memory pressure at the next context step.";
             else next_reason = "The measured context-growth slope does not predict significant shared-memory pressure at the next context step.";
 
-            std::string state = std::isfinite(headroom) && headroom < headroom_thresholds(budget_mib).loaded ? "saturated" : "dedicated";
-            std::string reason = state == "saturated"
+            std::string state = !memory_observed ? "unavailable" :
+                (std::isfinite(headroom) && headroom < headroom_thresholds(budget_mib).loaded ? "saturated" : "dedicated");
+            std::string reason = !memory_observed
+                ? "Runtime memory telemetry was not collected for this benchmark row."
+                : state == "saturated"
                 ? "Dedicated VRAM is near capacity; no significant shared allocation was observed."
                 : "The measured allocation remained in dedicated VRAM.";
 
             auto degradation_it = degradation_by_id.find(str_value(row, "id"));
             const bool has_degradation = degradation_it != degradation_by_id.end();
             const bool correlated = has_degradation && degradation_it->second.correlated;
-            if (shared > 0 && shared <= shared_threshold) {
+            if (memory_observed && shared > 0 && shared <= shared_threshold) {
                 state = "shared_allocated";
                 reason = "Shared allocation increased, but stayed below the configured significance threshold.";
             } else if (shared > shared_threshold && is_moe) {
@@ -833,7 +870,10 @@ std::map<std::string, json> derive_memory_policies(const std::vector<json> & row
 
             std::string residency;
             std::string residency_reason;
-            if (is_memory_failure(row)) {
+            if (!memory_observed && !is_memory_failure(row)) {
+                residency = "unknown";
+                residency_reason = "Runtime residency was not observed; file size is not treated as VRAM usage.";
+            } else if (is_memory_failure(row)) {
                 residency = "memory-failed";
                 residency_reason = "The configuration failed during load or execution with a memory-related error.";
             } else if (is_mixed_expected(row)) {
@@ -862,13 +902,19 @@ std::map<std::string, json> derive_memory_policies(const std::vector<json> & row
             }
 
             const double cliff_pct = has_degradation ? std::round(degradation_it->second.pct * 1000.0) / 10.0 : std::numeric_limits<double>::quiet_NaN();
-            const std::string resource_fit = resource_fit_from_headroom(headroom, budget_mib, residency, shared, shared_threshold, shared_minor, shared_pressure);
+            std::string resource_fit = memory_observed ?
+                resource_fit_from_headroom(headroom, budget_mib, residency, shared, shared_threshold, shared_minor, shared_pressure) :
+                "unknown";
             const std::string decode = usability_from_eval(row);
             const auto response = usability_from_response_latency(row);
             const std::string degradation = degradation_band(cliff_pct);
-            const std::string confidence = cap_confidence_for_anomalous_degradation(confidence_for_row(row, residency), resource_fit, degradation);
+            std::string confidence = cap_confidence_for_anomalous_degradation(confidence_for_row(row, residency), resource_fit, degradation);
             std::string recommendation_reason;
-            const std::string recommendation = recommendation_for(row, resource_fit, decode, degradation, recommendation_reason);
+            std::string recommendation = recommendation_for(row, resource_fit, decode, degradation, recommendation_reason);
+            if (!memory_observed && bool_value(row, "ok", false)) {
+                recommendation = "provisional-speed-only";
+                recommendation_reason = "Throughput was measured, but memory safety and efficiency were not observed.";
+            }
 
             json policy = {
                 {"memory_state", state},
@@ -973,12 +1019,12 @@ json derive_result_fields(const json & result, double vram_total_mib) {
         ? round_to((prompt_n / prompt_tps) + (eval_n / eval_tps), 2)
         : std::numeric_limits<double>::quiet_NaN();
     const int64_t headroom = std::max<int64_t>(0, (int64_t) std::trunc(vram_total_mib) - int_value(result, "vram_peak_mib"));
-    const int64_t arg_ctx = context_size_from_args(str_value(result, "extra_args"));
     const double direct_ctx = nullable_num(result, "ctx_size");
     const double requested_ctx = nullable_num(result, "requested_context_size");
+    const int64_t arg_ctx = context_size_from_args(str_value(result, "extra_args"));
     json ctx_size = nullptr;
-    if (arg_ctx > 0) ctx_size = arg_ctx;
-    else if (std::isfinite(direct_ctx) && direct_ctx > 0) ctx_size = (int64_t) std::trunc(direct_ctx);
+    if (std::isfinite(direct_ctx) && direct_ctx > 0) ctx_size = (int64_t) std::trunc(direct_ctx);
+    else if (arg_ctx > 0) ctx_size = arg_ctx;
     else if (std::isfinite(requested_ctx) && requested_ctx > 0) ctx_size = (int64_t) std::trunc(requested_ctx);
     return {
         {"time_total_sec", number_or_null(time_total, 2)},
@@ -1069,6 +1115,13 @@ json aggregate_bench_result(const json & item, const json & cfg, const std::vect
     std::sort(ends.begin(), ends.end());
     const double sat_ratio = vram_total > 0 ? round_to(vram_peak_med / vram_total, 3) : 0.0;
     const std::string extra_args = str_value(item, "extra_args");
+    const int64_t requested_ctx = arg_int(extra_args, {"--ctx-size", "-c"}, 0);
+    const int64_t measured_ctx = int_value(first, "measured_context_size", int_value(first, "ctx_size", 0));
+    const bool context_target_met = requested_ctx <= 0 || (measured_ctx > 0 && measured_ctx >= requested_ctx);
+    const std::string backend = str_value(first, "benchmark_backend");
+    const bool synthetic = backend == "llama-bench";
+    const std::string memory_kind = str_value(first, "memory_measurement_kind",
+        std::isfinite(nullable_num(first, "vram_peak_mib")) && !synthetic ? "observed" : "unavailable");
 
     json result = {
         {"metric_schema_version", METRIC_SCHEMA_VERSION},
@@ -1110,9 +1163,13 @@ json aggregate_bench_result(const json & item, const json & cfg, const std::vect
         {"model_path", item.value("model_path", json(nullptr))},
         {"mmproj_path", item.value("mmproj_path", json(nullptr))},
         {"extra_args", item.value("extra_args", json(nullptr))},
-        {"ctx_size", first.value("ctx_size", json(nullptr))},
-        {"requested_context_size", arg_int(extra_args, {"--ctx-size", "-c"}, 0) > 0 ? json(arg_int(extra_args, {"--ctx-size", "-c"})) : json(nullptr)},
+        {"ctx_size", measured_ctx > 0 ? json(measured_ctx) : first.value("ctx_size", json(nullptr))},
+        {"measured_context_size", measured_ctx > 0 ? json(measured_ctx) : json(nullptr)},
+        {"requested_context_size", requested_ctx > 0 ? json(requested_ctx) : json(nullptr)},
+        {"context_target_met", context_target_met},
+        {"context_measurement_kind", first.value("context_measurement_kind", synthetic ? json("synthetic-shape") : json("observed"))},
         {"benchmark_allocated_context_size", first.value("benchmark_allocated_context_size", json(nullptr))},
+        {"benchmark_filled_context_size", first.value("benchmark_filled_context_size", json(nullptr))},
         {"benchmark_depth_tokens", first.value("benchmark_depth_tokens", json(nullptr))},
         {"benchmark_prompt_tokens", first.value("benchmark_prompt_tokens", json(nullptr))},
         {"benchmark_generate_tokens", first.value("benchmark_generate_tokens", json(nullptr))},
@@ -1140,8 +1197,11 @@ json aggregate_bench_result(const json & item, const json & cfg, const std::vect
         {"effective_parallel_slots", first.value("effective_parallel_slots", json(nullptr))},
         {"effective_n_parallel", first.value("effective_n_parallel", json(nullptr))},
         {"flash_attention_state", first.value("flash_attention_state", json(nullptr))},
-        {"fit_status", str_value(item, "sweep") == "moe-cpu" && str_value(first, "fit_status_source") != "llama.cpp" ? "success" : infer_fit_status(str_value(first, "fit_status"), true, shared_peak_med, confirm)},
-        {"fit_status_source", str_value(first, "fit_status_source", "inferred")},
+        {"fit_status", memory_kind == "observed" ?
+            (str_value(item, "sweep") == "moe-cpu" && str_value(first, "fit_status_source") != "llama.cpp" ? "success" : infer_fit_status(str_value(first, "fit_status"), true, shared_peak_med, confirm)) :
+            "unknown"},
+        {"fit_status_source", memory_kind == "observed" ? str_value(first, "fit_status_source", "inferred") : "unavailable"},
+        {"memory_measurement_kind", memory_kind},
         {"shared_memory_interpretation", str_value(item, "sweep") == "moe-cpu" ? "cpu_expert_mapping_or_wddm_pressure" : "wddm_pressure"},
         {"vram_peak_mib", vram_peak_med},
         {"vram_total_peak_mib", vram_total_peak_med},
@@ -1178,6 +1238,8 @@ json aggregate_bench_result(const json & item, const json & cfg, const std::vect
         {"llama_server_version", str_value(session, "llama_server_version", "unknown")},
         {"llama_server_exe", str_value(cfg, "llama_server_exe")},
         {"runs", runs},
+        {"benchmark_backend", backend.empty() ? json(nullptr) : json(backend)},
+        {"evidence_level", synthetic ? "synthetic-measured" : "streaming-measured"},
     };
     const json stats = run_stats({{"eval_tps", eval_tps_med}, {"runs", runs}});
     for (auto it = stats.begin(); it != stats.end(); ++it) result[it.key()] = it.value();
@@ -1194,6 +1256,13 @@ json aggregate_bench_result(const json & item, const json & cfg, const std::vect
     if (pit != policies.end()) {
         for (auto it = pit->second.begin(); it != pit->second.end(); ++it) result[it.key()] = it.value();
     }
+    result["profile_support"] = {
+        {"speed", profile_supported(result, winner_profile::speed)},
+        {"efficiency", profile_supported(result, winner_profile::efficiency)},
+        {"safety", profile_supported(result, winner_profile::safety)},
+        {"overall", profile_supported(result, winner_profile::overall)},
+    };
+    result["fit_eligible"] = is_fit_eligible(result) && context_target_met;
     return result;
 }
 
