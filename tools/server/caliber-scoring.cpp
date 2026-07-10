@@ -589,6 +589,7 @@ bool is_usability_winner_eligible(const json & result) {
 bool is_normal_winner_eligible(const json & result) {
     if (!is_winner_eligible(result)) return false;
     if (!is_usability_winner_eligible(result)) return false;
+    if (str_value(result, "benchmark_backend") == "llama-bench") return false;
     const std::string confidence = measurement_confidence(result);
     return confidence.empty() || confidence == "reliable" || confidence == "noisy";
 }
@@ -596,7 +597,7 @@ bool is_normal_winner_eligible(const json & result) {
 bool is_limited_winner_fallback_eligible(const json & result) {
     const std::string confidence = measurement_confidence(result);
     return is_winner_eligible(result) && is_usability_winner_eligible(result) &&
-           (confidence == "limited" || confidence == "provisional");
+           (confidence == "limited" || confidence == "provisional" || str_value(result, "benchmark_backend") == "llama-bench");
 }
 
 winner_policy_anchors compute_anchors(const std::vector<json> & results) {

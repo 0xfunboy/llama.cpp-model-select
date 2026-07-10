@@ -5,6 +5,7 @@
 #include "server-common.h"
 #include "server-models.h"
 #include "server-persistence.h"
+#include "streaming-profiler.h"
 
 #include <sheredom/subprocess.h>
 
@@ -506,6 +507,21 @@ static json run_llama_bench_item(const json & item, const json & cfg) {
     return row;
 }
 
+static bool use_streaming_profiler(const json & item, const json & cfg) {
+    const std::string backend = json_value(json_value(cfg, "bench", json::object()), "backend", std::string("auto"));
+    if (backend == "streaming") return true;
+    if (backend == "synthetic") return false;
+    if (json_value(item, "search_stage", std::string()) == "race") return false;
+    return json_value(item, "row_role", std::string()) == "candidate";
+}
+
+static json run_profile_item(const json & item, const json & cfg, const std::function<bool()> & cancelled) {
+    if (use_streaming_profiler(item, cfg)) {
+        return streaming_profiler::profile(item, cfg, current_executable_dir() / "llama-server", cancelled);
+    }
+    return run_llama_bench_item(item, cfg);
+}
+
 static std::optional<json::iterator> find_model_entry(json & models, const std::string & id) {
     if (!models.is_array()) return std::nullopt;
     for (auto it = models.begin(); it != models.end(); ++it) {
@@ -534,7 +550,7 @@ static json default_plan_cfg() {
             {"kv_rescue", {{"enabled", true}, {"min_context_tokens", 65536}, {"kv_k", "q4_0"}, {"kv_v", "q4_0"}}},
             {"workload_sweeps", {{"context_reserve_tokens", 512}, {"kv_fill_ratios", {0.25, 0.5, 0.75, 0.9}}, {"prefill_micro_tokens", {2048}}, {"prefill_ratios", {0.25, 0.9}}}},
         }},
-        {"bench", {{"n_predict", 128}, {"repetitions", 3}, {"warmup", true}}},
+        {"bench", {{"backend", "auto"}, {"n_predict", 128}, {"repetitions", 3}, {"warmup", true}}},
         {"context_candidates", {{{"ctx", 8192}, {"kv", "q8_0"}}, {{"ctx", 32768}, {"kv", "q8_0"}}, {{"ctx", 131072}, {"kv", "q8_0"}}}},
         {"max_context_cap", 262144},
         {"base_args", "--flash-attn auto --parallel 1 --batch-size 512 --ubatch-size 512"},
@@ -855,7 +871,7 @@ struct server_caliber_advisor_routes::impl {
                     }
                     publish(job, "bench", {{"item", item_id}});
                     try {
-                        json row = run_llama_bench_item(item, payload["cfg"]);
+                        json row = run_profile_item(item, payload["cfg"], cancel_requested);
                         rows.push_back(row);
                         winner_rows.push_back(row);
                         publish(job, "row", {{"ok", true}, {"item", item_id}, {"eval_tps", json_value(row, "eval_tps", 0.0)}});
@@ -905,15 +921,18 @@ struct server_caliber_advisor_routes::impl {
                     return json_value(row, "ok", false);
                 });
                 const std::string report_status = cancelled ? "cancelled" : (has_success ? "completed" : "failed");
+                const bool has_streaming = std::any_of(winner_rows.begin(), winner_rows.end(), [](const json & row) {
+                    return json_value(row, "benchmark_backend", std::string()) == "llama-server-streaming" && json_value(row, "ok", false);
+                });
                 json report = {
                     {"id", report_id},
                     {"created_at", isoish_timestamp()},
                     {"status", report_status},
                     {"model", model_name},
-                    {"note", "Measured with llama-bench through Caliber Advisor."},
+                    {"note", has_streaming ? "Finalists measured with isolated streaming llama-server; synthetic rows were used only for racing." : "Measured with llama-bench synthetic racing only."},
                     {"metric_schema_version", caliber::METRIC_SCHEMA_VERSION},
-                    {"evidence_level", "synthetic-measured"},
-                    {"automatic_fit_allowed", false},
+                    {"evidence_level", has_streaming ? "streaming-measured" : "synthetic-measured"},
+                    {"automatic_fit_allowed", has_streaming},
                     {"cfg", payload["cfg"]},
                     {"models", payload["models"]},
                     {"plan", plan},

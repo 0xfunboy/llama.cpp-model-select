@@ -46,6 +46,8 @@ add_library(${TARGET}
     model-registry.h
     model-operations.cpp
     model-operations.h
+    streaming-profiler.cpp
+    streaming-profiler.h
     server-caliber-advisor.cpp
     server-caliber-advisor.h
     server.cpp
@@ -133,6 +135,12 @@ if(LLAMA_BUILD_TESTS)
     target_compile_features(test-model-operations PRIVATE cxx_std_17)
     target_include_directories(test-model-operations PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME model-operations COMMAND test-model-operations)
+
+    add_executable(test-streaming-profiler tests/test-streaming-profiler.cpp)
+    target_compile_features(test-streaming-profiler PRIVATE cxx_std_17)
+    target_include_directories(test-streaming-profiler PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(test-streaming-profiler PRIVATE llama-server-impl)
+    add_test(NAME streaming-profiler COMMAND test-streaming-profiler)
 endif()
 
 # llama-server executable
