@@ -6,6 +6,8 @@
 #include "server-models.h"
 #include "server-persistence.h"
 
+#include <sheredom/subprocess.h>
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -17,6 +19,7 @@
 #include <mutex>
 #include <sstream>
 #include <thread>
+#include <atomic>
 #include <unistd.h>
 
 namespace {
@@ -91,16 +94,6 @@ static void write_text_file(const std::filesystem::path & path, const std::strin
     if (ec) throw std::runtime_error("failed to atomically replace " + path.string());
 }
 
-static std::string shell_quote(const std::string & value) {
-    std::string out = "'";
-    for (char c : value) {
-        if (c == '\'') out += "'\\''";
-        else out.push_back(c);
-    }
-    out += "'";
-    return out;
-}
-
 static std::filesystem::path current_executable_dir() {
     char buf[4096];
     const ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
@@ -111,13 +104,35 @@ static std::filesystem::path current_executable_dir() {
     return std::filesystem::current_path() / "build" / "bin";
 }
 
-static std::string run_command_capture(const std::string & command, int & exit_code) {
+static std::string run_command_capture(const std::filesystem::path & executable, const std::vector<std::string> & args, int & exit_code) {
+    std::vector<std::string> command = {executable.string()};
+    command.insert(command.end(), args.begin(), args.end());
+    std::vector<char *> argv;
+    for (auto & value : command) argv.push_back(value.data());
+    argv.push_back(nullptr);
+    subprocess_s process{};
+    const int options = subprocess_option_no_window | subprocess_option_combined_stdout_stderr | subprocess_option_inherit_environment;
+    if (subprocess_create(argv.data(), options, &process) != 0) throw std::runtime_error("failed to start benchmark process");
+
+    std::atomic<bool> done{false};
+    std::thread timeout([&]() {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::hours(2);
+        while (!done.load()) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                subprocess_terminate(&process);
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    });
     std::array<char, 4096> buffer{};
     std::string output;
-    FILE * pipe = popen((command + " 2>&1").c_str(), "r");
-    if (!pipe) throw std::runtime_error("failed to start benchmark command");
+    FILE * pipe = subprocess_stdout(&process);
     while (fgets(buffer.data(), (int) buffer.size(), pipe) != nullptr) output += buffer.data();
-    exit_code = pclose(pipe);
+    done.store(true);
+    timeout.join();
+    subprocess_join(&process, &exit_code);
+    subprocess_destroy(&process);
     return output;
 }
 
@@ -412,10 +427,8 @@ static json sanitized_bench_args(const std::vector<std::string> & args) {
 static json run_llama_bench_item(const json & item, const json & cfg) {
     llama_bench_dims dims;
     const auto args = llama_bench_args_for_item(item, cfg, dims);
-    std::string command = shell_quote((current_executable_dir() / "llama-bench").string());
-    for (const auto & arg : args) command += " " + shell_quote(arg);
     int exit_code = 0;
-    const std::string output = run_command_capture(command, exit_code);
+    const std::string output = run_command_capture(current_executable_dir() / "llama-bench", args, exit_code);
     if (exit_code != 0) throw std::runtime_error("llama-bench failed: " + output.substr(0, 2000));
     json parsed = parse_first_json_array(output);
     if (!parsed.is_array() || parsed.empty() || !parsed[0].is_object()) {
@@ -531,8 +544,10 @@ static bool is_legacy_invalid_llama_bench_row(const json & row) {
 static json normalize_report_for_api(json report) {
     if (!report.contains("rows") || !report["rows"].is_array()) return report;
     int invalid = 0;
+    const std::string report_id = json_value(report, "id", std::string());
     for (auto & row : report["rows"]) {
         if (!row.is_object()) continue;
+        if (!report_id.empty()) row["report_id"] = report_id;
         if (json_value(row, "benchmark_backend", std::string()) == "llama-bench") {
             const int allocated = json_value(row, "benchmark_allocated_context_size", 0);
             const int requested = json_value(row, "requested_context_size", 0);
@@ -640,6 +655,7 @@ struct server_caliber_advisor_routes::impl {
         ev.data["seq"] = ev.seq;
         job->events.push_back(std::move(ev));
         while (job->events.size() > 200) job->events.pop_front();
+        server_persistence::record_job("caliber-advisor", job->id, job->status, job->events.back().data);
         job->cv.notify_all();
     }
 
@@ -738,6 +754,7 @@ struct server_caliber_advisor_routes::impl {
 
     server_http_res_ptr handle_sweep(const server_http_req & req) {
         auto res = std::make_unique<server_http_res>();
+        if (!require_admin_api_key(req, router.params, res)) return res;
         const json body = req.body.empty() ? json::object() : json::parse(req.body);
         auto job = std::make_shared<caliber_job>();
         job->id = slugify("caliber-" + isoish_timestamp() + "-" + std::to_string(jobs.size() + 1));
@@ -747,6 +764,8 @@ struct server_caliber_advisor_routes::impl {
         }
         publish(job, "queued", json::object());
         std::thread([this, job, body]() {
+            std::vector<std::string> restore_models;
+            const bool restore_after = json_value(body, "restore_active_model", true);
             try {
                 auto cancel_requested = [&job]() {
                     std::lock_guard<std::mutex> lock(job->mutex);
@@ -761,12 +780,19 @@ struct server_caliber_advisor_routes::impl {
                     publish(job, "cancelled", {{"message", "Campaign cancelled before start"}});
                     return;
                 }
+                auto operation = router.operations.acquire("caliber", 40, cancel_requested, std::chrono::hours(24));
+                if (!operation) throw std::runtime_error("campaign cancelled while waiting for inference resources");
                 {
                     std::lock_guard<std::mutex> lock(job->mutex);
                     job->status = "running";
                 }
                 publish(job, "started", json::object());
                 publish(job, "preflight", {{"message", "Unloading active router models before benchmark"}});
+                if (restore_after) {
+                    for (const auto & meta : router.models.get_all_meta()) {
+                        if (meta.is_running()) restore_models.push_back(meta.name);
+                    }
+                }
                 router.models.unload_all();
                 json payload = build_plan_payload(body);
                 json plan = payload["plan"];
@@ -885,6 +911,10 @@ struct server_caliber_advisor_routes::impl {
                 }
                 publish(job, "report", {{"report_id", report_id}, {"plan_count", payload["plan"].size()}});
                 publish(job, cancelled ? "cancelled" : "done", {{"report_id", report_id}});
+                for (const auto & name : restore_models) {
+                    try { router.models.load(name); } catch (const std::exception & e) { publish(job, "restore-warning", {{"model", name}, {"error", e.what()}}); }
+                }
+                restore_models.clear();
             } catch (const std::exception & e) {
                 {
                     std::lock_guard<std::mutex> lock(job->mutex);
@@ -894,6 +924,9 @@ struct server_caliber_advisor_routes::impl {
                     job->current_item.clear();
                 }
                 publish(job, "error", {{"error", e.what()}});
+            }
+            for (const auto & name : restore_models) {
+                try { router.models.load(name); } catch (...) {}
             }
         }).detach();
         res_ok(res, {{"success", true}, {"job_id", job->id}, {"status", "queued"}});
@@ -913,6 +946,7 @@ struct server_caliber_advisor_routes::impl {
 
     server_http_res_ptr handle_sweep_stop(const server_http_req & req) {
         auto res = std::make_unique<server_http_res>();
+        if (!require_admin_api_key(req, router.params, res)) return res;
         json body = req.body.empty() ? json::object() : json::parse(req.body);
         const std::string id = json_value(body, "id", req.get_param("id"));
         auto job = find_job(id);
@@ -1018,6 +1052,7 @@ struct server_caliber_advisor_routes::impl {
 
     server_http_res_ptr handle_delete_report(const server_http_req & req) {
         auto res = std::make_unique<server_http_res>();
+        if (!require_admin_api_key(req, router.params, res)) return res;
         const std::string id = req.get_param("id");
         if (id.empty()) {
             res_err(res, "report id is required");
@@ -1087,10 +1122,34 @@ struct server_caliber_advisor_routes::impl {
 
     server_http_res_ptr handle_configure(const server_http_req & req) {
         auto res = std::make_unique<server_http_res>();
+        if (!require_admin_api_key(req, router.params, res)) return res;
+        auto operation = router.operations.acquire("caliber-configure", 70, req.should_stop, std::chrono::seconds(30));
+        if (!operation) {
+            res_err(res, "inference resources are busy", 503);
+            return res;
+        }
         json body = req.body.empty() ? json::object() : json::parse(req.body);
         const std::string model = json_value(body, "model", json_value(body, "model_id", std::string()));
+        const std::string report_id = json_value(body, "report_id", std::string());
+        const std::string row_id = json_value(body, "row_id", std::string());
         if (model.empty()) {
             res_err(res, "configure requires model/model_id");
+            return res;
+        }
+        const json report = server_persistence::load_report("caliber-advisor", report_id);
+        json measured_row = nullptr;
+        if (report.is_object() && report.contains("rows") && report["rows"].is_array()) {
+            for (const auto & row : report["rows"]) {
+                if (row.is_object() && json_value(row, "id", std::string()) == row_id &&
+                    json_value(row, "model", std::string()) == model) {
+                    measured_row = row;
+                    break;
+                }
+            }
+        }
+        if (!measured_row.is_object() || !json_value(measured_row, "fit_eligible", false) ||
+            !json_value(measured_row, "context_target_met", false)) {
+            res_err(res, "configure requires a FIT-eligible row from a stored decision-grade report", 403);
             return res;
         }
         const auto meta = find_router_model(router, model);
@@ -1104,6 +1163,7 @@ struct server_caliber_advisor_routes::impl {
             return res;
         }
 
+        std::lock_guard<std::mutex> preset_lock(router.preset_mutex);
         json root = json::object();
         if (std::filesystem::exists(preset_path)) root = json::parse(read_text_file(preset_path));
         if (!root.is_object()) root = json::object();
@@ -1120,10 +1180,10 @@ struct server_caliber_advisor_routes::impl {
         else if (!hf_repo.empty()) entry["hf_repo"] = hf_repo;
         if (!entry.contains("alias")) entry["alias"] = meta->name;
         if (!entry.contains("load_on_startup")) entry["load_on_startup"] = false;
-        const std::string extra_args = json_value(body, "extra_args", std::string());
+        const std::string extra_args = json_value(measured_row, "extra_args", std::string());
         if (!extra_args.empty()) {
             apply_runtime_args(entry, extra_args);
-            entry["caliber_args"] = extra_args;
+            entry["caliber_evidence"] = {{"report_id", report_id}, {"row_id", row_id}};
         }
         if (body.contains("tags")) entry["tags"] = body["tags"];
 

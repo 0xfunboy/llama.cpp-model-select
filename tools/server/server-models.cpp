@@ -1618,7 +1618,7 @@ static std::string strip_bearer(std::string key) {
     return key;
 }
 
-static bool validate_admin_api_key(const server_http_req & req, const common_params & params) {
+bool validate_admin_api_key(const server_http_req & req, const common_params & params) {
     const std::vector<std::string> & keys = params.admin_api_keys.empty() ? params.api_keys : params.admin_api_keys;
     if (keys.empty()) {
         return true;
@@ -1636,7 +1636,7 @@ static bool validate_admin_api_key(const server_http_req & req, const common_par
     return std::find(keys.begin(), keys.end(), req_api_key) != keys.end();
 }
 
-static bool require_admin_api_key(
+bool require_admin_api_key(
         const server_http_req & req,
         const common_params & params,
         std::unique_ptr<server_http_res> & res) {
@@ -1843,6 +1843,13 @@ void server_models_routes::init_routes() {
     };
 
     this->proxy_post = [this](const server_http_req & req) {
+        auto operation = std::make_shared<model_operation_coordinator::lease>(
+            operations.acquire("chat", 100, req.should_stop, std::chrono::seconds(30)));
+        if (!*operation) {
+            auto unavailable = std::make_unique<server_http_res>();
+            res_err(unavailable, format_error_response("inference resources are reserved by " + operations.active_kind(), ERROR_TYPE_UNAVAILABLE));
+            return unavailable;
+        }
         if (auto wait_res = wait_for_switch_to_finish(*this, req)) {
             return wait_res;
         }
@@ -1871,7 +1878,14 @@ void server_models_routes::init_routes() {
         if (!conv_id.empty()) {
             models.conv_models.remember(conv_id, name);
         }
-        return models.proxy_request(req, method, name, true); // update last usage for POST request only
+        auto response = models.proxy_request(req, method, name, true); // update last usage for POST request only
+        if (auto * proxy = dynamic_cast<server_http_proxy *>(response.get())) {
+            auto cleanup = proxy->cleanup;
+            proxy->cleanup = [cleanup, operation]() {
+                if (cleanup) cleanup();
+            };
+        }
+        return response;
     };
 
     this->post_router_models_load = [this](const server_http_req & req) {

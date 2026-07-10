@@ -324,13 +324,25 @@ static db_handle open_database_locked() {
             "  imported_at TEXT NOT NULL,"
             "  PRIMARY KEY(kind, fingerprint)"
             ");"
+            "CREATE TABLE IF NOT EXISTS jobs ("
+            "  module TEXT NOT NULL,"
+            "  id TEXT NOT NULL,"
+            "  status TEXT NOT NULL,"
+            "  created_at TEXT,"
+            "  updated_at TEXT NOT NULL,"
+            "  payload_json TEXT NOT NULL,"
+            "  PRIMARY KEY(module, id)"
+            ");"
             "CREATE INDEX IF NOT EXISTS idx_results_model ON results(module, model);"
             "CREATE INDEX IF NOT EXISTS idx_samples_result ON samples(module, report_id, result_id);"
             "CREATE INDEX IF NOT EXISTS idx_downloads_status ON downloads(status);"
             "CREATE INDEX IF NOT EXISTS idx_reports_status ON reports(module, status);");
         exec_sql(handle.db,
-            "INSERT INTO metadata(key, value) VALUES('schema_version', '2') "
+            "INSERT INTO metadata(key, value) VALUES('schema_version', '3') "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value;");
+        exec_sql(handle.db,
+            "UPDATE jobs SET status='interrupted', updated_at=datetime('now') WHERE status IN ('queued','running','stopping','cancelling','resolving','downloading');"
+            "UPDATE downloads SET status='interrupted', updated_at=datetime('now') WHERE status IN ('queued','resolving','downloading');");
         g_schema_ready = true;
     }
     return handle;
@@ -1054,6 +1066,27 @@ void record_configuration(const std::string & module, const std::string & model_
     }
 }
 
+void record_job(const std::string & module, const std::string & id, const std::string & status, const json & payload) {
+    if (module.empty() || id.empty()) return;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    try {
+        auto db = open_database_locked();
+        auto stmt = prepare(db.db,
+            "INSERT INTO jobs(module, id, status, created_at, updated_at, payload_json) VALUES(?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(module, id) DO UPDATE SET status=excluded.status, updated_at=excluded.updated_at, payload_json=excluded.payload_json;");
+        const std::string now = isoish_timestamp();
+        bind_text(stmt.stmt, 1, module);
+        bind_text(stmt.stmt, 2, id);
+        bind_text(stmt.stmt, 3, status);
+        bind_text(stmt.stmt, 4, first_string(payload, {"created_at", "started_at"}).empty() ? now : first_string(payload, {"created_at", "started_at"}));
+        bind_text(stmt.stmt, 5, now);
+        bind_text(stmt.stmt, 6, json_dump(payload));
+        step_done(db.db, stmt.stmt);
+    } catch (const std::exception & e) {
+        SRV_WRN("job checkpoint write failed: %s\n", e.what());
+    }
+}
+
 server_http_res_ptr handle_archive_status(const server_http_req &) {
     import_existing_reports_once();
     auto res = std::make_unique<server_http_res>();
@@ -1070,6 +1103,7 @@ server_http_res_ptr handle_archive_status(const server_http_req &) {
         {"fit_recommendations", scalar_count(db.db, "SELECT COUNT(*) FROM fit_recommendations")},
         {"configurations", scalar_count(db.db, "SELECT COUNT(*) FROM configurations")},
         {"events", scalar_count(db.db, "SELECT COUNT(*) FROM events")},
+        {"jobs", scalar_count(db.db, "SELECT COUNT(*) FROM jobs")},
     };
     res->data = safe_json_to_str(out);
     return res;
@@ -1117,6 +1151,10 @@ server_http_res_ptr handle_archive_export(const server_http_req &) {
             {"events", select_rows(db.db,
                 "SELECT module, event_type, object_id, created_at, payload_json FROM events ORDER BY rowid DESC LIMIT 5000",
                 {"module", "event_type", "object_id", "created_at", "payload_json"},
+                {"payload_json"})},
+            {"jobs", select_rows(db.db,
+                "SELECT module, id, status, created_at, updated_at, payload_json FROM jobs ORDER BY updated_at DESC",
+                {"module", "id", "status", "created_at", "updated_at", "payload_json"},
                 {"payload_json"})},
         }},
     };

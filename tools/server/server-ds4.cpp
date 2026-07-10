@@ -948,6 +948,7 @@ struct server_ds4_routes::impl {
         while (job->events.size() > DS4_MAX_EVENTS) {
             job->events.pop_front();
         }
+        server_persistence::record_job("ds4-" + job->kind, job->id, job->status, job->events.back().data);
         job->cv.notify_all();
     }
 
@@ -1784,6 +1785,15 @@ struct server_ds4_routes::impl {
 
         publish(job, "status", {{"message", "queued"}});
         std::thread worker([this, job, body, kind]() mutable {
+            auto cancelled = [&job]() {
+                std::lock_guard<std::mutex> lock(job->mutex);
+                return job->cancel_requested;
+            };
+            auto operation = router.operations.acquire("ds4-" + kind, 50, cancelled, std::chrono::hours(24));
+            if (!operation) {
+                finish_job(job, "failed", "cancelled while waiting for inference resources");
+                return;
+            }
             if (kind == "eval") {
                 run_eval_job(job, std::move(body));
             } else {
@@ -1914,6 +1924,7 @@ struct server_ds4_routes::impl {
 
     server_http_res_ptr handle_cancel_job(const server_http_req & req) {
         auto res = std::make_unique<server_http_res>();
+        if (!require_admin_api_key(req, router.params, res)) return res;
         auto job = find_job(id_from_req(req));
         if (!job) {
             job = find_active_job();
@@ -1960,6 +1971,7 @@ struct server_ds4_routes::impl {
 
     server_http_res_ptr handle_delete_report(const server_http_req & req) {
         auto res = std::make_unique<server_http_res>();
+        if (!require_admin_api_key(req, router.params, res)) return res;
         std::string id = id_from_req(req);
         if (!line_is_safe_report_id(id)) {
             ds4_res_err(res, format_error_response("invalid report id", ERROR_TYPE_INVALID_REQUEST));
@@ -2065,10 +2077,14 @@ void server_ds4_routes::init_routes() {
     };
 
     post_run_eval = [p = pimpl](const server_http_req & req) {
+        auto unauthorized = std::make_unique<server_http_res>();
+        if (!require_admin_api_key(req, p->router.params, unauthorized)) return unauthorized;
         return p->handle_action_or_start(req, "eval");
     };
 
     post_run_bench = [p = pimpl](const server_http_req & req) {
+        auto unauthorized = std::make_unique<server_http_res>();
+        if (!require_admin_api_key(req, p->router.params, unauthorized)) return unauthorized;
         return p->handle_action_or_start(req, "bench");
     };
 

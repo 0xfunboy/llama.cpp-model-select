@@ -259,7 +259,11 @@ int llama_server(int argc, char ** argv) {
         server_persistence::import_existing_reports_once();
         ctx_http.get ("/api/archive/status",                ex_wrapper(server_persistence::handle_archive_status));
         ctx_http.get ("/api/archive/export",                ex_wrapper(server_persistence::handle_archive_export));
-        ctx_http.post("/api/archive/import",                ex_wrapper(server_persistence::handle_archive_import));
+        ctx_http.post("/api/archive/import",                ex_wrapper([&models_routes](const server_http_req & req) {
+            auto unauthorized = std::make_unique<server_http_res>();
+            if (!models_routes || !require_admin_api_key(req, models_routes->params, unauthorized)) return unauthorized;
+            return server_persistence::handle_archive_import(req);
+        }));
     }
 
     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)

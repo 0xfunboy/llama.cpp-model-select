@@ -44,6 +44,8 @@ add_library(${TARGET}
     caliber-scoring.h
     model-registry.cpp
     model-registry.h
+    model-operations.cpp
+    model-operations.h
     server-caliber-advisor.cpp
     server-caliber-advisor.h
     server.cpp
@@ -126,6 +128,11 @@ if(LLAMA_BUILD_TESTS)
     target_include_directories(test-server-persistence PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(test-server-persistence PRIVATE llama-server-impl SQLite::SQLite3)
     add_test(NAME server-persistence COMMAND test-server-persistence)
+
+    add_executable(test-model-operations tests/test-model-operations.cpp model-operations.cpp model-operations.h)
+    target_compile_features(test-model-operations PRIVATE cxx_std_17)
+    target_include_directories(test-model-operations PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME model-operations COMMAND test-model-operations)
 endif()
 
 # llama-server executable

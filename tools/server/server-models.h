@@ -7,6 +7,7 @@
 #include "server-http.h"
 #include "server-queue.h"
 #include "model-registry.h"
+#include "model-operations.h"
 
 #include <mutex>
 #include <condition_variable>
@@ -288,8 +289,10 @@ struct server_models_routes {
     std::mutex switch_mutex;
     std::condition_variable switch_cv;
     bool switch_in_progress = false;
+    std::mutex preset_mutex;
     server_models models;
     model_registry::index registry;
+    model_operation_coordinator operations;
     server_models_routes(const common_params & params, int argc, char ** argv)
             : params(params), models(params, argc, argv) {
         const std::string & cfg = this->params.ui_config_json;
@@ -328,6 +331,9 @@ struct server_models_routes {
     server_http_context::handler_t router_streams_lookup;
     server_http_context::handler_t router_stream_delete;
 };
+
+bool validate_admin_api_key(const server_http_req & req, const common_params & params);
+bool require_admin_api_key(const server_http_req & req, const common_params & params, std::unique_ptr<server_http_res> & res);
 
 /**
  * A simple HTTP proxy that forwards requests to another server

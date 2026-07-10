@@ -6,6 +6,8 @@
 #include "server-models.h"
 #include "server-persistence.h"
 
+#include <sheredom/subprocess.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -138,17 +140,32 @@ static std::filesystem::path models_root_dir(const server_models_routes & router
     return std::filesystem::path(home_dir()) / "models";
 }
 
-static std::string shell_quote(const std::string & value) {
-    std::string out = "'";
-    for (char c : value) {
-        if (c == '\'') {
-            out += "'\\''";
-        } else {
-            out.push_back(c);
+static bool path_is_within(const std::filesystem::path & root, const std::filesystem::path & candidate) {
+    std::error_code ec;
+    const auto canonical_root = std::filesystem::weakly_canonical(root, ec);
+    if (ec) return false;
+    const auto canonical_candidate = std::filesystem::weakly_canonical(candidate, ec);
+    if (ec) return false;
+    const auto relative = std::filesystem::relative(canonical_candidate, canonical_root, ec);
+    return !ec && !relative.empty() && *relative.begin() != "..";
+}
+
+static bool safe_repo_id(const std::string & repo) {
+    if (repo.empty() || repo.find("..") != std::string::npos || repo.front() == '/' || repo.back() == '/') return false;
+    int separators = 0;
+    for (unsigned char c : repo) {
+        if (c == '/') {
+            ++separators;
+        } else if (!(std::isalnum(c) || c == '-' || c == '_' || c == '.')) {
+            return false;
         }
     }
-    out += "'";
-    return out;
+    return separators == 1;
+}
+
+static bool safe_download_filename(const std::string & filename) {
+    if (filename.empty()) return true;
+    return std::filesystem::path(filename).filename() == filename && filename.find("..") == std::string::npos && ends_with_ci(filename, ".gguf");
 }
 
 static std::string url_encode_path(const std::string & value) {
@@ -235,23 +252,38 @@ static std::string read_text_file(const std::filesystem::path & path) {
 
 static void write_text_file(const std::filesystem::path & path, const std::string & text) {
     std::filesystem::create_directories(path.parent_path());
-    std::ofstream out(path, std::ios::binary);
+    const auto temporary = std::filesystem::path(path.string() + ".tmp");
+    std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
     if (!out) {
         throw std::runtime_error(string_format("cannot write '%s'", path.string().c_str()));
     }
     out << text;
+    out.close();
+    std::error_code ec;
+    std::filesystem::rename(temporary, path, ec);
+    if (ec) {
+        std::filesystem::remove(path, ec);
+        ec.clear();
+        std::filesystem::rename(temporary, path, ec);
+    }
+    if (ec) throw std::runtime_error(string_format("cannot atomically replace '%s'", path.string().c_str()));
 }
 
-static std::vector<std::string> shell_lines(const std::string & command) {
+static std::vector<char *> argv_for(std::vector<std::string> & command) {
+    std::vector<char *> argv;
+    for (auto & value : command) argv.push_back(value.data());
+    argv.push_back(nullptr);
+    return argv;
+}
+
+static std::vector<std::string> process_lines(std::vector<std::string> command) {
     std::vector<std::string> lines;
-#if defined(_WIN32)
-    FILE * pipe = _popen(command.c_str(), "r");
-#else
-    FILE * pipe = popen(command.c_str(), "r");
-#endif
-    if (!pipe) {
-        return lines;
-    }
+    auto argv = argv_for(command);
+    subprocess_s process{};
+    const int options = subprocess_option_no_window | subprocess_option_combined_stdout_stderr |
+        subprocess_option_inherit_environment | subprocess_option_search_user_path;
+    if (subprocess_create(argv.data(), options, &process) != 0) return lines;
+    FILE * pipe = subprocess_stdout(&process);
     char buffer[4096];
     while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
         std::string line = trim_copy(buffer);
@@ -259,11 +291,9 @@ static std::vector<std::string> shell_lines(const std::string & command) {
             lines.push_back(line);
         }
     }
-#if defined(_WIN32)
-    _pclose(pipe);
-#else
-    pclose(pipe);
-#endif
+    int exit_code = 0;
+    subprocess_join(&process, &exit_code);
+    subprocess_destroy(&process);
     return lines;
 }
 
@@ -350,7 +380,7 @@ static json detect_system_json() {
     json gpus = json::array();
     std::vector<double> vram_gb;
     std::string primary_gpu;
-    for (const auto & line : shell_lines("nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits 2>/dev/null")) {
+    for (const auto & line : process_lines({"nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"})) {
         auto pos = line.rfind(',');
         if (pos == std::string::npos) {
             continue;
@@ -770,14 +800,14 @@ static uint64_t parse_u64_header_value(const std::string & line) {
 }
 
 static uint64_t remote_file_size(const std::string & url, const std::string & token) {
-    std::string command = "curl -fsSIL -L --max-time 30 --connect-timeout 15";
+    std::vector<std::string> command = {"curl", "-fsSIL", "-L", "--max-time", "30", "--connect-timeout", "15"};
     if (!token.empty()) {
-        command += " -H " + shell_quote("Authorization: Bearer " + token);
+        command.insert(command.end(), {"-H", "Authorization: Bearer " + token});
     }
-    command += " " + shell_quote(url) + " 2>/dev/null";
+    command.push_back(url);
 
     uint64_t content_length = 0;
-    for (const auto & line : shell_lines(command)) {
+    for (const auto & line : process_lines(command)) {
         const std::string lower = lower_copy(line);
         if (lower.rfind("x-linked-size:", 0) == 0) {
             const uint64_t linked = parse_u64_header_value(line);
@@ -1125,33 +1155,22 @@ static int run_aria2c_for_file(const std::shared_ptr<fit_download_job> & job, si
     publish_download_snapshot(job);
 
     std::filesystem::create_directories(file.local_path.parent_path());
-    std::string command =
-        "aria2c"
-        " --continue=true"
-        " --max-connection-per-server=8"
-        " --split=8"
-        " --min-split-size=64M"
-        " --summary-interval=1"
-        " --console-log-level=notice"
-        " --auto-file-renaming=false"
-        " --allow-overwrite=true"
-        " --file-allocation=none";
+    std::vector<std::string> command = {
+        "aria2c", "--continue=true", "--max-connection-per-server=8", "--split=8",
+        "--min-split-size=64M", "--summary-interval=1", "--console-log-level=notice",
+        "--auto-file-renaming=false", "--allow-overwrite=true", "--file-allocation=none",
+    };
     if (!token.empty()) {
-        command += " --header=" + shell_quote("Authorization: Bearer " + token);
+        command.push_back("--header=Authorization: Bearer " + token);
     }
-    command += " --dir=" + shell_quote(file.local_path.parent_path().string());
-    command += " -o " + shell_quote(file.local_path.filename().string());
-    command += " " + shell_quote(file.url);
-    command += " 2>&1";
-
-#if defined(_WIN32)
-    FILE * pipe = _popen(command.c_str(), "r");
-#else
-    FILE * pipe = popen(command.c_str(), "r");
-#endif
-    if (!pipe) {
-        return 127;
-    }
+    command.push_back("--dir=" + file.local_path.parent_path().string());
+    command.insert(command.end(), {"-o", file.local_path.filename().string(), file.url});
+    auto argv = argv_for(command);
+    subprocess_s process{};
+    const int options = subprocess_option_no_window | subprocess_option_combined_stdout_stderr |
+        subprocess_option_inherit_environment | subprocess_option_search_user_path;
+    if (subprocess_create(argv.data(), options, &process) != 0) return 127;
+    FILE * pipe = subprocess_stdout(&process);
 
     char buffer[4096];
     while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
@@ -1183,25 +1202,16 @@ static int run_aria2c_for_file(const std::shared_ptr<fit_download_job> & job, si
         }
     }
 
-#if defined(_WIN32)
-    const int raw_status = _pclose(pipe);
-    return raw_status;
-#else
-    const int raw_status = pclose(pipe);
-    if (WIFEXITED(raw_status)) {
-        return WEXITSTATUS(raw_status);
-    }
-    if (WIFSIGNALED(raw_status)) {
-        return 128 + WTERMSIG(raw_status);
-    }
-    return raw_status;
-#endif
+    int exit_code = 0;
+    subprocess_join(&process, &exit_code);
+    subprocess_destroy(&process);
+    return exit_code;
 }
 
 static void run_download_job(const std::shared_ptr<fit_download_job> & job) {
     const std::string token = read_hf_token();
     try {
-        if (shell_lines("command -v aria2c 2>/dev/null").empty()) {
+        if (process_lines({"aria2c", "--version"}).empty()) {
             throw std::runtime_error("aria2c is not installed or is not in PATH");
         }
 
@@ -1378,6 +1388,23 @@ static bool local_model_file_ready(const std::string & path) {
 
 static bool local_model_file_partial(const std::string & path) {
     return local_file_exists(path) && local_file_has_aria2_sidecar(path);
+}
+
+static json typed_preset_fields(const json & requested) {
+    static const std::set<std::string> allowed = {
+        "id", "model", "hf_repo", "alias", "tags", "ctx_size", "n_gpu_layers", "n_cpu_moe",
+        "parallel", "batch_size", "ubatch_size", "main_gpu", "cache_type_k", "cache_type_v",
+        "flash_attn", "split_mode", "tensor_split", "threads", "reasoning", "reasoning_budget",
+        "load_on_startup",
+    };
+    json out = json::object();
+    if (!requested.is_object()) return out;
+    for (auto it = requested.begin(); it != requested.end(); ++it) {
+        if (!allowed.count(it.key())) continue;
+        if (it.value().is_string() || it.value().is_number() || it.value().is_boolean() ||
+            (it.key() == "tags" && it.value().is_array())) out[it.key()] = it.value();
+    }
+    return out;
 }
 
 static std::string preset_model_path(const std::string & path) {
@@ -1958,8 +1985,9 @@ struct server_fit_advisor_routes::impl {
         return res;
     }
 
-    server_http_res_ptr handle_refresh(const server_http_req &) {
+    server_http_res_ptr handle_refresh(const server_http_req & req) {
         auto res = std::make_unique<server_http_res>();
+        if (!require_admin_api_key(req, router.params, res)) return res;
         try {
             fit_res_ok(res, refresh_catalog(false));
         } catch (const std::exception & e) {
@@ -1970,6 +1998,7 @@ struct server_fit_advisor_routes::impl {
 
     server_http_res_ptr handle_download(const server_http_req & req) {
         auto res = std::make_unique<server_http_res>();
+        if (!require_admin_api_key(req, router.params, res)) return res;
         json body = req.body.empty() ? json::object() : json::parse(req.body);
         const std::string model_id = json_value(body, "model_id", json_value(body, "id", std::string()));
         std::string hf_ref = json_value(body, "hf_ref", std::string());
@@ -1995,12 +2024,20 @@ struct server_fit_advisor_routes::impl {
             fit_res_err(res, format_error_response("download request could not resolve a Hugging Face repo", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
+        if (!safe_repo_id(repo)) {
+            fit_res_err(res, format_error_response("invalid Hugging Face repo; expected owner/name", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
 
         std::filesystem::path target_dir = json_value(body, "target_dir", std::string());
         if (target_dir.empty()) {
             target_dir = default_download_dir(router, repo, model_id.empty() ? hf_ref : model_id);
         }
         const std::string requested_filename = json_value(body, "filename", std::string());
+        if (!path_is_within(models_root_dir(router), target_dir) || !safe_download_filename(requested_filename)) {
+            fit_res_err(res, format_error_response("download target must stay inside the configured model root and use a GGUF basename", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
 
         try {
             auto local = find_local_gguf(target_dir, quant);
@@ -2133,6 +2170,12 @@ struct server_fit_advisor_routes::impl {
 
     server_http_res_ptr handle_configure(const server_http_req & req) {
         auto res = std::make_unique<server_http_res>();
+        if (!require_admin_api_key(req, router.params, res)) return res;
+        auto operation = router.operations.acquire("fit-configure", 70, req.should_stop, std::chrono::seconds(30));
+        if (!operation) {
+            fit_res_err(res, format_error_response("inference resources are busy", ERROR_TYPE_UNAVAILABLE));
+            return res;
+        }
         json body = req.body.empty() ? json::object() : json::parse(req.body);
 
         const std::string model_id = json_value(body, "model_id", json_value(body, "id", std::string()));
@@ -2188,6 +2231,13 @@ struct server_fit_advisor_routes::impl {
             fit_res_err(res, format_error_response("model file is not ready or is missing on disk", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
+        if (!local_path.empty()) {
+            const json registry = router.scan_model_registry(true);
+            if (model_registry::artifact_id_for_path(registry, local_path).empty()) {
+                fit_res_err(res, format_error_response("model path is outside the registered model roots", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+        }
 
         const std::string id = json_value(body, "preset_id", slugify(!model_id.empty() ? model_id : (!hf_ref.empty() ? hf_ref : local_path)));
         const std::string preset_path = router.params.models_preset;
@@ -2197,6 +2247,7 @@ struct server_fit_advisor_routes::impl {
         }
 
         try {
+            std::lock_guard<std::mutex> preset_lock(router.preset_mutex);
             json root = json::parse(read_text_file(preset_path));
             if (!root.is_object()) {
                 root = json::object();
@@ -2208,10 +2259,7 @@ struct server_fit_advisor_routes::impl {
                 root["models"] = json::array();
             }
 
-            json entry = json_value(body, "preset", json::object());
-            if (!entry.is_object()) {
-                entry = json::object();
-            }
+            json entry = typed_preset_fields(json_value(body, "preset", json::object()));
             entry["id"] = id;
             if (!local_path.empty()) {
                 entry["model"] = preset_model_path(local_path);

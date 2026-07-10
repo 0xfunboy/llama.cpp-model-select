@@ -839,7 +839,8 @@
 		try {
 			const result = await CaliberAdvisorService.configure({
 				model,
-				extra_args: rowText(row, ['extra_args']),
+				report_id: rowText(row, ['report_id'], selectedReportId),
+				row_id: rowText(row, ['id']),
 				load_now: loadAfterConfigure,
 				tags: ['caliber-winner', profile]
 			});

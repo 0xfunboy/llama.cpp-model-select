@@ -31,6 +31,7 @@ json load_reports(const std::string & module);
 void record_download(const json & snapshot);
 void record_fit_recommendations(const json & response);
 void record_configuration(const std::string & module, const std::string & model_id, const std::string & preset_id, const json & payload);
+void record_job(const std::string & module, const std::string & id, const std::string & status, const json & payload);
 
 server_http_res_ptr handle_archive_status(const server_http_req & req);
 server_http_res_ptr handle_archive_export(const server_http_req & req);
