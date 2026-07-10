@@ -218,11 +218,57 @@ json model_base_args(const json & meta, const std::string & base, int64_t ram_av
     return {{"baseArgs", trim(base)}, {"mode", "no-mmap"}, {"reason", "model_size_within_plausible_ram_vram_before_load"}, {"nommapRequiredMib", nommap_required}, {"ramAvailableBeforeLoadMib", ram_available}};
 }
 
+double effective_vram_mib(const json & hardware, const json & planning) {
+    const double per_gpu_reserve = std::max(0.0, num_value(planning, "per_gpu_headroom_mib", 512.0));
+    double topology_total = 0.0;
+    if (has_key(hardware, "gpus") && hardware.at("gpus").is_array()) {
+        for (const auto & gpu : hardware.at("gpus")) {
+            const double usable = num_value(gpu, "vram_driver_usable_mib", num_value(gpu, "vram_total_mib", 0.0));
+            topology_total += std::max(0.0, usable - per_gpu_reserve);
+        }
+    }
+    double available = topology_total > 0 ? topology_total : num_value(hardware, "vram_driver_usable_mib", num_value(hardware, "vram_budget_mib", 0.0));
+    const std::string backend = lower(str_value(hardware, "backend", "generic"));
+    if (bool_value(hardware, "unified_memory") || backend == "metal") {
+        const double ram = num_value(hardware, "system_ram_available_mib", available);
+        if (ram > 0) available = available > 0 ? std::min(available, ram) : ram;
+    }
+    return std::max(0.0, available);
+}
+
+std::string planner_adapter(const json & hardware) {
+    const std::string backend = lower(str_value(hardware, "backend", "generic"));
+    if (backend.find("cuda") != std::string::npos) return "cuda-topology";
+    if (backend.find("metal") != std::string::npos || bool_value(hardware, "unified_memory")) return "metal-unified";
+    if (backend.find("hip") != std::string::npos) return "hip-topology";
+    if (backend.find("vulkan") != std::string::npos) return "vulkan-topology";
+    return num_value(hardware, "vram_budget_mib", 0.0) > 0 ? "generic-gpu" : "cpu-numa";
+}
+
+std::vector<int> closest_candidates(std::vector<int> candidates, int anchor, size_t limit) {
+    std::sort(candidates.begin(), candidates.end(), [anchor](int a, int b) {
+        const int da = std::abs(a - anchor);
+        const int db = std::abs(b - anchor);
+        return da == db ? a < b : da < db;
+    });
+    if (candidates.size() > limit) candidates.resize(limit);
+    std::sort(candidates.begin(), candidates.end());
+    return candidates;
+}
+
+void annotate_adaptive_item(json & item, const json & estimate, const std::string & adapter, int anchor, size_t ordinal) {
+    item["planning_mode"] = "adaptive-structural";
+    item["planner_adapter"] = adapter;
+    item["predicted_frontier"] = anchor;
+    item["search_stage"] = ordinal < 3 ? "race" : "boundary-confirmation";
+    item["structural_estimate"] = estimate;
+}
+
 std::string get_sweep_kind(const json & meta, const json & cfg) {
     if (bool_value(meta, "is_moe")) return "moe-cpu";
     const json hardware = has_key(cfg, "hardware") ? cfg.at("hardware") : json::object();
     const json planning = has_key(cfg, "planning") ? cfg.at("planning") : json::object();
-    const int64_t budget = int_value(hardware, "vram_budget_mib") ? int_value(hardware, "vram_budget_mib") : int_value(hardware, "vram_driver_usable_mib");
+    const int64_t budget = (int64_t) effective_vram_mib(hardware, planning);
     const int64_t needed = int_value(meta, "size_mib") + int_value(meta, "mmproj_mib") + int_value(planning, "overhead_mib");
     return needed < budget ? "context" : "offload";
 }
@@ -558,6 +604,8 @@ std::vector<json> invoke_plan(const std::vector<json> & catalog, const json & cf
     if (preset_max > 0 && (global_cap == 0 || preset_max < global_cap)) global_cap = preset_max;
     const json hardware = has_key(cfg, "hardware") ? cfg.at("hardware") : json::object();
     const json planning = has_key(cfg, "planning") ? cfg.at("planning") : json::object();
+    const double topology_vram_mib = effective_vram_mib(hardware, planning);
+    const std::string adapter = planner_adapter(hardware);
     const std::string threads = int_value(hardware, "cpu_cores_physical") > 0
         ? " --threads " + std::to_string(int_value(hardware, "cpu_cores_physical")) + " --threads-batch " + std::to_string(int_value(hardware, "cpu_threads_logical", int_value(hardware, "cpu_cores_physical")))
         : "";
@@ -600,7 +648,7 @@ std::vector<json> invoke_plan(const std::vector<json> & catalog, const json & cf
         if (has_key(opts, "level") && opts.at("level").is_string() && level != opts.at("level")) continue;
         const auto cit = context_map.find(name);
         const int64_t per_model_cap = cit != context_map.end() ? cit->second : int_value(meta, "gguf_context_length");
-        const json mmap_policy = model_base_args(meta, base, ram_available, int_value(hardware, "vram_driver_usable_mib", int_value(hardware, "vram_budget_mib")));
+        const json mmap_policy = model_base_args(meta, base, ram_available, (int64_t) topology_vram_mib);
         const std::string per_model_base = str_value(mmap_policy, "baseArgs");
         const std::string suffix = per_model_base.empty() ? "" : " " + per_model_base;
         plan.push_back(new_plan_item(meta, sweep, level, "", "vanilla_llama_cpp", json::object(), "vanilla"));
@@ -666,21 +714,49 @@ std::vector<json> invoke_plan(const std::vector<json> & catalog, const json & cf
             }
         } else if (sweep == "moe-cpu") {
             std::vector<int> sweep_values = ints_from_array(planning, "moecpu_sweep");
-            if (sweep_values.empty()) sweep_values = {28, 30, 32, 34, 36};
+            json structural = json::object();
+            int anchor = 0;
+            if (sweep_values.empty()) {
+                structural = estimate_initial_cpu_moe(meta, topology_vram_mib, num_value(planning, "overhead_mib", 1200.0));
+                const int blocks = int_value(structural, "expertBlockCount", int_value(meta, "gguf_block_count"));
+                anchor = int_value(structural, "nCpuMoe", blocks / 2);
+                sweep_values = closest_candidates(build_moe_benchmark_candidates(anchor, blocks), anchor, 6);
+            }
             const int64_t sweep_ctx = choose_sweep_context(ctx_candidates, global_cap, per_model_cap, 16384);
-            for (int n : sweep_values) {
+            for (size_t i = 0; i < sweep_values.size(); ++i) {
+                const int n = sweep_values[i];
                 const std::string args = "--ctx-size " + std::to_string(sweep_ctx) + " --gpu-layers 99 --n-cpu-moe " + std::to_string(n) + " --cache-type-k q8_0 --cache-type-v q8_0" + suffix;
-                plan.push_back(new_plan_item(meta, sweep, level, args, "ncpumoe_" + std::to_string(n), json::object(), nullptr, mmap_policy));
+                json item = new_plan_item(meta, sweep, level, args, "ncpumoe_" + std::to_string(n), json::object(), nullptr, mmap_policy);
+                if (structural.is_object() && !structural.empty()) annotate_adaptive_item(item, structural, adapter, anchor, i);
+                plan.push_back(std::move(item));
             }
         } else {
             std::vector<int> sweep_values = ints_from_array(planning, "offload_sweep");
-            if (sweep_values.empty()) sweep_values = {20, 24, 28, 32, 36};
+            json structural = json::object();
+            int anchor = 0;
+            if (sweep_values.empty()) {
+                const json estimate_options = {
+                    {"availableMib", topology_vram_mib},
+                    {"runtimeReserveMib", num_value(planning, "overhead_mib", 1200.0)},
+                    {"mmprojMib", num_value(meta, "mmproj_mib", 0.0)},
+                };
+                structural = estimate_initial_offload(meta, estimate_options);
+                anchor = int_value(structural, "estimatedLayers", 0);
+                const int blocks = int_value(structural, "blockCount", int_value(meta, "gguf_block_count"));
+                sweep_values = closest_candidates(build_offload_benchmark_candidates(anchor, blocks, {-4, -2, 0, 1, 2, 4}), anchor, 6);
+            }
             const int64_t sweep_ctx = choose_sweep_context(ctx_candidates, global_cap, per_model_cap, 16384);
-            for (int n : sweep_values) {
+            for (size_t i = 0; i < sweep_values.size(); ++i) {
+                const int n = sweep_values[i];
                 const std::string args = "--ctx-size " + std::to_string(sweep_ctx) + " --gpu-layers " + std::to_string(n) + " --cache-type-k q8_0 --cache-type-v q8_0" + suffix;
-                plan.push_back(new_plan_item(meta, sweep, level, args, "ngl_" + std::to_string(n), json::object(), nullptr, mmap_policy));
+                json item = new_plan_item(meta, sweep, level, args, "ngl_" + std::to_string(n), json::object(), nullptr, mmap_policy);
+                annotate_adaptive_item(item, structural, adapter, anchor, i);
+                plan.push_back(std::move(item));
             }
         }
+    }
+    for (auto & item : plan) {
+        item["capability_source"] = has_key(cfg, "capabilities") ? "build-probe" : "unprobed";
     }
     return plan;
 }

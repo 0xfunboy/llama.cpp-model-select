@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <regex>
 #include <sstream>
 #include <thread>
 #include <atomic>
@@ -143,6 +144,24 @@ static json parse_first_json_array(const std::string & output) {
         throw std::runtime_error("benchmark did not return JSON output");
     }
     return json::parse(output.substr(begin, end - begin + 1));
+}
+
+static json detected_build_capabilities() {
+    static std::once_flag once;
+    static json capabilities = json::object();
+    std::call_once(once, []() {
+        int exit_code = 0;
+        const std::string help = run_command_capture(current_executable_dir() / "llama-bench", {"--help"}, exit_code);
+        std::set<std::string> flags;
+        const std::regex flag_pattern(R"((--[a-zA-Z0-9][a-zA-Z0-9-]*))");
+        for (std::sregex_iterator it(help.begin(), help.end(), flag_pattern), end; it != end; ++it) flags.insert((*it)[1].str());
+        capabilities = {
+            {"source", "llama-bench-help"},
+            {"exit_code", exit_code},
+            {"supported_flags", flags},
+        };
+    });
+    return capabilities;
 }
 
 static std::string isoish_timestamp() {
@@ -362,9 +381,16 @@ static std::vector<std::string> llama_bench_args_for_item(const json & item, con
         out.push_back(std::to_string(dims.depth_tokens));
     }
 
+    auto flag_supported = [&](const std::string & flag) {
+        const json capabilities = json_value(cfg, "capabilities", json::object());
+        if (!capabilities.contains("supported_flags") || !capabilities["supported_flags"].is_array() || capabilities["supported_flags"].empty()) return true;
+        return std::any_of(capabilities["supported_flags"].begin(), capabilities["supported_flags"].end(), [&](const json & value) {
+            return value.is_string() && value.get<std::string>() == flag;
+        });
+    };
     auto push_value = [&](const std::string & dst, const std::vector<std::string> & names, bool tensor_split = false) {
         std::string value = arg_value(source, names);
-        if (value.empty()) return;
+        if (value.empty() || !flag_supported(dst)) return;
         if (tensor_split) value = normalized_tensor_split(value);
         out.push_back(dst);
         out.push_back(value);
@@ -493,16 +519,18 @@ static std::optional<json::iterator> find_model_entry(json & models, const std::
 static json default_plan_cfg() {
     return {
         {"hardware", {
-            {"vram_budget_mib", 49152},
-            {"vram_driver_usable_mib", 24576},
+            {"backend", "auto"},
+            {"vram_budget_mib", 0},
+            {"vram_driver_usable_mib", 0},
+            {"gpus", json::array()},
             {"cpu_cores_physical", (int) std::max(1u, std::thread::hardware_concurrency() / 2)},
             {"cpu_threads_logical", (int) std::max(1u, std::thread::hardware_concurrency())},
             {"system_ram_available_mib", 0},
         }},
         {"planning", {
             {"overhead_mib", 1200},
-            {"moecpu_sweep", {0, 8, 16, 24, 32}},
-            {"offload_sweep", {20, 28, 36, 48, 60, 80}},
+            {"per_gpu_headroom_mib", 512},
+            {"search", "adaptive"},
             {"kv_rescue", {{"enabled", true}, {"min_context_tokens", 65536}, {"kv_k", "q4_0"}, {"kv_v", "q4_0"}}},
             {"workload_sweeps", {{"context_reserve_tokens", 512}, {"kv_fill_ratios", {0.25, 0.5, 0.75, 0.9}}, {"prefill_micro_tokens", {2048}}, {"prefill_ratios", {0.25, 0.9}}}},
         }},
@@ -699,7 +727,8 @@ struct server_caliber_advisor_routes::impl {
 
     json build_plan_payload(const json & body) {
         const auto metas = model_plan_metas(body);
-        const json cfg = merge_cfg(default_plan_cfg(), json_value(body, "cfg", json::object()));
+        json cfg = merge_cfg(default_plan_cfg(), json_value(body, "cfg", json::object()));
+        if (!cfg.contains("capabilities")) cfg["capabilities"] = detected_build_capabilities();
         const json opts = json_value(body, "opts", json::object());
         const auto items = caliber::invoke_plan(metas, cfg, {}, json::object(), opts);
         json plan = json::array();

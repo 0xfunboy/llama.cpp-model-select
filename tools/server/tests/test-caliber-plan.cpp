@@ -148,6 +148,38 @@ void test_plan_core() {
     require_eq(profiles.front().at("prefillTokens"), 512, "workload micro prefill");
 }
 
+void test_adaptive_production_plan() {
+    const double mib = 1024.0 * 1024.0;
+    json adaptive_cfg = cfg();
+    adaptive_cfg["planning"].erase("offload_sweep");
+    adaptive_cfg["planning"].erase("moecpu_sweep");
+    adaptive_cfg["planning"]["overhead_mib"] = 256;
+    adaptive_cfg["planning"]["per_gpu_headroom_mib"] = 512;
+    adaptive_cfg["hardware"] = {
+        {"backend", "CUDA"},
+        {"vram_budget_mib", 16384},
+        {"gpus", {{{"name", "gpu0"}, {"vram_driver_usable_mib", 4096}}, {{"name", "gpu1"}, {"vram_driver_usable_mib", 4096}}}},
+        {"system_ram_available_mib", 32000},
+    };
+    adaptive_cfg["capabilities"] = {{"supported_flags", {"--ctx-size", "--gpu-layers", "--cache-type-k", "--cache-type-v", "--parallel"}}};
+    json meta = {
+        {"path", "model.gguf"}, {"model", "Dense-12B"}, {"variant", "Q4_K_M"}, {"size_mib", 9000},
+        {"gguf_block_count", 8}, {"gguf_tensor_bytes", 9 * 1024.0 * mib}, {"gguf_global_tensor_bytes", 1024.0 * mib},
+        {"gguf_block_tensor_bytes", json::array()}, {"is_moe", false}, {"gguf_context_length", 32768},
+    };
+    for (int block = 0; block < 8; ++block) meta["gguf_block_tensor_bytes"].push_back({{"block", block}, {"bytes", 1024.0 * mib}});
+    const auto plan = caliber::invoke_plan({meta}, adaptive_cfg, {}, {});
+    int adaptive_rows = 0;
+    for (const auto & item : plan) {
+        if (item.value("planning_mode", std::string()) != "adaptive-structural") continue;
+        ++adaptive_rows;
+        require_eq(item.at("planner_adapter"), "cuda-topology", "topology adapter recorded");
+        require(item.at("extra_args").get<std::string>().find("--ctx-size") != std::string::npos, "logical context survives capability mapping");
+        require_eq(item.at("capability_source"), "build-probe", "build capability source recorded");
+    }
+    require(adaptive_rows > 1 && adaptive_rows <= 6, "small adaptive frontier grid");
+}
+
 void test_real_gguf_reader() {
     const std::string path = "/home/cooper/models/deepseek-coder-33b-base/deepseek-coder-33b-base.Q4_K_M.gguf";
     if (!std::filesystem::exists(path)) return;
@@ -171,6 +203,7 @@ int main() {
     test_offload_planner();
     test_moe();
     test_plan_core();
+    test_adaptive_production_plan();
     test_real_gguf_reader();
     if (failures) {
         std::cerr << failures << " caliber plan test(s) failed\n";

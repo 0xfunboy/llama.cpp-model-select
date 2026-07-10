@@ -473,6 +473,21 @@
 			models: pendingSelectedIds,
 			opts: { workloadSweep: scopeOptions[runScope].workload },
 			cfg: {
+				hardware: fitSystem ? {
+					backend: fitSystem.backend,
+					unified_memory: fitSystem.unified_memory ?? false,
+					vram_budget_mib: Math.round(fitSystem.total_gpu_vram_gb * 1024),
+					vram_driver_usable_mib: Math.round(fitSystem.total_gpu_vram_gb * 1024),
+					system_ram_available_mib: Math.round(fitSystem.available_ram_gb * 1024),
+					cpu_threads_logical: fitSystem.cpu_cores,
+					cpu_cores_physical: Math.max(1, Math.floor(fitSystem.cpu_cores / 2)),
+					gpus: fitSystem.gpus.map((gpu) => ({
+						name: gpu.name,
+						backend: gpu.backend,
+						vram_total_mib: Math.round(gpu.vram_gb * 1024),
+						vram_driver_usable_mib: Math.round(gpu.vram_gb * 1024)
+					}))
+				} : {},
 				context_candidates: [{ ctx: contextSize, kv: 'q8_0' }],
 				max_context_cap: contextSize
 			}
