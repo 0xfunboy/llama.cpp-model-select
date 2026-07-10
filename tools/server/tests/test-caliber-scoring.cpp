@@ -214,6 +214,15 @@ void test_winner_policy() {
             "safety requires observed memory");
     require(caliber::group_winners({synthetic}, caliber::winner_profile::overall).empty(),
             "overall requires observed memory");
+
+    winners = caliber::group_winners({
+        {{"id", "fast-low-quality"}, {"model", "fast"}, {"ok", true}, {"eval_tps", 200},
+         {"quality_gate_required", true}, {"quality_gate_passed", false}},
+        {{"id", "slower-qualified"}, {"model", "good"}, {"ok", true}, {"eval_tps", 40},
+         {"quality_gate_required", true}, {"quality_gate_passed", true}},
+    }, caliber::winner_profile::speed);
+    require(winners.count("fast") == 0 && winners.count("good") == 1,
+            "fast model below the quality floor cannot win");
 }
 
 void test_memory_policy() {

@@ -46,6 +46,8 @@ add_library(${TARGET}
     model-registry.h
     model-operations.cpp
     model-operations.h
+    quality-evidence.cpp
+    quality-evidence.h
     streaming-profiler.cpp
     streaming-profiler.h
     server-caliber-advisor.cpp
@@ -65,6 +67,7 @@ add_library(${TARGET}
 set_target_properties(${TARGET} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 target_compile_definitions(${TARGET} PRIVATE
     LLAMA_DS4_EVAL_CASES_PATH="${CMAKE_CURRENT_SOURCE_DIR}/ds4-eval-cases.json"
+    LLAMA_LOCAL_QUALITY_PACKS_PATH="${CMAKE_CURRENT_SOURCE_DIR}/local-quality-packs.json"
 )
 
 target_include_directories(${TARGET} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -141,6 +144,11 @@ if(LLAMA_BUILD_TESTS)
     target_include_directories(test-streaming-profiler PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(test-streaming-profiler PRIVATE llama-server-impl)
     add_test(NAME streaming-profiler COMMAND test-streaming-profiler)
+
+    add_executable(test-quality-evidence tests/test-quality-evidence.cpp quality-evidence.cpp)
+    target_compile_features(test-quality-evidence PRIVATE cxx_std_17)
+    target_include_directories(test-quality-evidence PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/vendor)
+    add_test(NAME quality-evidence COMMAND test-quality-evidence)
 endif()
 
 # llama-server executable

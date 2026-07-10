@@ -555,6 +555,7 @@ bool is_candidate_row(const json & source) {
 }
 
 bool is_winner_eligible(const json & result) {
+    if (bool_value(result, "quality_gate_required", false) && !bool_value(result, "quality_gate_passed", false)) return false;
     return row_role(result) == "candidate";
 }
 

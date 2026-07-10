@@ -6,6 +6,7 @@
 #include "server-models.h"
 #include "server-persistence.h"
 #include "streaming-profiler.h"
+#include "quality-evidence.h"
 
 #include <sheredom/subprocess.h>
 
@@ -551,6 +552,7 @@ static json default_plan_cfg() {
             {"workload_sweeps", {{"context_reserve_tokens", 512}, {"kv_fill_ratios", {0.25, 0.5, 0.75, 0.9}}, {"prefill_micro_tokens", {2048}}, {"prefill_ratios", {0.25, 0.9}}}},
         }},
         {"bench", {{"backend", "auto"}, {"n_predict", 128}, {"repetitions", 3}, {"warmup", true}}},
+        {"quality", {{"required", true}, {"pack", "overall"}, {"min_score", 0.5}, {"min_samples", 1}}},
         {"context_candidates", {{{"ctx", 8192}, {"kv", "q8_0"}}, {{"ctx", 32768}, {"kv", "q8_0"}}, {{"ctx", 131072}, {"kv", "q8_0"}}}},
         {"max_context_cap", 262144},
         {"base_args", "--flash-attn auto --parallel 1 --batch-size 512 --ubatch-size 512"},
@@ -913,10 +915,16 @@ struct server_caliber_advisor_routes::impl {
                 memory_options.vram_budget_mib = json_value(hardware, "vram_budget_mib", -1.0);
                 memory_options.vram_driver_usable_mib = json_value(hardware, "vram_driver_usable_mib", -1.0);
                 winner_rows = caliber::build_report_rows(winner_rows, vram_total_mib, memory_options);
+                std::vector<json> ds4_reports;
+                for (const auto & report : server_persistence::load_reports("ds4-eval")) ds4_reports.push_back(report);
+                const json quality_profiles = quality_evidence::build_profiles(ds4_reports, router.scan_model_registry(false));
+                const json quality_policy = json_value(payload["cfg"], "quality", json::object({{"required", true}, {"pack", "overall"}, {"min_score", 0.5}, {"min_samples", 1}}));
+                winner_rows = quality_evidence::apply_policy(winner_rows, quality_profiles, quality_policy);
                 rows = json::array();
                 for (const auto & row : winner_rows) rows.push_back(row);
 
                 const json recommendations = caliber::build_recommendations(winner_rows);
+                const bool has_quality_winner = recommendations.contains("overall") && recommendations["overall"].value("winner", json(nullptr)).is_object();
                 const bool has_success = std::any_of(rows.begin(), rows.end(), [](const json & row) {
                     return json_value(row, "ok", false);
                 });
@@ -932,7 +940,9 @@ struct server_caliber_advisor_routes::impl {
                     {"note", has_streaming ? "Finalists measured with isolated streaming llama-server; synthetic rows were used only for racing." : "Measured with llama-bench synthetic racing only."},
                     {"metric_schema_version", caliber::METRIC_SCHEMA_VERSION},
                     {"evidence_level", has_streaming ? "streaming-measured" : "synthetic-measured"},
-                    {"automatic_fit_allowed", has_streaming},
+                    {"automatic_fit_allowed", has_streaming && has_quality_winner},
+                    {"quality_policy", quality_policy},
+                    {"quality_profiles", quality_profiles},
                     {"cfg", payload["cfg"]},
                     {"models", payload["models"]},
                     {"plan", plan},
@@ -1196,8 +1206,9 @@ struct server_caliber_advisor_routes::impl {
             }
         }
         if (!measured_row.is_object() || !json_value(measured_row, "fit_eligible", false) ||
-            !json_value(measured_row, "context_target_met", false)) {
-            res_err(res, "configure requires a FIT-eligible row from a stored decision-grade report", 403);
+            !json_value(measured_row, "context_target_met", false) ||
+            (json_value(measured_row, "quality_gate_required", false) && !json_value(measured_row, "quality_gate_passed", false))) {
+            res_err(res, "configure requires a streaming-measured, context-verified row that passes its quality policy", 403);
             return res;
         }
         const auto meta = find_router_model(router, model);

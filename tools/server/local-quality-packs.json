@@ -1,0 +1,21 @@
+{
+  "source": "Local Autopilot quality packs v1",
+  "cases": [
+    {"id":"general-01","pack":"general","domain":"common-sense","title":"Everyday planning","question":"You have a glass of water and need it colder without adding flavor. What should you add?","choices":["Salt","Ice","Pepper","Oil"],"answer":"B"},
+    {"id":"general-02","pack":"general","domain":"knowledge","title":"Basic geography","question":"Which planet is known as the Red Planet?","choices":["Venus","Mars","Jupiter","Mercury"],"answer":"B"},
+    {"id":"chat-01","pack":"chat","domain":"instruction-following","title":"Exact acknowledgement","question":"Reply with exactly the lowercase word: acknowledged","choices":[],"answer":"acknowledged","scorer":"exact"},
+    {"id":"chat-02","pack":"chat","domain":"instruction-following","title":"Concise response","question":"Reply with exactly: Ready to help.","choices":[],"answer":"Ready to help.","scorer":"exact"},
+    {"id":"coding-01","pack":"coding","domain":"programming","title":"Python semantics","question":"What does len([10, 20, 30]) return?","choices":["2","3","20","30"],"answer":"B"},
+    {"id":"coding-02","pack":"coding","domain":"programming","title":"Complexity","question":"What is the average lookup complexity of a well-sized hash table?","choices":["O(1)","O(log n)","O(n)","O(n squared)"],"answer":"A"},
+    {"id":"reasoning-01","pack":"reasoning","domain":"logic","title":"Syllogism","question":"All ravens are birds. No birds are mammals. Can a raven be a mammal?","choices":["Yes","No","Only at night","Cannot be determined"],"answer":"B"},
+    {"id":"reasoning-02","pack":"reasoning","domain":"arithmetic","title":"Multi-step arithmetic","question":"A box has 7 rows of 8 items. Twelve are removed. How many remain?","choices":[],"answer":"44"},
+    {"id":"fim-01","pack":"fim","domain":"code-completion","title":"Python FIM","question":"Complete the missing expression only: def square(x): return <FILL>","choices":[],"answer":"x * x","scorer":"contains"},
+    {"id":"fim-02","pack":"fim","domain":"code-completion","title":"JavaScript FIM","question":"Complete the missing property only: const user = {name: 'Ada'}; console.log(user.<FILL>);","choices":[],"answer":"name","scorer":"contains"},
+    {"id":"rag-01","pack":"rag","domain":"retrieval","title":"Grounded retrieval","question":"Use only this context: Project Aurora launches on 17 November. On what date does Project Aurora launch?","choices":["17 November","7 November","17 December","Unknown"],"answer":"A"},
+    {"id":"rag-02","pack":"rag","domain":"retrieval","title":"Reject unsupported answer","question":"Context: The manual states the device is blue. What is its weight?","choices":["2 kg","5 kg","The context does not say","10 kg"],"answer":"C"},
+    {"id":"tools-01","pack":"tools","domain":"structured-output","title":"Tool arguments","question":"Create JSON with string key city equal to Rome and integer key days equal to 2.","choices":[],"answer":"{\"city\":\"Rome\",\"days\":2}","scorer":"json"},
+    {"id":"tools-02","pack":"tools","domain":"structured-output","title":"Boolean tool argument","question":"Create JSON with string key query equal to weather and boolean key current equal to true.","choices":[],"answer":"{\"query\":\"weather\",\"current\":true}","scorer":"json"},
+    {"id":"long-01","pack":"long-context","domain":"needle-retrieval","title":"Late needle","repeat_text":"Archive filler: cedar, quartz, linen, harbor. ","repeat_count":512,"question":"Important record: the access code is ORBIT-731. What is the access code?","choices":[],"answer":"ORBIT-731","scorer":"contains"},
+    {"id":"long-02","pack":"long-context","domain":"needle-retrieval","title":"Early needle","question":"The owner of unit K-19 is Dr. Mira Sol. After this fact comes a long neutral archive. Who owns unit K-19? Archive: amber slate river cloud repeated for context.","repeat_text":"Neutral appendix: amber, slate, river, cloud. ","repeat_count":512,"choices":[],"answer":"Dr. Mira Sol","scorer":"contains"}
+  ]
+}

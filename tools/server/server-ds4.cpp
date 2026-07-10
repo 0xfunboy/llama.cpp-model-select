@@ -26,6 +26,9 @@
 #ifndef LLAMA_DS4_EVAL_CASES_PATH
 #define LLAMA_DS4_EVAL_CASES_PATH "tools/server/ds4-eval-cases.json"
 #endif
+#ifndef LLAMA_LOCAL_QUALITY_PACKS_PATH
+#define LLAMA_LOCAL_QUALITY_PACKS_PATH "tools/server/local-quality-packs.json"
+#endif
 
 namespace {
 
@@ -41,6 +44,8 @@ struct ds4_case {
     std::string question;
     std::vector<std::string> choices;
     std::string answer;
+    std::string pack = "reasoning";
+    std::string scorer = "auto";
 };
 
 struct ds4_event {
@@ -303,7 +308,38 @@ static json read_report_by_id(const std::string & id) {
     return report;
 }
 
-static std::vector<ds4_case> load_eval_cases() {
+static void append_eval_cases(std::vector<ds4_case> & out, const json & root, const std::string & default_pack) {
+    if (!root.contains("cases") || !root["cases"].is_array()) throw std::runtime_error("quality prompt pack requires a cases array");
+    if (root["cases"].size() > 256) throw std::runtime_error("quality prompt pack exceeds 256 cases");
+    for (const auto & item : root["cases"]) {
+        ds4_case tc;
+        tc.source = json_value(item, "source", json_value(root, "source", std::string("local")));
+        tc.id = json_value(item, "id", std::string());
+        tc.domain = json_value(item, "domain", std::string());
+        tc.title = json_value(item, "title", tc.id);
+        tc.question = json_value(item, "question", std::string());
+        tc.answer = json_value(item, "answer", std::string());
+        tc.pack = json_value(item, "pack", json_value(root, "name", default_pack));
+        tc.scorer = json_value(item, "scorer", std::string("auto"));
+        const std::string repeat_text = json_value(item, "repeat_text", std::string());
+        const int repeat_count = std::clamp(json_value(item, "repeat_count", 0), 0, 4096);
+        if (!repeat_text.empty() && repeat_count > 0) {
+            std::string expanded;
+            expanded.reserve(repeat_text.size() * (size_t) repeat_count + tc.question.size());
+            for (int i = 0; i < repeat_count; ++i) expanded += repeat_text;
+            tc.question = expanded + tc.question;
+        }
+        if (tc.id.empty() || tc.question.empty() || tc.answer.empty() || tc.pack.empty()) {
+            throw std::runtime_error("quality prompt pack cases require id, question, answer and pack");
+        }
+        if (item.contains("choices") && item["choices"].is_array()) {
+            for (const auto & choice : item["choices"]) tc.choices.push_back(choice.get<std::string>());
+        }
+        out.push_back(std::move(tc));
+    }
+}
+
+static std::vector<ds4_case> load_eval_cases(const json & request) {
     std::vector<std::filesystem::path> candidates = {
         std::filesystem::path(LLAMA_DS4_EVAL_CASES_PATH),
         std::filesystem::current_path() / "tools/server/ds4-eval-cases.json",
@@ -325,23 +361,28 @@ static std::vector<ds4_case> load_eval_cases() {
         throw std::runtime_error("DS4 eval cases JSON not found");
     }
 
-    json root = json::parse(raw);
     std::vector<ds4_case> out;
-    for (const auto & item : root.at("cases")) {
-        ds4_case tc;
-        tc.source = json_value(item, "source", std::string());
-        tc.id = json_value(item, "id", std::string());
-        tc.domain = json_value(item, "domain", std::string());
-        tc.title = json_value(item, "title", std::string());
-        tc.question = json_value(item, "question", std::string());
-        tc.answer = json_value(item, "answer", std::string());
-        if (item.contains("choices") && item["choices"].is_array()) {
-            for (const auto & choice : item["choices"]) {
-                tc.choices.push_back(choice.get<std::string>());
-            }
-        }
-        out.push_back(std::move(tc));
+    append_eval_cases(out, json::parse(raw), "reasoning");
+
+    for (const auto & path : {std::filesystem::path(LLAMA_LOCAL_QUALITY_PACKS_PATH),
+            std::filesystem::current_path() / "tools/server/local-quality-packs.json"}) {
+        std::error_code ec;
+        if (!std::filesystem::exists(path, ec)) continue;
+        append_eval_cases(out, json::parse(read_text_file(path)), "general");
+        break;
     }
+    if (request.contains("local_prompt_pack") && request["local_prompt_pack"].is_object()) {
+        append_eval_cases(out, request["local_prompt_pack"], "local");
+    }
+
+    std::set<std::string> requested_packs;
+    if (request.contains("packs") && request["packs"].is_array()) {
+        for (const auto & value : request["packs"]) if (value.is_string()) requested_packs.insert(value.get<std::string>());
+    }
+    if (!requested_packs.empty()) {
+        out.erase(std::remove_if(out.begin(), out.end(), [&](const ds4_case & tc) { return !requested_packs.count(tc.pack); }), out.end());
+    }
+    if (out.empty()) throw std::runtime_error("quality prompt pack selection contains no cases");
 
     SRV_INF("loaded %zu DS4 eval cases from %s\n", out.size(), used.string().c_str());
     return out;
@@ -363,6 +404,12 @@ static std::string build_question_prompt(const ds4_case & tc) {
         out << "\nSolve the question. At the end, write exactly one final line in this "
                "format and do not write anything after it:\n"
                "Answer: <letter>";
+    } else if (tc.scorer == "exact") {
+        out << "\nReturn only the exact requested answer with no explanation.";
+    } else if (tc.scorer == "contains") {
+        out << "\nProvide the requested completion concisely.";
+    } else if (tc.scorer == "json") {
+        out << "\nReturn only valid JSON with no markdown fence or explanation.";
     } else if (is_compsec_case(tc)) {
         out << "\nAt the end, write exactly one final line in this format and do not "
                "write anything after it:\n"
@@ -693,6 +740,7 @@ static bool compsec_answer_matches(const std::string & expected_spec, const std:
 }
 
 static std::string find_case_answer(const ds4_case & tc, const std::string & generated) {
+    if (tc.scorer == "exact" || tc.scorer == "contains" || tc.scorer == "json") return trim_copy(visible_after_think(generated));
     if (!tc.choices.empty()) {
         return std::string(1, find_answer_letter(generated, (int) tc.choices.size()));
     }
@@ -703,6 +751,11 @@ static std::string find_case_answer(const ds4_case & tc, const std::string & gen
 }
 
 static bool answer_matches(const ds4_case & tc, const std::string & got) {
+    if (tc.scorer == "exact") return lower_copy(trim_copy(got)) == lower_copy(trim_copy(tc.answer));
+    if (tc.scorer == "contains") return lower_copy(got).find(lower_copy(tc.answer)) != std::string::npos;
+    if (tc.scorer == "json") {
+        try { return json::parse(got) == json::parse(tc.answer); } catch (...) { return false; }
+    }
     if (!tc.choices.empty()) {
         return !got.empty() && !tc.answer.empty() && got[0] == tc.answer[0];
     }
@@ -1366,7 +1419,7 @@ struct server_ds4_routes::impl {
                     is_resume ? json_value(resume_report, "temperature", 0.0) : 0.0);
             std::string selector;
             const auto model_names = models_from_resume_or_request(request, resume_report, selector);
-            auto cases = load_eval_cases();
+            auto cases = load_eval_cases(request);
             if (limit > 0 && limit < (int) cases.size()) {
                 cases.resize((size_t) limit);
             }
@@ -1383,6 +1436,12 @@ struct server_ds4_routes::impl {
                 {"thinking_budget_tokens", think_budget},
                 {"thinking", thinking},
                 {"temperature", temperature},
+                {"packs", request.value("packs", json::array())},
+                {"prompt_pack_source", request.contains("local_prompt_pack") ? "user-owned" : "built-in"},
+                {"evaluation_profile", {{"template", "router-default"}, {"reasoning_format", "deepseek"},
+                    {"thinking", thinking}, {"thinking_budget_tokens", think_budget}, {"max_tokens", max_tokens},
+                    {"temperature", temperature}, {"top_p", 1.0}, {"top_k", 1}, {"seed", 42}}},
+                {"artifacts", json::object()},
                 {"limit", limit},
                 {"results", json::array()},
                 {"summary", json::object()},
@@ -1430,6 +1489,11 @@ struct server_ds4_routes::impl {
                     throw std::runtime_error("model disappeared after switch");
                 }
                 const int port = meta->port;
+                std::string model_path;
+                meta->preset.get_option("LLAMA_ARG_MODEL", model_path);
+                const json registry = router.scan_model_registry(false);
+                const std::string artifact_id = model_registry::artifact_id_for_path(registry, model_path);
+                report["artifacts"][resolved] = artifact_id.empty() ? json(nullptr) : json(artifact_id);
 
                 int model_pass = 0;
                 int model_fail = 0;
@@ -1457,6 +1521,7 @@ struct server_ds4_routes::impl {
                         {"temperature", temperature},
                         {"top_p", 1.0},
                         {"top_k", 1},
+                        {"seed", 42},
                         {"max_tokens", timeout_tokens},
                         {"cache_prompt", false},
                         {"reasoning_format", "deepseek"},
@@ -1520,6 +1585,12 @@ struct server_ds4_routes::impl {
                         {"source", tc.source},
                         {"id", tc.id},
                         {"domain", tc.domain},
+                        {"pack", tc.pack},
+                        {"scorer", tc.scorer},
+                        {"artifact_id", artifact_id.empty() ? json(nullptr) : json(artifact_id)},
+                        {"template", "router-default"},
+                        {"sampling_profile", {{"temperature", temperature}, {"top_p", 1.0}, {"top_k", 1}, {"seed", 42},
+                            {"thinking", thinking}, {"reasoning_format", "deepseek"}}},
                         {"title", tc.title},
                         {"expected", tc.answer},
                         {"got", got},
