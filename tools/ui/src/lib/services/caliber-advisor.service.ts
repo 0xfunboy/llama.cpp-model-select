@@ -68,8 +68,10 @@ export interface CaliberSweepStatus {
 	error?: string;
 	current?: number;
 	total?: number;
-	report_id?: string;
+	current_item?: string | null;
+	report_id?: string | null;
 	finished?: boolean;
+	cancel_requested?: boolean;
 }
 
 export interface CaliberSweepEvent {
@@ -124,6 +126,13 @@ export class CaliberAdvisorService {
 		return apiFetch<CaliberSweepStatus>(`/api/caliber-advisor/sweep/status${suffix}`, {
 			authOnly: true
 		});
+	}
+
+	static stopSweep(jobId?: string): Promise<CaliberSweepStatus> {
+		return apiPost<CaliberSweepStatus, Record<string, unknown>>(
+			'/api/caliber-advisor/sweep/stop',
+			jobId ? { id: jobId } : {}
+		);
 	}
 
 	static async streamSweepEvents(

@@ -33,6 +33,7 @@
 	const models = $derived(response?.models ?? []);
 	const system = $derived(response?.system ?? null);
 	const catalog = $derived(response?.catalog ?? null);
+	const hasPendingDownload = $derived(downloadJobs.some((job) => isActiveDownloadStatus(job.status)));
 	const contextOptions = [
 		{ value: 4096, label: '4k' },
 		{ value: 8192, label: '8k' },
@@ -152,7 +153,7 @@
 		if (!model.download) return;
 		isDownloading = true;
 		error = '';
-		message = `Starting download for ${model.download.hf_ref}...`;
+		message = `${hasPendingDownload ? 'Queueing' : 'Starting'} download for ${model.download.hf_ref}...`;
 		try {
 			const result = await FitAdvisorService.download(model);
 			if (result.job) {
@@ -237,11 +238,15 @@
 		return downloadJobs.find((job) => job.model_id === model.id || job.hf_ref === model.download?.hf_ref) ?? model.download_progress ?? null;
 	}
 
+	function isActiveDownloadStatus(status: string): boolean {
+		return status === 'queued' || status === 'resolving' || status === 'downloading';
+	}
+
 	function statusFor(model: FitAdvisorModel): string {
 		if (model.configured || model.installed) return 'configured';
 		const job = downloadJobFor(model);
 		if (job) {
-			if (job.status === 'queued' || job.status === 'resolving' || job.status === 'downloading') return job.status;
+			if (isActiveDownloadStatus(job.status)) return job.status;
 			return job.status;
 		}
 		if (model.download_status) return model.download_status;
@@ -268,6 +273,14 @@
 	}
 
 	function downloadButtonLabel(model: FitAdvisorModel): string {
+		const job = downloadJobFor(model);
+		if (job && isActiveDownloadStatus(job.status)) {
+			const progress = typeof job.percent === 'number' && Number.isFinite(job.percent) ? ` ${Math.round(job.percent)}%` : '';
+			if (job.status === 'queued') return 'Queued';
+			if (job.status === 'resolving') return 'Resolving';
+			return `Downloading${progress}`;
+		}
+		if (hasPendingDownload && statusFor(model) === 'available') return 'Queue DL';
 		return statusFor(model) === 'partial' ? 'Resume DL' : 'Download';
 	}
 </script>

@@ -13,6 +13,7 @@
 		RefreshCw,
 		Search,
 		Settings2,
+		Square,
 		Trash2,
 		Wrench
 	} from '@lucide/svelte';
@@ -134,6 +135,7 @@
 	let downloadLastSeq = $state(0);
 	let downloadAbort: AbortController | null = null;
 	let sweepAbort: AbortController | null = null;
+	let sweepFinalizedFor = '';
 
 	const resultRows = $derived(asRows(results?.rows).filter((row) => rowNum(row, ['eval_tps', 'tps']) > 0));
 	const reportRows = $derived(asRows(selectedReport?.rows));
@@ -153,6 +155,7 @@
 	const completedReports = $derived(reports.filter((report) => report.rows > 0 && isCompleteStatus(report.status)));
 	const pendingReports = $derived(reports.filter((report) => canDeleteReport(report)));
 	const failedReports = $derived(reports.filter((report) => report.status === 'failed'));
+	const hasPendingDownload = $derived(downloads.some((job) => isActiveDownloadStatus(job.status)));
 	const selectedModels = $derived(models.filter((model) => selectedLocalIds.includes(model.id)));
 	const pendingSelectedIds = $derived(selectedLocalIds.filter((id) => !hasHistoricModelResult(id)));
 	const selectableModels = $derived(models.filter((model) => Boolean(model.path)));
@@ -165,6 +168,7 @@
 		void refreshAll();
 		void loadCatalog();
 		void refreshDownloads();
+		void restoreActiveSweep();
 		startDownloadStream();
 	});
 
@@ -392,7 +396,7 @@
 	}
 
 	function reportStatusLabel(report: CaliberReportSummary): string {
-		if (report.rows > 0) return 'complete';
+		if (report.rows > 0 && isCompleteStatus(report.status)) return 'complete';
 		return report.status || 'pending';
 	}
 
@@ -429,6 +433,7 @@
 	}
 
 	function nextActionText(): string {
+		if (status?.cancel_requested) return 'Stop requested. Caliber will exit after the current benchmark config returns.';
 		if (running) return 'Benchmark is running on the server. You can close this page and come back to Reports.';
 		if (selectedLocalIds.length === 0) return 'Choose at least one installed model, or download/configure a catalog model first.';
 		if (pendingSelectedIds.length === 0) return 'All selected models already have completed historical measurements. Open Reports to compare them without rerunning.';
@@ -450,6 +455,99 @@
 
 	function pushEvent(line: string) {
 		eventLog = [`${new Date().toLocaleTimeString()} ${line}`, ...eventLog].slice(0, 80);
+	}
+
+	function sweepIsLive(snapshot: CaliberSweepStatus | null): boolean {
+		const state = (snapshot?.status ?? '').toLowerCase();
+		return Boolean(snapshot?.job_id && !snapshot.finished && ['queued', 'running', 'stopping'].includes(state));
+	}
+
+	function delay(ms: number, signal: AbortSignal): Promise<void> {
+		return new Promise((resolve) => {
+			const timeout = window.setTimeout(resolve, ms);
+			signal.addEventListener(
+				'abort',
+				() => {
+					window.clearTimeout(timeout);
+					resolve();
+				},
+				{ once: true }
+			);
+		});
+	}
+
+	function attachSweep(jobId: string) {
+		sweepAbort?.abort();
+		sweepAbort = new AbortController();
+		const signal = sweepAbort.signal;
+		running = true;
+		void CaliberAdvisorService.streamSweepEvents(
+			jobId,
+			(event) => {
+				status = event.data;
+				running = sweepIsLive(event.data);
+				pushEvent(humanEvent(event.event, event.data));
+				if (!sweepIsLive(event.data) || ['done', 'error', 'cancelled'].includes(event.event)) {
+					sweepAbort?.abort();
+					void finishSweep(event.data);
+				}
+			},
+			signal
+		).catch((e) => {
+			if (!(e instanceof DOMException && e.name === 'AbortError')) pushEvent(e instanceof Error ? e.message : String(e));
+		});
+		void monitorSweep(jobId, signal);
+	}
+
+	async function monitorSweep(jobId: string, signal: AbortSignal) {
+		while (!signal.aborted) {
+			await delay(2000, signal);
+			if (signal.aborted) return;
+			try {
+				const latest = await CaliberAdvisorService.sweepStatus(jobId);
+				status = latest;
+				running = sweepIsLive(latest);
+				if (!sweepIsLive(latest)) {
+					await finishSweep(latest);
+					return;
+				}
+			} catch (e) {
+				pushEvent(e instanceof Error ? e.message : String(e));
+			}
+		}
+	}
+
+	async function finishSweep(snapshot: CaliberSweepStatus) {
+		running = false;
+		if (snapshot.job_id && status?.job_id === snapshot.job_id) sweepAbort?.abort();
+		if (snapshot.job_id && sweepFinalizedFor === snapshot.job_id) return;
+		if (snapshot.job_id) sweepFinalizedFor = snapshot.job_id;
+		await refreshAll();
+		if (snapshot.report_id) {
+			const summary = reports.find((report) => report.id === snapshot.report_id);
+			if (summary) await openReport(summary, false);
+			activeTab = 'reports';
+		}
+	}
+
+	async function restoreActiveSweep() {
+		try {
+			const snapshot = await CaliberAdvisorService.sweepStatus();
+			if (!snapshot.job_id || snapshot.status === 'idle') {
+				running = false;
+				return;
+			}
+			status = snapshot;
+			running = sweepIsLive(snapshot);
+			if (running && snapshot.job_id) {
+				activeTab = 'start';
+				eventLog = [];
+				pushEvent(`Restored campaign ${snapshot.job_id}`);
+				attachSweep(snapshot.job_id);
+			}
+		} catch (e) {
+			pushEvent(e instanceof Error ? e.message : String(e));
+		}
 	}
 
 	async function refreshAll() {
@@ -507,36 +605,31 @@
 			const started = await CaliberAdvisorService.sweep(payload());
 			status = { job_id: started.job_id, status: started.status };
 			pushEvent(`Queued campaign ${started.job_id}`);
-			void CaliberAdvisorService.streamSweepEvents(
-				started.job_id,
-				(event) => {
-					status = event.data;
-					pushEvent(humanEvent(event.event, event.data));
-					if (event.event === 'done' || event.event === 'error') sweepAbort?.abort();
-				},
-				sweepAbort.signal
-			).catch((e) => {
-				if (!(e instanceof DOMException && e.name === 'AbortError')) pushEvent(e instanceof Error ? e.message : String(e));
-			});
-			for (let i = 0; i < 240; i += 1) {
-				await new Promise((resolve) => setTimeout(resolve, 1000));
-				status = await CaliberAdvisorService.sweepStatus(started.job_id);
-				if (status.finished) break;
-			}
-			await refreshAll();
-			if (status?.report_id) {
-				const summary = reports.find((report) => report.id === status?.report_id);
-				if (summary) await openReport(summary, false);
-			}
-			activeTab = 'reports';
+			attachSweep(started.job_id);
+		} catch (e) {
+			running = false;
+			error = e instanceof Error ? e.message : String(e);
+		}
+	}
+
+	async function stopSweep() {
+		if (!status?.job_id) return;
+		error = '';
+		try {
+			const stopped = await CaliberAdvisorService.stopSweep(status.job_id);
+			status = stopped;
+			running = sweepIsLive(stopped);
+			pushEvent('Stop requested');
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
-		} finally {
-			running = false;
 		}
 	}
 
 	function humanEvent(event: string, data: CaliberSweepStatus & Record<string, unknown>): string {
+		if (event === 'queued') return `Campaign queued ${String(data.job_id ?? '')}`;
+		if (event === 'started') return 'Campaign started';
+		if (event === 'stop') return String(data.message ?? 'Stop requested');
+		if (event === 'cancelled') return 'Campaign cancelled';
 		if (event === 'preflight') return String(data.message ?? 'Preparing benchmark');
 		if (event === 'bench') return `Testing ${String(data.item ?? 'configuration')}`;
 		if (event === 'row') return data.ok ? `Measured ${fmtNumber(Number(data.eval_tps ?? 0), 1)} tok/s` : `Failed: ${String(data.error ?? 'configuration failed')}`;
@@ -602,15 +695,24 @@
 		downloads = index === -1 ? [job, ...downloads] : downloads.map((item, i) => (i === index ? job : item));
 	}
 
+	function sameNonEmpty(left: string | null | undefined, right: string | null | undefined): boolean {
+		return Boolean(left && right && left === right);
+	}
+
 	function downloadFor(model: FitAdvisorModel): FitAdvisorDownloadJob | null {
 		return (
 			downloads.find(
 				(job) =>
-					job.model_id === model.id ||
-					job.local_path === model.local_path ||
-					(model.download?.hf_ref && job.hf_ref === model.download.hf_ref)
+					sameNonEmpty(job.model_id, model.id) ||
+					sameNonEmpty(job.hf_ref, model.download?.hf_ref) ||
+					sameNonEmpty(job.target_dir, model.download?.target_dir ?? model.target_dir) ||
+					sameNonEmpty(job.local_path, model.local_path)
 			) ?? model.download_progress ?? null
 		);
+	}
+
+	function isActiveDownloadStatus(status: string): boolean {
+		return status === 'queued' || status === 'resolving' || status === 'downloading';
 	}
 
 	function downloadStatus(model: FitAdvisorModel): string {
@@ -618,15 +720,23 @@
 	}
 
 	function downloadActionLabel(model: FitAdvisorModel): string {
+		const job = downloadFor(model);
+		if (job && isActiveDownloadStatus(job.status)) {
+			const progress = typeof job.percent === 'number' && Number.isFinite(job.percent) ? ` ${Math.round(job.percent)}%` : '';
+			if (job.status === 'queued') return 'Queued';
+			if (job.status === 'resolving') return 'Resolving';
+			return `Downloading${progress}`;
+		}
 		const status = downloadStatus(model);
 		if (status === 'partial' || model.partial) return 'Resume DL';
 		if (status === 'failed') return 'Retry DL';
 		if (status === 'downloaded' || status === 'configured') return 'Downloaded';
+		if (hasPendingDownload) return 'Queue DL';
 		return 'Download';
 	}
 
 	function isDownloading(model: FitAdvisorModel): boolean {
-		return ['queued', 'resolving', 'downloading'].includes(downloadStatus(model));
+		return isActiveDownloadStatus(downloadStatus(model));
 	}
 
 	function canStartDownload(model: FitAdvisorModel): boolean {
@@ -882,6 +992,12 @@
 							<Play size={16} />
 							Start benchmark
 						</button>
+						{#if sweepIsLive(status)}
+							<button type="button" class="danger" onclick={stopSweep} disabled={status?.cancel_requested}>
+								<Square size={16} />
+								Stop benchmark
+							</button>
+						{/if}
 					</div>
 					<p class="note">{nextAction}</p>
 				</div>
@@ -939,7 +1055,13 @@
 							<h2>Live campaign</h2>
 							<p>{status?.status ?? 'idle'}</p>
 						</div>
-						<Activity size={18} />
+						{#if sweepIsLive(status)}
+							<button type="button" class="icon-action danger" onclick={stopSweep} disabled={status?.cancel_requested} aria-label="Stop benchmark">
+								<Square size={16} />
+							</button>
+						{:else}
+							<Activity size={18} />
+						{/if}
 					</div>
 					<div class="job">
 						<div class="progress">
@@ -948,6 +1070,7 @@
 						<dl>
 							<div><dt>Done</dt><dd>{status?.current ?? 0}</dd></div>
 							<div><dt>Total</dt><dd>{status?.total ?? 0}</dd></div>
+							<div><dt>Current</dt><dd>{status?.current_item ?? '-'}</dd></div>
 							<div><dt>Report</dt><dd>{status?.report_id ?? '-'}</dd></div>
 						</dl>
 						<div class="event-log">
@@ -1471,6 +1594,17 @@
 	button.primary {
 		background: var(--primary);
 		color: var(--primary-foreground);
+	}
+
+	button.danger {
+		border-color: color-mix(in oklch, var(--destructive) 55%, var(--border));
+		background: color-mix(in oklch, var(--destructive) 14%, var(--background));
+		color: var(--destructive);
+	}
+
+	button.icon-action {
+		width: 38px;
+		padding: 0;
 	}
 
 	button.active,

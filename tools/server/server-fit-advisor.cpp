@@ -68,6 +68,7 @@ struct fit_download_job {
     double speed_bps = 0.0;
     double percent = 0.0;
     int exit_code = 0;
+    uint64_t queue_seq = 0;
     int64_t last_progress_ms = 0;
     uint64_t last_progress_bytes = 0;
 
@@ -85,6 +86,8 @@ static std::condition_variable g_fit_download_cv;
 static std::map<std::string, std::shared_ptr<fit_download_job>> g_fit_download_jobs;
 static std::deque<fit_download_event> g_fit_download_events;
 static uint64_t g_fit_download_next_seq = 0;
+static uint64_t g_fit_download_next_queue_seq = 0;
+static bool g_fit_download_dispatcher_running = false;
 
 static void fit_res_ok(std::unique_ptr<server_http_res> & res, const json & response_data) {
     res->status = 200;
@@ -1018,6 +1021,7 @@ static json download_job_snapshot_locked(const std::shared_ptr<fit_download_job>
         {"speed_bps", job->speed_bps},
         {"percent", job->percent},
         {"exit_code", job->exit_code},
+        {"queue_seq", job->queue_seq},
         {"started_at", job->started_at.empty() ? nullptr : json(job->started_at)},
         {"updated_at", job->updated_at.empty() ? nullptr : json(job->updated_at)},
         {"finished_at", job->finished_at.empty() ? nullptr : json(job->finished_at)},
@@ -1266,6 +1270,50 @@ static void run_download_job(const std::shared_ptr<fit_download_job> & job) {
             j.finished_at = isoish_timestamp();
             j.speed_bps = 0.0;
         });
+    }
+}
+
+static std::shared_ptr<fit_download_job> next_queued_download_job() {
+    std::shared_ptr<fit_download_job> next;
+    uint64_t best_seq = std::numeric_limits<uint64_t>::max();
+    std::lock_guard<std::mutex> lock(g_fit_download_mutex);
+    for (const auto & [_, job] : g_fit_download_jobs) {
+        std::lock_guard<std::mutex> job_lock(job->mutex);
+        if (job->status != "queued") {
+            continue;
+        }
+        const uint64_t seq = job->queue_seq == 0 ? std::numeric_limits<uint64_t>::max() : job->queue_seq;
+        if (!next || seq < best_seq) {
+            next = job;
+            best_seq = seq;
+        }
+    }
+    return next;
+}
+
+static void download_dispatcher_loop() {
+    for (;;) {
+        auto job = next_queued_download_job();
+        if (!job) {
+            std::lock_guard<std::mutex> lock(g_fit_download_mutex);
+            g_fit_download_dispatcher_running = false;
+            return;
+        }
+        run_download_job(job);
+    }
+}
+
+static void ensure_download_dispatcher_running() {
+    bool start = false;
+    {
+        std::lock_guard<std::mutex> lock(g_fit_download_mutex);
+        if (!g_fit_download_dispatcher_running) {
+            g_fit_download_dispatcher_running = true;
+            start = true;
+        }
+    }
+    if (start) {
+        std::thread(download_dispatcher_loop).detach();
     }
 }
 
@@ -2004,12 +2052,11 @@ struct server_fit_advisor_routes::impl {
 
             {
                 std::lock_guard<std::mutex> lock(g_fit_download_mutex);
+                job->queue_seq = ++g_fit_download_next_queue_seq;
                 g_fit_download_jobs[job->id] = job;
             }
             publish_download_snapshot(job);
-            std::thread([job]() {
-                run_download_job(job);
-            }).detach();
+            ensure_download_dispatcher_running();
 
             fit_res_ok(res, {
                 {"success", true},

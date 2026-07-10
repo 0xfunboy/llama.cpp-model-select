@@ -245,6 +245,7 @@ int llama_server(int argc, char ** argv) {
         ctx_http.get ("/api/caliber-advisor/models",        ex_wrapper(caliber_advisor_routes->get_models));
         ctx_http.post("/api/caliber-advisor/plan",          ex_wrapper(caliber_advisor_routes->post_plan));
         ctx_http.post("/api/caliber-advisor/sweep",         ex_wrapper(caliber_advisor_routes->post_sweep));
+        ctx_http.post("/api/caliber-advisor/sweep/stop",    ex_wrapper(caliber_advisor_routes->post_sweep_stop));
         ctx_http.get ("/api/caliber-advisor/sweep/events",  ex_wrapper(caliber_advisor_routes->get_sweep_events));
         ctx_http.get ("/api/caliber-advisor/sweep/status",  ex_wrapper(caliber_advisor_routes->get_sweep_status));
         ctx_http.get ("/api/caliber-advisor/results",       ex_wrapper(caliber_advisor_routes->get_results));

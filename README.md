@@ -15,15 +15,37 @@ The upstream README continues below this fork overview.
 - **Admin router control API** for lifecycle-safe model switching:
   - `GET /admin/models`
   - `POST /admin/switch`
-- **DS4-Eval dashboard** for resumable DwarfStar-style evaluation runs.
-- **DS4-Bench dashboard** for prompt/generation throughput checks.
-- **DS4 model report view** with per-model sector summaries and single-model or
-  race-style comparison reports.
 - **Fit Advisor dashboard** at `/fit-advisor`, backed by a native C++ advisor
-  inspired by `llmfit`.
+  inspired by [`AlexsJones/llmfit`](https://github.com/AlexsJones/llmfit).
+- **Caliber Advisor dashboard** at `/caliber-advisor`, a Svelte/native-router
+  port of core planning, scoring, guided-run, benchmark and reporting ideas from
+  [`SpeederX/calibr`](https://github.com/SpeederX/calibr).
+- **DS4-Eval dashboard** for resumable DwarfStar-style quality evaluation runs,
+  inspired by [`antirez/ds4`](https://github.com/antirez/ds4).
+- **Model report and comparison views** with sector summaries, winner selection,
+  per-model drilldowns, and historical comparison across completed runs.
 - **aria2c Hugging Face download manager** for resumable GGUF downloads.
 - **Router preset writer** that can add downloaded or selected models directly to
   the active `--models-preset` JSON file.
+- **Local SQLite archive** for benchmark reports, download state, Fit Advisor
+  recommendations and configured presets, with import/export from Settings.
+
+### Credits And Imported Work
+
+This fork keeps upstream `llama.cpp` as the runtime foundation and integrates
+local-model operations ideas from several focused projects:
+
+- Thanks to **SpeederX** for [`calibr`](https://github.com/SpeederX/calibr). The
+  Caliber Advisor module adapts its guided workflow, fit planning, winner
+  profiles, benchmark result model and rich report layout into the native
+  `llama-server` router UI.
+- Thanks to **Salvatore Sanfilippo / antirez** for
+  [`ds4`](https://github.com/antirez/ds4). The DS4-Eval workflow and
+  DwarfStar-style quality checks in this fork build on that project family and
+  its model-evaluation focus.
+- Thanks to **Alex Jones** for [`llmfit`](https://github.com/AlexsJones/llmfit).
+  Fit Advisor uses the same practical premise: rank GGUF candidates against the
+  actual machine before downloading or configuring them.
 
 ### Router And Model Lifecycle Features
 
@@ -73,8 +95,40 @@ The upstream README continues below this fork overview.
   when appropriate.
 - Avoids absolute user paths in generated presets when a relative path can be
   written safely.
+- Persists recommendations, download state and FIT configurations into the local
+  archive so they can be backed up or compared later.
 
-### DS4-Eval And DS4-Bench Features
+### Caliber Advisor Features
+
+- Provides a guided workflow for selecting the target use case, benchmark depth,
+  candidate models and context target.
+- Lists installed router models and can select every available model for a
+  campaign while skipping models that already have successful historical
+  measurements.
+- Reuses Fit Advisor downloads and FIT configuration, so a catalog model can be
+  downloaded, configured and then measured without leaving the UI.
+- Plans benchmark sweeps from GGUF metadata, target context, KV-cache settings,
+  offload mode and host hardware.
+- Runs campaigns server-side, preserving progress if the browser is closed.
+- Stores completed benchmark reports under `tools/ui/static/reports/caliber`
+  and mirrors them into the local SQLite archive.
+- Aggregates all completed reports into a historical comparison view; later runs
+  remain comparable with earlier runs without repeating benchmarks for the same
+  model.
+- Offers winner profiles for:
+  - daily-driver balance
+  - fastest response
+  - speed per watt/GB
+  - safest memory fit
+- Renders a Calibr-style report with hardware strip, data-scope controls,
+  winner criteria, memory-vs-latency scatter, per-model expandable rows,
+  measured config tables and throughput/memory bars.
+- Keeps `FIT winner` actions on recommended winners, writing known-good launch
+  settings back to the active router preset.
+- Marks synthetic `llama-bench` rows explicitly so benchmark output is not
+  confused with full streaming chat telemetry.
+
+### DS4-Eval Features
 
 - Runs the test suite from `tools/server/ds4-eval-cases.json`.
 - Covers multiple subject sectors, including logic, geometry, algebra,
@@ -86,9 +140,22 @@ The upstream README continues below this fork overview.
 - Writes reports under `tools/ui/static/reports`.
 - Provides a model report panel below test logs with sector-level percentages.
 - Supports single-model summaries and race-style comparison between models from
-  the same evaluation run.
-- DS4-Bench measures prompt-processing and generation throughput using the
-  Promessi Sposi corpus when available.
+  completed evaluation runs.
+- Retains completed model results as historical benchmark data while allowing
+  interrupted or pending reports to be deleted.
+
+### Archive And Backup Features
+
+- Stores operational data in `data/llm-model-select.sqlite`; the database is
+  runtime state and is intentionally ignored by Git.
+- Provides Settings import/export for portable backups of:
+  - Fit Advisor recommendations
+  - download states
+  - FIT configurations
+  - Caliber reports and measured rows
+  - DS4-Eval reports and best results
+- Keeps completed benchmark data available for future comparison until a better
+  result replaces it or the report is explicitly removed.
 
 ### Download Manager Features
 

@@ -38,14 +38,20 @@ struct caliber_job {
     std::string status = "queued";
     std::string error;
     std::string report_id;
+    std::string current_item;
     int current = 0;
     int total = 0;
     bool finished = false;
+    bool cancel_requested = false;
     uint64_t next_seq = 1;
     std::mutex mutex;
     std::condition_variable cv;
     std::deque<caliber_event> events;
 };
+
+static bool caliber_job_status_live(const std::string & status) {
+    return status == "queued" || status == "running" || status == "stopping";
+}
 
 static std::filesystem::path reports_dir() {
     return std::filesystem::path(LLAMA_CALIBER_REPORTS_DIR);
@@ -513,12 +519,52 @@ struct server_caliber_advisor_routes::impl {
 
     explicit impl(server_models_routes & router) : router(router) {}
 
+    json snapshot_locked(const std::shared_ptr<caliber_job> & job) {
+        return {
+            {"job_id", job->id},
+            {"status", job->status},
+            {"error", job->error.empty() ? nullptr : json(job->error)},
+            {"current", job->current},
+            {"total", job->total},
+            {"current_item", job->current_item.empty() ? nullptr : json(job->current_item)},
+            {"report_id", job->report_id.empty() ? nullptr : json(job->report_id)},
+            {"finished", job->finished},
+            {"cancel_requested", job->cancel_requested},
+        };
+    }
+
+    json snapshot(const std::shared_ptr<caliber_job> & job) {
+        std::lock_guard<std::mutex> lock(job->mutex);
+        return snapshot_locked(job);
+    }
+
+    std::shared_ptr<caliber_job> find_job(const std::string & id) {
+        std::lock_guard<std::mutex> lock(jobs_mutex);
+        if (!id.empty()) {
+            auto it = jobs.find(id);
+            return it == jobs.end() ? nullptr : it->second;
+        }
+        std::shared_ptr<caliber_job> latest;
+        for (const auto & [_, job] : jobs) {
+            std::lock_guard<std::mutex> job_lock(job->mutex);
+            if (caliber_job_status_live(job->status) && !job->finished) {
+                return job;
+            }
+            latest = job;
+        }
+        return latest;
+    }
+
     void publish(const std::shared_ptr<caliber_job> & job, const std::string & event, json data) {
         std::lock_guard<std::mutex> lock(job->mutex);
         data["job_id"] = job->id;
         data["status"] = job->status;
         data["current"] = job->current;
         data["total"] = job->total;
+        data["current_item"] = job->current_item.empty() ? nullptr : json(job->current_item);
+        data["report_id"] = job->report_id.empty() ? nullptr : json(job->report_id);
+        data["finished"] = job->finished;
+        data["cancel_requested"] = job->cancel_requested;
         data["ts"] = isoish_timestamp();
         caliber_event ev;
         ev.seq = job->next_seq++;
@@ -600,6 +646,19 @@ struct server_caliber_advisor_routes::impl {
         publish(job, "queued", json::object());
         std::thread([this, job, body]() {
             try {
+                auto cancel_requested = [&job]() {
+                    std::lock_guard<std::mutex> lock(job->mutex);
+                    return job->cancel_requested;
+                };
+                if (cancel_requested()) {
+                    {
+                        std::lock_guard<std::mutex> lock(job->mutex);
+                        job->status = "cancelled";
+                        job->finished = true;
+                    }
+                    publish(job, "cancelled", {{"message", "Campaign cancelled before start"}});
+                    return;
+                }
                 {
                     std::lock_guard<std::mutex> lock(job->mutex);
                     job->status = "running";
@@ -626,13 +685,23 @@ struct server_caliber_advisor_routes::impl {
                 const std::string report_id = slugify(model_name + "-" + isoish_timestamp());
                 json rows = json::array();
                 std::vector<json> winner_rows;
+                bool cancelled = false;
                 for (const auto & item : plan) {
-                    publish(job, "bench", {{"item", json_value(item, "id", json_value(item, "label", std::string()))}});
+                    const std::string item_id = json_value(item, "id", json_value(item, "label", std::string()));
+                    {
+                        std::lock_guard<std::mutex> lock(job->mutex);
+                        if (job->cancel_requested) {
+                            cancelled = true;
+                            break;
+                        }
+                        job->current_item = item_id;
+                    }
+                    publish(job, "bench", {{"item", item_id}});
                     try {
                         json row = run_llama_bench_item(item, payload["cfg"]);
                         rows.push_back(row);
                         winner_rows.push_back(row);
-                        publish(job, "row", {{"ok", true}, {"item", json_value(item, "id", json_value(item, "label", std::string()))}, {"eval_tps", json_value(row, "eval_tps", 0.0)}});
+                        publish(job, "row", {{"ok", true}, {"item", item_id}, {"eval_tps", json_value(row, "eval_tps", 0.0)}});
                     } catch (const std::exception & e) {
                         json row = item;
                         const int requested_ctx = requested_context_for_item(item, payload["cfg"]);
@@ -645,11 +714,18 @@ struct server_caliber_advisor_routes::impl {
                         row["vram_peak_mib"] = 0;
                         rows.push_back(row);
                         winner_rows.push_back(row);
-                        publish(job, "row", {{"ok", false}, {"item", json_value(item, "id", json_value(item, "label", std::string()))}, {"error", e.what()}});
+                        publish(job, "row", {{"ok", false}, {"item", item_id}, {"error", e.what()}});
                     }
                     {
                         std::lock_guard<std::mutex> lock(job->mutex);
                         job->current += 1;
+                        job->current_item.clear();
+                        if (job->cancel_requested) {
+                            cancelled = true;
+                        }
+                    }
+                    if (cancelled) {
+                        break;
                     }
                 }
                 json winners = json::object();
@@ -661,10 +737,11 @@ struct server_caliber_advisor_routes::impl {
                 const bool has_success = std::any_of(rows.begin(), rows.end(), [](const json & row) {
                     return json_value(row, "ok", false);
                 });
+                const std::string report_status = cancelled ? "cancelled" : (has_success ? "completed" : "failed");
                 json report = {
                     {"id", report_id},
                     {"created_at", isoish_timestamp()},
-                    {"status", has_success ? "completed" : "failed"},
+                    {"status", report_status},
                     {"model", model_name},
                     {"note", "Measured with llama-bench through Caliber Advisor."},
                     {"cfg", payload["cfg"]},
@@ -685,18 +762,20 @@ struct server_caliber_advisor_routes::impl {
                     report);
                 {
                     std::lock_guard<std::mutex> lock(job->mutex);
-                    job->status = "completed";
+                    job->status = cancelled ? "cancelled" : "completed";
                     job->finished = true;
                     job->report_id = report_id;
+                    job->current_item.clear();
                 }
                 publish(job, "report", {{"report_id", report_id}, {"plan_count", payload["plan"].size()}});
-                publish(job, "done", {{"report_id", report_id}});
+                publish(job, cancelled ? "cancelled" : "done", {{"report_id", report_id}});
             } catch (const std::exception & e) {
                 {
                     std::lock_guard<std::mutex> lock(job->mutex);
                     job->status = "failed";
                     job->error = e.what();
                     job->finished = true;
+                    job->current_item.clear();
                 }
                 publish(job, "error", {{"error", e.what()}});
             }
@@ -707,31 +786,45 @@ struct server_caliber_advisor_routes::impl {
 
     server_http_res_ptr handle_sweep_status(const server_http_req & req) {
         auto res = std::make_unique<server_http_res>();
-        const std::string id = req.get_param("id");
-        std::shared_ptr<caliber_job> job;
-        {
-            std::lock_guard<std::mutex> lock(jobs_mutex);
-            if (!id.empty() && jobs.count(id)) job = jobs[id];
-            else if (!jobs.empty()) job = jobs.rbegin()->second;
-        }
+        auto job = find_job(req.get_param("id"));
         if (!job) {
             res_ok(res, {{"status", "idle"}});
             return res;
         }
-        std::lock_guard<std::mutex> lock(job->mutex);
-        res_ok(res, {{"job_id", job->id}, {"status", job->status}, {"error", job->error}, {"current", job->current}, {"total", job->total}, {"report_id", job->report_id}, {"finished", job->finished}});
+        res_ok(res, snapshot(job));
+        return res;
+    }
+
+    server_http_res_ptr handle_sweep_stop(const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        json body = req.body.empty() ? json::object() : json::parse(req.body);
+        const std::string id = json_value(body, "id", req.get_param("id"));
+        auto job = find_job(id);
+        if (!job) {
+            res_ok(res, {{"status", "idle"}});
+            return res;
+        }
+        bool requested = false;
+        {
+            std::lock_guard<std::mutex> lock(job->mutex);
+            if (!job->finished) {
+                job->cancel_requested = true;
+                if (caliber_job_status_live(job->status)) {
+                    job->status = "stopping";
+                }
+                requested = true;
+            }
+        }
+        if (requested) {
+            publish(job, "stop", {{"message", "Stop requested; the current benchmark config may finish before the campaign exits"}});
+        }
+        res_ok(res, snapshot(job));
         return res;
     }
 
     server_http_res_ptr handle_sweep_events(const server_http_req & req) {
         auto res = std::make_unique<server_http_res>();
-        const std::string id = req.get_param("id");
-        std::shared_ptr<caliber_job> job;
-        {
-            std::lock_guard<std::mutex> lock(jobs_mutex);
-            if (!id.empty() && jobs.count(id)) job = jobs[id];
-            else if (!jobs.empty()) job = jobs.rbegin()->second;
-        }
+        auto job = find_job(req.get_param("id"));
         if (!job) {
             res->content_type = "text/event-stream";
             res->data = "event: idle\ndata: {\"status\":\"idle\"}\n\n";
@@ -904,6 +997,7 @@ void server_caliber_advisor_routes::init_routes() {
     get_models = [p = pimpl](const server_http_req & req) { return p->handle_models(req); };
     post_plan = [p = pimpl](const server_http_req & req) { return p->handle_plan(req); };
     post_sweep = [p = pimpl](const server_http_req & req) { return p->handle_sweep(req); };
+    post_sweep_stop = [p = pimpl](const server_http_req & req) { return p->handle_sweep_stop(req); };
     get_sweep_events = [p = pimpl](const server_http_req & req) { return p->handle_sweep_events(req); };
     get_sweep_status = [p = pimpl](const server_http_req & req) { return p->handle_sweep_status(req); };
     get_results = [p = pimpl](const server_http_req & req) { return p->handle_results(req); };
