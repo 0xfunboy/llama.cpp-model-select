@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onDestroy, onMount } from 'svelte';
+	import { SvelteMap } from 'svelte/reactivity';
 	import {
 		Activity,
 		CheckCircle2,
@@ -11,6 +12,7 @@
 		Info,
 		Play,
 		RefreshCw,
+		Route,
 		Search,
 		Settings2,
 		Square,
@@ -31,7 +33,15 @@
 		type FitAdvisorSystem
 	} from '$lib/services/fit-advisor.service';
 
-	type TabId = 'start' | 'candidates' | 'reports' | 'diagnostics';
+	type TabId =
+		| 'home'
+		| 'library'
+		| 'test-lab'
+		| 'recommendations'
+		| 'router'
+		| 'history'
+		| 'doctor';
+	type UseCaseId = 'general' | 'chat' | 'coding' | 'reasoning' | 'rag' | 'tools' | 'long-context';
 	type ProfileId = 'overall' | 'speed' | 'efficiency' | 'safety';
 	type RunScope = 'quick' | 'standard' | 'deep';
 	type ReportScope = 'latest' | 'all';
@@ -48,10 +58,30 @@
 		{ label: '262k', value: 262144, hint: 'Only when the model really supports it' }
 	];
 	const tabs: { id: TabId; label: string }[] = [
-		{ id: 'start', label: 'Start here' },
-		{ id: 'candidates', label: 'Choose models' },
-		{ id: 'reports', label: 'Reports' },
-		{ id: 'diagnostics', label: 'Diagnostics' }
+		{ id: 'home', label: 'Home' },
+		{ id: 'library', label: 'Library' },
+		{ id: 'test-lab', label: 'Test Lab' },
+		{ id: 'recommendations', label: 'Recommendations' },
+		{ id: 'router', label: 'Router' },
+		{ id: 'history', label: 'History' },
+		{ id: 'doctor', label: 'Doctor' }
+	];
+	const useCases: { id: UseCaseId; label: string; help: string }[] = [
+		{
+			id: 'general',
+			label: 'Everyday assistant',
+			help: 'Writing, questions and mixed daily work.'
+		},
+		{ id: 'chat', label: 'Fast chat', help: 'Responsive conversation and instruction following.' },
+		{ id: 'coding', label: 'Coding', help: 'Repository work, debugging and code generation.' },
+		{ id: 'reasoning', label: 'Deep reasoning', help: 'Math, science and difficult decisions.' },
+		{ id: 'rag', label: 'Documents / RAG', help: 'Grounded answers over your own documents.' },
+		{ id: 'tools', label: 'Agents & tools', help: 'Reliable structured output and tool calls.' },
+		{
+			id: 'long-context',
+			label: 'Long context',
+			help: 'Large files, long chats and needle retrieval.'
+		}
 	];
 	const profileLabels: Record<ProfileId, { title: string; help: string }> = {
 		overall: {
@@ -71,7 +101,10 @@
 			help: 'Prefers configs that avoid memory pressure and risky spill.'
 		}
 	};
-	const scopeOptions: Record<RunScope, { title: string; help: string; workload: 'baseline' | 'all' }> = {
+	const scopeOptions: Record<
+		RunScope,
+		{ title: string; help: string; workload: 'baseline' | 'all' }
+	> = {
 		quick: {
 			title: 'Quick comparison',
 			help: 'Benchmarks normal generation only. Use this first to get a useful answer quickly.',
@@ -91,7 +124,10 @@
 	const workflow = [
 		['Setup', 'Check hardware, llama.cpp, model folders and report storage.'],
 		['Acquire', 'Use installed GGUF files or download catalog candidates one at a time.'],
-		['Plan', 'Expand safe configs: vanilla control, context, KV cache, GPU split and MoE/offload candidates.'],
+		[
+			'Plan',
+			'Expand safe configs: vanilla control, context, KV cache, GPU split and MoE/offload candidates.'
+		],
 		['Benchmark', 'Run measured configs server-side, even if this browser tab is closed.'],
 		['Decide', 'Rank winners, explain tradeoffs, save launch/FIT settings.']
 	];
@@ -102,11 +138,33 @@
 		{ id: 'balanced', label: 'Balanced' }
 	];
 	const reportMetrics: ReportMetric[] = ['eval', 'prompt', 'memory', 'latency', 'vram'];
+	const technicalColumns = [
+		'model',
+		'variant',
+		'row_role',
+		'workload_kind',
+		'benchmark_backend',
+		'evidence_level',
+		'quality_evidence_level',
+		'ctx_size',
+		'prompt_tps',
+		'eval_tps',
+		'e2e_ttft_ms',
+		'itl_p95_ms',
+		'vram_peak_mib',
+		'process_working_set_peak_mib',
+		'gpu_power_peak_w',
+		'measurement_confidence',
+		'fit_eligible'
+	];
 
-	let activeTab = $state<TabId>('start');
+	let activeTab = $state<TabId>('home');
 	let profile = $state<ProfileId>('overall');
+	let useCase = $state<UseCaseId>('general');
+	let installedOnly = $state(true);
+	let allowedTestMinutes = $state(20);
 	let runScope = $state<RunScope>('quick');
-	let contextSize = $state(131072);
+	let contextSize = $state(32768);
 	let models = $state<CaliberModel[]>([]);
 	let selectedLocalIds = $state<string[]>([]);
 	let plan = $state<CaliberPlanItem[]>([]);
@@ -138,29 +196,56 @@
 	let sweepAbort: AbortController | null = null;
 	let sweepFinalizedFor = '';
 
-	const resultRows = $derived(asRows(results?.rows).filter((row) => rowNum(row, ['eval_tps', 'tps']) > 0));
+	const resultRows = $derived(
+		asRows(results?.rows).filter((row) => rowNum(row, ['eval_tps', 'tps']) > 0)
+	);
 	const reportRows = $derived(asRows(selectedReport?.rows));
 	const reportPlan = $derived(asRows(selectedReport?.plan));
 	const analyticsRows = $derived(selectedReport ? reportRows : resultRows);
-	const scopedAnalyticsRows = $derived(selectedReport ? analyticsRows : filterReportScope(analyticsRows, reportScope));
-	const okAnalyticsRows = $derived(scopedAnalyticsRows.filter((row) => rowText(row, ['ok']) !== 'false' && rowNum(row, ['eval_tps', 'tps']) > 0));
-	const recommendationSource = $derived(selectedReport ?? recommendationScope(results, reportScope));
+	const scopedAnalyticsRows = $derived(
+		selectedReport ? analyticsRows : filterReportScope(analyticsRows, reportScope)
+	);
+	const okAnalyticsRows = $derived(
+		scopedAnalyticsRows.filter(
+			(row) => rowText(row, ['ok']) !== 'false' && rowNum(row, ['eval_tps', 'tps']) > 0
+		)
+	);
+	const recommendationSource = $derived(
+		selectedReport ?? recommendationScope(results, reportScope)
+	);
 	const activeDecision = $derived(profileDecision(recommendationSource, profile));
 	const reportGroups = $derived(buildReportGroups(scopedAnalyticsRows, activeDecision));
-	const reportLeaderboard = $derived(rankRowsByMetric(reportGroups.map((group) => group.winner).filter(Boolean) as CaliberRow[]));
-	const reportMetricMax = $derived(Math.max(1, ...reportLeaderboard.map((row) => reportMetricValue(row, reportMetric))));
+	const reportLeaderboard = $derived(
+		rankRowsByMetric(reportGroups.map((group) => group.winner).filter(Boolean) as CaliberRow[])
+	);
+	const reportMetricMax = $derived(
+		Math.max(1, ...reportLeaderboard.map((row) => reportMetricValue(row, reportMetric)))
+	);
 	const reportScatterRows = $derived(okAnalyticsRows.filter((row) => reportTimeSec(row) > 0));
+	const loadCurveRows = $derived(
+		scopedAnalyticsRows.filter((row) =>
+			['prefill', 'kv-fill'].includes(rowText(row, ['workload_kind']))
+		)
+	);
 	const reportMaxTime = $derived(Math.max(1, ...reportScatterRows.map(reportTimeSec)));
-	const reportMaxMemory = $derived(Math.max(1, ...reportScatterRows.map((row) => reportMemoryMib(row))));
-	const syntheticRows = $derived(scopedAnalyticsRows.filter((row) => rowText(row, ['benchmark_backend']) === 'llama-bench').length);
+	const reportMaxMemory = $derived(
+		Math.max(1, ...reportScatterRows.map((row) => reportMemoryMib(row)))
+	);
+	const syntheticRows = $derived(
+		scopedAnalyticsRows.filter((row) => rowText(row, ['benchmark_backend']) === 'llama-bench')
+			.length
+	);
 	const bestWinner = $derived((asRecord(activeDecision?.winner) as CaliberRow | null) ?? null);
-	const completedReports = $derived(reports.filter((report) => report.rows > 0 && isCompleteStatus(report.status)));
-	const pendingReports = $derived(reports.filter((report) => canDeleteReport(report)));
-	const failedReports = $derived(reports.filter((report) => report.status === 'failed'));
+	const bestAlternatives = $derived(asRows(activeDecision?.alternatives).slice(0, 3));
+	const bestTimeline = $derived(timelineSamples(bestWinner));
+	const completedReports = $derived(
+		reports.filter((report) => report.rows > 0 && isCompleteStatus(report.status))
+	);
 	const hasPendingDownload = $derived(downloads.some((job) => isActiveDownloadStatus(job.status)));
-	const selectedModels = $derived(models.filter((model) => selectedLocalIds.includes(model.id)));
 	const pendingSelectedIds = $derived(selectedLocalIds.filter((id) => !hasHistoricModelResult(id)));
-	const selectableModels = $derived(models.filter((model) => model.loadable !== false && Boolean(model.path)));
+	const selectableModels = $derived(
+		models.filter((model) => model.loadable !== false && Boolean(model.path))
+	);
 	const planModels = $derived(uniqueStrings(plan.map((item) => item.model)).length);
 	const targetContext = $derived(contextOptions.find((item) => item.value === contextSize));
 	const readyToRun = $derived(pendingSelectedIds.length > 0 && !running);
@@ -180,7 +265,9 @@
 	});
 
 	function asRows(value: unknown): CaliberRow[] {
-		return Array.isArray(value) ? (value.filter((row) => row && typeof row === 'object') as CaliberRow[]) : [];
+		return Array.isArray(value)
+			? (value.filter((row) => row && typeof row === 'object') as CaliberRow[])
+			: [];
 	}
 
 	function asRecord(value: unknown): Record<string, unknown> | null {
@@ -189,13 +276,19 @@
 			: null;
 	}
 
-	function recommendationScope(source: Record<string, unknown> | null, scope: ReportScope): Record<string, unknown> | null {
+	function recommendationScope(
+		source: Record<string, unknown> | null,
+		scope: ReportScope
+	): Record<string, unknown> | null {
 		if (!source || scope === 'all') return source;
 		const scopes = asRecord(source.scopes);
 		return asRecord(scopes?.latest_campaign) ?? source;
 	}
 
-	function profileDecision(source: Record<string, unknown> | null, selectedProfile: ProfileId): RecommendationDecision | null {
+	function profileDecision(
+		source: Record<string, unknown> | null,
+		selectedProfile: ProfileId
+	): RecommendationDecision | null {
 		const recommendations = asRecord(source?.recommendations);
 		return asRecord(recommendations?.[selectedProfile]);
 	}
@@ -230,7 +323,81 @@
 	}
 
 	function canFitCaliberRow(row: CaliberRow): boolean {
-		return rowBool(row, 'fit_eligible', false) && rowText(row, ['ok']) !== 'false';
+		return (
+			rowBool(row, 'fit_eligible', false) &&
+			rowText(row, ['ok']) !== 'false' &&
+			(!rowBool(row, 'quality_gate_required', false) || rowBool(row, 'quality_gate_passed', false))
+		);
+	}
+
+	function timelineSamples(row: CaliberRow | null): number[][] {
+		const timeline = asRecord(row?.timeline);
+		if (!timeline || timeline.encoding !== 'delta-columns-v1' || !Array.isArray(timeline.rows))
+			return [];
+		let elapsed = 0;
+		return (timeline.rows as unknown[]).filter(Array.isArray).map((raw) => {
+			const values = raw as unknown[];
+			elapsed += Number(values[0] ?? 0);
+			return [elapsed, Number(values[1] ?? 0), Number(values[4] ?? 0), Number(values[5] ?? 0)];
+		});
+	}
+
+	function timelineX(sample: number[]): number {
+		const max = Math.max(1, bestTimeline.at(-1)?.[0] ?? 1);
+		return 44 + (sample[0] / max) * 676;
+	}
+
+	function timelineY(sample: number[], index: number): number {
+		const max = Math.max(1, ...bestTimeline.map((item) => item[index]));
+		return 250 - (sample[index] / max) * 190;
+	}
+
+	function qualityScore(row: CaliberRow | null): number {
+		const evidence = asRecord(row?.quality_evidence);
+		return Number(evidence?.score ?? 0);
+	}
+
+	function radarPoints(row: CaliberRow): string {
+		const maxima = {
+			eval: Math.max(1, ...okAnalyticsRows.map((item) => rowNum(item, ['eval_tps', 'tps']))),
+			prompt: Math.max(1, ...okAnalyticsRows.map((item) => rowNum(item, ['prompt_tps']))),
+			ctx: Math.max(1, ...okAnalyticsRows.map((item) => rowNum(item, ['ctx_size']))),
+			memory: Math.max(1, ...okAnalyticsRows.map(reportMemoryMib))
+		};
+		const values = [
+			rowNum(row, ['eval_tps', 'tps']) / maxima.eval,
+			rowNum(row, ['prompt_tps']) / maxima.prompt,
+			rowNum(row, ['ctx_size']) / maxima.ctx,
+			1 - Math.min(1, reportMemoryMib(row) / maxima.memory),
+			qualityScore(row)
+		];
+		return values
+			.map((value, index) => {
+				const angle = -Math.PI / 2 + index * ((Math.PI * 2) / 5);
+				const radius = 78 * Math.max(0.08, Math.min(1, value));
+				return `${110 + Math.cos(angle) * radius},${105 + Math.sin(angle) * radius}`;
+			})
+			.join(' ');
+	}
+
+	function matchedVanilla(row: CaliberRow): CaliberRow | null {
+		return (
+			scopedAnalyticsRows.find(
+				(item) =>
+					rowText(item, ['model']) === rowText(row, ['model']) &&
+					rowText(item, ['control_kind']) === 'vanilla' &&
+					rowNum(item, ['ctx_size']) === rowNum(row, ['ctx_size'])
+			) ?? null
+		);
+	}
+
+	function loadTarget(row: CaliberRow): number {
+		return rowNum(row, ['prefill_target_tokens', 'kv_fill_target_tokens', 'prompt_n']);
+	}
+
+	function loadCurveWidth(row: CaliberRow): number {
+		const max = Math.max(1, ...loadCurveRows.map(loadTarget));
+		return Math.max(2, Math.min(100, (loadTarget(row) / max) * 100));
 	}
 
 	function reportSessionKey(row: CaliberRow): string {
@@ -246,7 +413,10 @@
 	function isReportCandidate(row: CaliberRow): boolean {
 		const role = rowText(row, ['row_role']);
 		const workload = rowText(row, ['workload_kind'], 'baseline');
-		return (role === 'candidate' || (!role && workload === 'baseline')) && rowText(row, ['ok']) !== 'false';
+		return (
+			(role === 'candidate' || (!role && workload === 'baseline')) &&
+			rowText(row, ['ok']) !== 'false'
+		);
 	}
 
 	function reportMemoryMib(row: CaliberRow): number {
@@ -301,8 +471,11 @@
 		});
 	}
 
-	function buildReportGroups(rows: CaliberRow[], decision: RecommendationDecision | null): ReportModelGroup[] {
-		const map = new Map<string, CaliberRow[]>();
+	function buildReportGroups(
+		rows: CaliberRow[],
+		decision: RecommendationDecision | null
+	): ReportModelGroup[] {
+		const map = new SvelteMap<string, CaliberRow[]>();
 		for (const row of rows) {
 			const model = rowText(row, ['model', 'model_id'], 'unknown model');
 			map.set(model, [...(map.get(model) ?? []), row]);
@@ -341,7 +514,9 @@
 
 	function reportFitClass(row: CaliberRow): string {
 		const memory = reportMemoryMib(row);
-		const vram = fitSystem ? fitSystem.total_gpu_vram_gb * 1024 : rowNum(row, ['vram_budget_mib', 'gpu_vram_mib'], 0);
+		const vram = fitSystem
+			? fitSystem.total_gpu_vram_gb * 1024
+			: rowNum(row, ['vram_budget_mib', 'gpu_vram_mib'], 0);
 		if (vram > 0 && memory > vram * 1.12) return 'ultra';
 		if (vram > 0 && memory > vram * 0.85) return 'high';
 		const params = rowNum(row, ['params_b', 'model_params_b']);
@@ -375,7 +550,12 @@
 				.filter(Boolean)
 				.map((value) => normalizeIdentity(String(value)));
 			return identities.some((identity) =>
-				rowIdentities.some((rowIdentity) => rowIdentity === identity || rowIdentity.includes(identity) || identity.includes(rowIdentity))
+				rowIdentities.some(
+					(rowIdentity) =>
+						rowIdentity === identity ||
+						rowIdentity.includes(identity) ||
+						identity.includes(rowIdentity)
+				)
 			);
 		});
 	}
@@ -444,7 +624,21 @@
 	}
 
 	function selectRecommendedLocal() {
-		selectedLocalIds = selectableModels.slice(0, 4).map((model) => model.id);
+		const memoryBudget = Math.max(
+			1,
+			((fitSystem?.total_gpu_vram_gb ?? 0) + (fitSystem?.available_ram_gb ?? 0) * 0.7) * 1024
+		);
+		selectedLocalIds = [...selectableModels]
+			.filter(
+				(model) => rowNum((model.plan_meta ?? {}) as CaliberRow, ['size_mib'], 0) <= memoryBudget
+			)
+			.sort(
+				(a, b) =>
+					rowNum((b.plan_meta ?? {}) as CaliberRow, ['size_mib']) -
+					rowNum((a.plan_meta ?? {}) as CaliberRow, ['size_mib'])
+			)
+			.slice(0, allowedTestMinutes <= 10 ? 2 : allowedTestMinutes <= 30 ? 4 : 8)
+			.map((model) => model.id);
 		plan = [];
 	}
 
@@ -459,12 +653,18 @@
 	}
 
 	function nextActionText(): string {
-		if (status?.cancel_requested) return 'Stop requested. Caliber will exit after the current benchmark config returns.';
-		if (running) return 'Benchmark is running on the server. You can close this page and come back to Reports.';
-		if (selectedLocalIds.length === 0) return 'Choose at least one installed model, or download/configure a catalog model first.';
-		if (pendingSelectedIds.length === 0) return 'All selected models already have completed historical measurements. Open Reports to compare them without rerunning.';
-		if (plan.length === 0) return 'Review the benchmark plan so you know how many configs will run.';
-		if (completedReports.length === 0) return 'Start the benchmark. The report will appear automatically when it finishes.';
+		if (status?.cancel_requested)
+			return 'Stop requested. Caliber will exit after the current benchmark config returns.';
+		if (running)
+			return 'Benchmark is running on the server. You can close this page and come back to Reports.';
+		if (selectedLocalIds.length === 0)
+			return 'Choose at least one installed model, or download/configure a catalog model first.';
+		if (pendingSelectedIds.length === 0)
+			return 'All selected models already have completed historical measurements. Open Reports to compare them without rerunning.';
+		if (plan.length === 0)
+			return 'Review the benchmark plan so you know how many configs will run.';
+		if (completedReports.length === 0)
+			return 'Start the benchmark. The report will appear automatically when it finishes.';
 		return 'Open Reports to compare historical winners and choose the model/config to FIT.';
 	}
 
@@ -473,21 +673,35 @@
 			models: pendingSelectedIds,
 			opts: { workloadSweep: scopeOptions[runScope].workload },
 			cfg: {
-				hardware: fitSystem ? {
-					backend: fitSystem.backend,
-					unified_memory: fitSystem.unified_memory ?? false,
-					vram_budget_mib: Math.round(fitSystem.total_gpu_vram_gb * 1024),
-					vram_driver_usable_mib: Math.round(fitSystem.total_gpu_vram_gb * 1024),
-					system_ram_available_mib: Math.round(fitSystem.available_ram_gb * 1024),
-					cpu_threads_logical: fitSystem.cpu_cores,
-					cpu_cores_physical: Math.max(1, Math.floor(fitSystem.cpu_cores / 2)),
-					gpus: fitSystem.gpus.map((gpu) => ({
-						name: gpu.name,
-						backend: gpu.backend,
-						vram_total_mib: Math.round(gpu.vram_gb * 1024),
-						vram_driver_usable_mib: Math.round(gpu.vram_gb * 1024)
-					}))
-				} : {},
+				quality: {
+					required: true,
+					pack: useCase === 'long-context' ? 'long-context' : useCase,
+					min_score: 0.5,
+					min_samples: 1
+				},
+				product_intent: {
+					use_case: useCase,
+					installed_only: installedOnly,
+					allowed_test_minutes: allowedTestMinutes,
+					objective: profile
+				},
+				hardware: fitSystem
+					? {
+							backend: fitSystem.backend,
+							unified_memory: fitSystem.unified_memory ?? false,
+							vram_budget_mib: Math.round(fitSystem.total_gpu_vram_gb * 1024),
+							vram_driver_usable_mib: Math.round(fitSystem.total_gpu_vram_gb * 1024),
+							system_ram_available_mib: Math.round(fitSystem.available_ram_gb * 1024),
+							cpu_threads_logical: fitSystem.cpu_cores,
+							cpu_cores_physical: Math.max(1, Math.floor(fitSystem.cpu_cores / 2)),
+							gpus: fitSystem.gpus.map((gpu) => ({
+								name: gpu.name,
+								backend: gpu.backend,
+								vram_total_mib: Math.round(gpu.vram_gb * 1024),
+								vram_driver_usable_mib: Math.round(gpu.vram_gb * 1024)
+							}))
+						}
+					: {},
 				context_candidates: [{ ctx: contextSize, kv: 'q8_0' }],
 				max_context_cap: contextSize
 			}
@@ -500,7 +714,9 @@
 
 	function sweepIsLive(snapshot: CaliberSweepStatus | null): boolean {
 		const state = (snapshot?.status ?? '').toLowerCase();
-		return Boolean(snapshot?.job_id && !snapshot.finished && ['queued', 'running', 'stopping'].includes(state));
+		return Boolean(
+			snapshot?.job_id && !snapshot.finished && ['queued', 'running', 'stopping'].includes(state)
+		);
 	}
 
 	function delay(ms: number, signal: AbortSignal): Promise<void> {
@@ -535,7 +751,8 @@
 			},
 			signal
 		).catch((e) => {
-			if (!(e instanceof DOMException && e.name === 'AbortError')) pushEvent(e instanceof Error ? e.message : String(e));
+			if (!(e instanceof DOMException && e.name === 'AbortError'))
+				pushEvent(e instanceof Error ? e.message : String(e));
 		});
 		void monitorSweep(jobId, signal);
 	}
@@ -567,7 +784,7 @@
 		if (snapshot.report_id) {
 			const summary = reports.find((report) => report.id === snapshot.report_id);
 			if (summary) await openReport(summary, false);
-			activeTab = 'reports';
+			activeTab = 'recommendations';
 		}
 	}
 
@@ -581,7 +798,7 @@
 			status = snapshot;
 			running = sweepIsLive(snapshot);
 			if (running && snapshot.job_id) {
-				activeTab = 'start';
+				activeTab = 'test-lab';
 				eventLog = [];
 				pushEvent(`Restored campaign ${snapshot.job_id}`);
 				attachSweep(snapshot.job_id);
@@ -603,7 +820,6 @@
 			models = modelsResult.data;
 			reports = reportsResult.data.sort((a, b) => b.created_at.localeCompare(a.created_at));
 			results = resultsResult;
-			if (selectedLocalIds.length === 0) selectedLocalIds = models.slice(0, 3).map((model) => model.id);
 			message = `${completedReports.length} completed benchmark reports, ${resultRows.length} measured rows`;
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
@@ -615,7 +831,7 @@
 	async function previewPlan() {
 		if (pendingSelectedIds.length === 0) {
 			message = 'No benchmark needed: selected models are already in the historical archive.';
-			activeTab = 'reports';
+			activeTab = 'recommendations';
 			return;
 		}
 		loading = true;
@@ -624,7 +840,7 @@
 			const result = await CaliberAdvisorService.plan(payload());
 			plan = result.plan;
 			message = `${result.plan_count} configs planned across ${pendingSelectedIds.length} new model(s); ${selectedLocalIds.length - pendingSelectedIds.length} already archived.`;
-			activeTab = 'start';
+			activeTab = 'test-lab';
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
 		} finally {
@@ -673,7 +889,10 @@
 		if (event === 'cancelled') return 'Campaign cancelled';
 		if (event === 'preflight') return String(data.message ?? 'Preparing benchmark');
 		if (event === 'bench') return `Testing ${String(data.item ?? 'configuration')}`;
-		if (event === 'row') return data.ok ? `Measured ${fmtNumber(Number(data.eval_tps ?? 0), 1)} tok/s` : `Failed: ${String(data.error ?? 'configuration failed')}`;
+		if (event === 'row')
+			return data.ok
+				? `Measured ${fmtNumber(Number(data.eval_tps ?? 0), 1)} tok/s`
+				: `Failed: ${String(data.error ?? 'configuration failed')}`;
 		if (event === 'report') return `Saved report ${String(data.report_id ?? '')}`;
 		if (event === 'done') return 'Campaign finished';
 		if (event === 'error') return `Error: ${String(data.error ?? 'unknown')}`;
@@ -687,7 +906,7 @@
 		try {
 			if (refresh) await FitAdvisorService.refreshCatalog();
 			const result = await FitAdvisorService.models({
-				use_case: 'coding',
+				use_case: useCase,
 				min_fit: catalogMinFit,
 				quant: '',
 				search: catalogSearch,
@@ -698,9 +917,10 @@
 			});
 			fitSystem = result.system;
 			catalogModels = result.models;
-			catalogMessage = result.returned_models > 0
-				? `${result.returned_models} downloadable candidates ranked for this machine`
-				: 'No candidates matched these filters. Try a broader search or lower the minimum fit.';
+			catalogMessage =
+				result.returned_models > 0
+					? `${result.returned_models} downloadable candidates ranked for this machine`
+					: 'No candidates matched these filters. Try a broader search or lower the minimum fit.';
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
 		} finally {
@@ -733,10 +953,14 @@
 
 	function upsertDownload(job: FitAdvisorDownloadJob) {
 		const index = downloads.findIndex((item) => item.id === job.id);
-		downloads = index === -1 ? [job, ...downloads] : downloads.map((item, i) => (i === index ? job : item));
+		downloads =
+			index === -1 ? [job, ...downloads] : downloads.map((item, i) => (i === index ? job : item));
 	}
 
-	function sameNonEmpty(left: string | null | undefined, right: string | null | undefined): boolean {
+	function sameNonEmpty(
+		left: string | null | undefined,
+		right: string | null | undefined
+	): boolean {
 		return Boolean(left && right && left === right);
 	}
 
@@ -748,7 +972,9 @@
 					sameNonEmpty(job.hf_ref, model.download?.hf_ref) ||
 					sameNonEmpty(job.target_dir, model.download?.target_dir ?? model.target_dir) ||
 					sameNonEmpty(job.local_path, model.local_path)
-			) ?? model.download_progress ?? null
+			) ??
+			model.download_progress ??
+			null
 		);
 	}
 
@@ -757,13 +983,20 @@
 	}
 
 	function downloadStatus(model: FitAdvisorModel): string {
-		return downloadFor(model)?.status ?? model.download_status ?? (model.installed ? 'configured' : 'available');
+		return (
+			downloadFor(model)?.status ??
+			model.download_status ??
+			(model.installed ? 'configured' : 'available')
+		);
 	}
 
 	function downloadActionLabel(model: FitAdvisorModel): string {
 		const job = downloadFor(model);
 		if (job && isActiveDownloadStatus(job.status)) {
-			const progress = typeof job.percent === 'number' && Number.isFinite(job.percent) ? ` ${Math.round(job.percent)}%` : '';
+			const progress =
+				typeof job.percent === 'number' && Number.isFinite(job.percent)
+					? ` ${Math.round(job.percent)}%`
+					: '';
 			if (job.status === 'queued') return 'Queued';
 			if (job.status === 'resolving') return 'Resolving';
 			return `Downloading${progress}`;
@@ -776,17 +1009,20 @@
 		return 'Download';
 	}
 
-	function isDownloading(model: FitAdvisorModel): boolean {
-		return isActiveDownloadStatus(downloadStatus(model));
-	}
-
 	function canStartDownload(model: FitAdvisorModel): boolean {
 		if (!model.download) return false;
-		return !['queued', 'resolving', 'downloading', 'downloaded', 'configured'].includes(downloadStatus(model));
+		return !['queued', 'resolving', 'downloading', 'downloaded', 'configured'].includes(
+			downloadStatus(model)
+		);
 	}
 
 	function canConfigureFit(model: FitAdvisorModel): boolean {
-		return Boolean(model.installed || model.downloaded || model.configured || downloadStatus(model) === 'downloaded');
+		return Boolean(
+			model.installed ||
+			model.downloaded ||
+			model.configured ||
+			downloadStatus(model) === 'downloaded'
+		);
 	}
 
 	async function downloadModel(model: FitAdvisorModel) {
@@ -794,7 +1030,9 @@
 		try {
 			const result = await FitAdvisorService.download(model);
 			if (result.job) upsertDownload(result.job);
-			catalogMessage = result.already_present ? 'Model already present' : `Download queued: ${model.name}`;
+			catalogMessage = result.already_present
+				? 'Model already present'
+				: `Download queued: ${model.name}`;
 			await refreshDownloads();
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
@@ -810,8 +1048,9 @@
 			catalogMessage = `${result.model} added to local models${result.loaded ? ' and loaded' : ''}`;
 			await loadCatalog();
 			await refreshAll();
-			if (!selectedLocalIds.includes(result.model)) selectedLocalIds = [...selectedLocalIds, result.model];
-			activeTab = 'start';
+			if (!selectedLocalIds.includes(result.model))
+				selectedLocalIds = [...selectedLocalIds, result.model];
+			activeTab = 'test-lab';
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
 		}
@@ -822,7 +1061,7 @@
 		try {
 			selectedReport = await CaliberAdvisorService.report(report.id);
 			selectedReportId = report.id;
-			if (switchTab) activeTab = 'reports';
+			if (switchTab) activeTab = 'history';
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
 		}
@@ -845,7 +1084,8 @@
 
 	async function configureCaliberRow(row: CaliberRow) {
 		if (!canFitCaliberRow(row)) {
-			error = 'This row is synthetic or lacks complete context/memory evidence. Run a decision-grade streaming benchmark before FIT.';
+			error =
+				'This row is synthetic or lacks complete context/memory evidence. Run a decision-grade streaming benchmark before FIT.';
 			return;
 		}
 		const model = rowText(row, ['model', 'model_id']);
@@ -878,7 +1118,7 @@
 </script>
 
 <svelte:head>
-	<title>Caliber Advisor</title>
+	<title>Local LLM Autopilot</title>
 </svelte:head>
 
 <main class="caliber-page">
@@ -886,20 +1126,20 @@
 		<div>
 			<div class="header-kicker">
 				<Gauge size={16} />
-				calibr logic, native llama.cpp router
+				private, offline-first, evidence-based
 			</div>
-			<h1>Caliber Advisor</h1>
+			<h1>Local LLM Autopilot</h1>
 			<p>
-				Benchmark local GGUF configurations, compare speed and memory tradeoffs, then FIT the
-				winning launch settings into the router.
+				Point it at your model folders. Autopilot discovers what is healthy, proves what fits,
+				measures real responses, checks task quality and applies the best local model safely.
 			</p>
 		</div>
 		<div class="hero-actions">
-			<button type="button" onclick={() => (activeTab = 'start')} class="primary">
-				Start guided run
+			<button type="button" onclick={() => (activeTab = 'home')} class="primary">
+				Find my model
 				<ChevronRight size={16} />
 			</button>
-			<button type="button" onclick={() => (activeTab = 'reports')}>
+			<button type="button" onclick={() => (activeTab = 'recommendations')}>
 				<FileJson size={16} />
 				View reports
 			</button>
@@ -909,49 +1149,102 @@
 	{#if error}
 		<div class="error">{error}</div>
 	{/if}
+	{#if message && !error}
+		<div class="status-message">{message}</div>
+	{/if}
 
 	<section class="answer-strip">
 		<div>
 			<span>Best answer</span>
 			<strong>{bestWinner ? rowText(bestWinner, ['model'], '-') : 'No winner yet'}</strong>
-			<p>{bestWinner ? rowText(bestWinner, ['selection_reason'], `${fmtNumber(rowNum(bestWinner, ['eval_tps', 'tps']), 1)} tok/s at ${rowNum(bestWinner, ['ctx_size'], contextSize)} ctx`) : 'Run a campaign to populate this.'}</p>
+			<p>
+				{bestWinner
+					? rowText(
+							bestWinner,
+							['selection_reason'],
+							`${fmtNumber(rowNum(bestWinner, ['eval_tps', 'tps']), 1)} tok/s at ${rowNum(bestWinner, ['ctx_size'], contextSize)} ctx`
+						)
+					: 'Run a campaign to populate this.'}
+			</p>
 		</div>
 		<div>
 			<span>Hardware</span>
 			<strong>{fitSystem?.gpu_name ?? 'Detecting GPU'}</strong>
-			<p>{fitSystem ? `${fitSystem.gpu_count} GPU(s), ${fmtGb(fitSystem.total_gpu_vram_gb)} aggregate VRAM` : 'Fit Advisor system scan pending.'}</p>
+			<p>
+				{fitSystem
+					? `${fitSystem.gpu_count} GPU(s), ${fmtGb(fitSystem.total_gpu_vram_gb)} aggregate VRAM`
+					: 'Fit Advisor system scan pending.'}
+			</p>
 		</div>
 		<div>
 			<span>Next step</span>
-			<strong>{running ? 'Running' : selectedLocalIds.length ? 'Review and run' : 'Choose models'}</strong>
+			<strong
+				>{running
+					? 'Running'
+					: selectedLocalIds.length
+						? 'Review and run'
+						: 'Choose models'}</strong
+			>
 			<p>{nextAction}</p>
 		</div>
 	</section>
 
-	<nav class="tabs" aria-label="Caliber Advisor sections">
-		{#each tabs as tab}
-			<button type="button" class:active={activeTab === tab.id} onclick={() => (activeTab = tab.id)}>
-				{#if tab.id === 'start'}<Gauge size={16} />{/if}
-				{#if tab.id === 'candidates'}<Download size={16} />{/if}
-				{#if tab.id === 'reports'}<FileJson size={16} />{/if}
-				{#if tab.id === 'diagnostics'}<Wrench size={16} />{/if}
+	<nav class="tabs" aria-label="Local LLM Autopilot sections">
+		{#each tabs as tab (tab.id)}
+			<button
+				type="button"
+				class:active={activeTab === tab.id}
+				onclick={() => (activeTab = tab.id)}
+			>
+				{#if tab.id === 'home' || tab.id === 'test-lab'}<Gauge size={16} />{/if}
+				{#if tab.id === 'library'}<Download size={16} />{/if}
+				{#if tab.id === 'recommendations' || tab.id === 'history'}<FileJson size={16} />{/if}
+				{#if tab.id === 'router'}<Route size={16} />{/if}
+				{#if tab.id === 'doctor'}<Wrench size={16} />{/if}
 				{tab.label}
 			</button>
 		{/each}
 	</nav>
 
-	{#if activeTab === 'start'}
+	{#if activeTab === 'home' || activeTab === 'test-lab'}
 		<section class="wizard-grid">
 			<div class="panel">
 				<div class="panel-head">
 					<div>
-						<h2>1. Choose the question</h2>
-						<p>Caliber will rank models differently depending on what you care about.</p>
+						<h2>1. What will you use it for?</h2>
+						<p>The quality pack and eligible model features follow this choice.</p>
 					</div>
 				</div>
 				<div class="choice-grid">
-					{#each Object.entries(profileLabels) as [id, item]}
-						<button type="button" class="choice" class:active={profile === id} onclick={() => (profile = id as ProfileId)}>
+					{#each useCases as item (item.id)}
+						<button
+							type="button"
+							class="choice compact-choice"
+							class:active={useCase === item.id}
+							onclick={() => (useCase = item.id)}
+						>
+							<strong>{item.label}</strong>
+							<span>{item.help}</span>
+						</button>
+					{/each}
+				</div>
+			</div>
+
+			<div class="panel">
+				<div class="panel-head">
+					<div>
+						<h2>2. What matters most?</h2>
+						<p>The backend applies this policy after fit and quality gates.</p>
+					</div>
+				</div>
+				<div class="choice-grid">
+					{#each Object.entries(profileLabels) as [id, item] (id)}
+						<button
+							type="button"
+							class="choice"
+							class:active={profile === id}
+							onclick={() => (profile = id as ProfileId)}
+						>
 							<strong>{item.title}</strong>
 							<span>{item.help}</span>
 						</button>
@@ -967,8 +1260,13 @@
 					</div>
 				</div>
 				<div class="choice-grid">
-					{#each Object.entries(scopeOptions) as [id, item]}
-						<button type="button" class="choice" class:active={runScope === id} onclick={() => (runScope = id as RunScope)}>
+					{#each Object.entries(scopeOptions) as [id, item] (id)}
+						<button
+							type="button"
+							class="choice"
+							class:active={runScope === id}
+							onclick={() => (runScope = id as RunScope)}
+						>
 							<strong>{item.title}</strong>
 							<span>{item.help}</span>
 						</button>
@@ -979,20 +1277,28 @@
 
 		<section class="wizard-grid">
 			<div class="panel">
-					<div class="panel-head">
-						<div>
-							<h2>3. Select candidate models</h2>
-							<p>{selectedLocalIds.length} selected · {pendingSelectedIds.length} need benchmarking · {selectedLocalIds.length - pendingSelectedIds.length} already archived.</p>
-						</div>
-						<div class="row-actions">
-							<button type="button" onclick={selectRecommendedLocal}>Pick first 4</button>
-							<button type="button" onclick={selectAllLocal}>All available</button>
-							<button type="button" onclick={clearSelection}>Clear</button>
-						</div>
+				<div class="panel-head">
+					<div>
+						<h2>3. Select candidate models</h2>
+						<p>
+							{selectedLocalIds.length} selected · {pendingSelectedIds.length} need benchmarking · {selectedLocalIds.length -
+								pendingSelectedIds.length} already archived.
+						</p>
 					</div>
+					<div class="row-actions">
+						<button type="button" onclick={selectRecommendedLocal}>Hardware shortlist</button>
+						<button type="button" onclick={selectAllLocal}>All available</button>
+						<button type="button" onclick={clearSelection}>Clear</button>
+					</div>
+				</div>
 				<div class="model-list">
-					{#each selectableModels as model}
-						<button type="button" class="model-option" class:active={selectedLocalIds.includes(model.id)} onclick={() => toggleLocalModel(model.id)}>
+					{#each selectableModels as model (model.id)}
+						<button
+							type="button"
+							class="model-option"
+							class:active={selectedLocalIds.includes(model.id)}
+							onclick={() => toggleLocalModel(model.id)}
+						>
 							<span class="checkbox">{selectedLocalIds.includes(model.id) ? '✓' : ''}</span>
 							<div>
 								<strong>{model.name || model.id}</strong>
@@ -1011,16 +1317,44 @@
 					</div>
 				</div>
 				<div class="run-card">
+					<div class="intent-controls">
+						<label class="check"
+							><input type="checkbox" bind:checked={installedOnly} /><span
+								>Use installed models first</span
+							></label
+						>
+						<label
+							><span>Allowed test time</span><select bind:value={allowedTestMinutes}
+								><option value={10}>About 10 minutes</option><option value={20}
+									>About 20 minutes</option
+								><option value={45}>Up to 45 minutes</option><option value={90}
+									>Deep, up to 90 minutes</option
+								></select
+							></label
+						>
+					</div>
 					<dl>
-						<div><dt>Selected models</dt><dd>{selectedLocalIds.length}</dd></div>
-						<div><dt>Target context</dt><dd>{targetContext?.label ?? contextSize}</dd></div>
-						<div><dt>Benchmark scope</dt><dd>{scopeOptions[runScope].title}</dd></div>
-						<div><dt>Planned configs</dt><dd>{plan.length || '-'}</dd></div>
+						<div>
+							<dt>Selected models</dt>
+							<dd>{selectedLocalIds.length}</dd>
+						</div>
+						<div>
+							<dt>Target context</dt>
+							<dd>{targetContext?.label ?? contextSize}</dd>
+						</div>
+						<div>
+							<dt>Benchmark scope</dt>
+							<dd>{scopeOptions[runScope].title}</dd>
+						</div>
+						<div>
+							<dt>Planned configs</dt>
+							<dd>{plan.length || '-'}</dd>
+						</div>
 					</dl>
 					<label>
 						<span>Context target</span>
 						<select bind:value={contextSize}>
-							{#each contextOptions as option}
+							{#each contextOptions as option (option.value)}
 								<option value={option.value}>{option.label} - {option.hint}</option>
 							{/each}
 						</select>
@@ -1030,7 +1364,11 @@
 						<span>Load winner immediately after FIT</span>
 					</label>
 					<div class="button-row">
-						<button type="button" onclick={previewPlan} disabled={selectedLocalIds.length === 0 || loading}>
+						<button
+							type="button"
+							onclick={previewPlan}
+							disabled={selectedLocalIds.length === 0 || loading}
+						>
 							<Settings2 size={16} />
 							Review plan
 						</button>
@@ -1039,7 +1377,12 @@
 							Start benchmark
 						</button>
 						{#if sweepIsLive(status)}
-							<button type="button" class="danger" onclick={stopSweep} disabled={status?.cancel_requested}>
+							<button
+								type="button"
+								class="danger"
+								onclick={stopSweep}
+								disabled={status?.cancel_requested}
+							>
 								<Square size={16} />
 								Stop benchmark
 							</button>
@@ -1058,7 +1401,7 @@
 				</div>
 			</div>
 			<div class="workflow">
-				{#each workflow as item, index}
+				{#each workflow as item, index (item[0])}
 					<div class="workflow-step">
 						<span>{index + 1}</span>
 						<strong>{item[0]}</strong>
@@ -1084,7 +1427,7 @@
 							<span>Workload</span>
 							<span>Human summary</span>
 						</div>
-						{#each plan.slice(0, 120) as row}
+						{#each plan.slice(0, 120) as row (row.id)}
 							<div class="table-row">
 								<strong>{row.model}</strong>
 								<span>{row.row_role === 'candidate' ? 'Can win' : 'Diagnostic control'}</span>
@@ -1102,7 +1445,13 @@
 							<p>{status?.status ?? 'idle'}</p>
 						</div>
 						{#if sweepIsLive(status)}
-							<button type="button" class="icon-action danger" onclick={stopSweep} disabled={status?.cancel_requested} aria-label="Stop benchmark">
+							<button
+								type="button"
+								class="icon-action danger"
+								onclick={stopSweep}
+								disabled={status?.cancel_requested}
+								aria-label="Stop benchmark"
+							>
 								<Square size={16} />
 							</button>
 						{:else}
@@ -1111,16 +1460,30 @@
 					</div>
 					<div class="job">
 						<div class="progress">
-							<span style={`width:${status?.total ? Math.min(100, ((status.current ?? 0) / status.total) * 100) : running ? 12 : 0}%`}></span>
+							<span
+								style={`width:${status?.total ? Math.min(100, ((status.current ?? 0) / status.total) * 100) : running ? 12 : 0}%`}
+							></span>
 						</div>
 						<dl>
-							<div><dt>Done</dt><dd>{status?.current ?? 0}</dd></div>
-							<div><dt>Total</dt><dd>{status?.total ?? 0}</dd></div>
-							<div><dt>Current</dt><dd>{status?.current_item ?? '-'}</dd></div>
-							<div><dt>Report</dt><dd>{status?.report_id ?? '-'}</dd></div>
+							<div>
+								<dt>Done</dt>
+								<dd>{status?.current ?? 0}</dd>
+							</div>
+							<div>
+								<dt>Total</dt>
+								<dd>{status?.total ?? 0}</dd>
+							</div>
+							<div>
+								<dt>Current</dt>
+								<dd>{status?.current_item ?? '-'}</dd>
+							</div>
+							<div>
+								<dt>Report</dt>
+								<dd>{status?.report_id ?? '-'}</dd>
+							</div>
 						</dl>
 						<div class="event-log">
-							{#each eventLog as line}
+							{#each eventLog as line, index (`${index}-${line}`)}
 								<code>{line}</code>
 							{/each}
 						</div>
@@ -1130,7 +1493,7 @@
 		{/if}
 	{/if}
 
-	{#if activeTab === 'candidates'}
+	{#if activeTab === 'library'}
 		<section class="panel explain">
 			<Info size={18} />
 			<div>
@@ -1152,7 +1515,7 @@
 			<label>
 				<span>Fit strategy</span>
 				<select bind:value={catalogStrategy}>
-					{#each strategies as strategy}
+					{#each strategies as strategy (strategy.id)}
 						<option value={strategy.id}>{strategy.label}</option>
 					{/each}
 				</select>
@@ -1194,7 +1557,7 @@
 					<span>Status</span>
 					<span>Action</span>
 				</div>
-				{#each catalogModels as model}
+				{#each catalogModels as model (model.id)}
 					{@const job = downloadFor(model)}
 					<div class="table-row">
 						<span class={`fit ${model.fit_level}`}>{model.fit_level}</span>
@@ -1208,15 +1571,25 @@
 						<div class="status-cell">
 							<span>{downloadStatus(model)}</span>
 							{#if job}
-								<div class="mini-progress"><span style={`width:${Math.min(100, job.percent || 0)}%`}></span></div>
+								<div class="mini-progress">
+									<span style={`width:${Math.min(100, job.percent || 0)}%`}></span>
+								</div>
 							{/if}
 						</div>
 						<div class="row-actions">
-							<button type="button" onclick={() => downloadModel(model)} disabled={!canStartDownload(model)}>
+							<button
+								type="button"
+								onclick={() => downloadModel(model)}
+								disabled={!canStartDownload(model)}
+							>
 								<Download size={15} />
 								{downloadActionLabel(model)}
 							</button>
-							<button type="button" onclick={() => configureFitModel(model)} disabled={!canConfigureFit(model)}>
+							<button
+								type="button"
+								onclick={() => configureFitModel(model)}
+								disabled={!canConfigureFit(model)}
+							>
 								<CheckCircle2 size={15} />
 								FIT
 							</button>
@@ -1227,46 +1600,66 @@
 		</section>
 	{/if}
 
-	{#if activeTab === 'reports'}
+	{#if activeTab === 'recommendations' || activeTab === 'history'}
 		<section class="reports-layout">
-			<div class="panel">
-				<div class="panel-head">
-					<div>
-						<h2>Saved reports</h2>
-						<p>Completed reports stay available for future comparisons. Pending reports can be deleted.</p>
-					</div>
-					<FileJson size={18} />
-				</div>
-				<div class="table reports-table">
-					<div class="table-head">
-						<span>Status</span>
-						<span>Rows</span>
-						<span>Model/Campaign</span>
-						<span>Date</span>
-						<span></span>
-					</div>
-					{#each reports as report}
-						<div class="table-row" class:active={selectedReportId === report.id}>
-							<button type="button" class="linkish" onclick={() => openReport(report)}>{reportStatusLabel(report)}</button>
-							<span>{report.rows}</span>
-							<strong>{report.model || report.id}</strong>
-							<span>{report.created_at}</span>
-							<button type="button" onclick={() => deletePendingReport(report)} disabled={!canDeleteReport(report)}>
-								<Trash2 size={15} />
-							</button>
+			{#if activeTab === 'history'}
+				<div class="panel">
+					<div class="panel-head">
+						<div>
+							<h2>Saved reports</h2>
+							<p>
+								Completed reports stay available for future comparisons. Pending reports can be
+								deleted.
+							</p>
 						</div>
-					{/each}
+						<FileJson size={18} />
+					</div>
+					<div class="table reports-table">
+						<div class="table-head">
+							<span>Status</span>
+							<span>Rows</span>
+							<span>Model/Campaign</span>
+							<span>Date</span>
+							<span></span>
+						</div>
+						{#each reports as report (report.id)}
+							<div class="table-row" class:active={selectedReportId === report.id}>
+								<button type="button" class="linkish" onclick={() => openReport(report)}
+									>{reportStatusLabel(report)}</button
+								>
+								<span>{report.rows}</span>
+								<strong>{report.model || report.id}</strong>
+								<span>{report.created_at}</span>
+								<button
+									type="button"
+									onclick={() => deletePendingReport(report)}
+									disabled={!canDeleteReport(report)}
+								>
+									<Trash2 size={15} />
+								</button>
+							</div>
+						{/each}
+					</div>
 				</div>
-			</div>
+			{/if}
 
 			<div class="panel report-detail-panel">
 				<div class="panel-head">
 					<div>
-						<h2>Report detail</h2>
-						<p>{selectedReportId || 'Select a report'}</p>
+						<h2>{activeTab === 'history' ? 'Report detail' : 'Decision center'}</h2>
+						<p>
+							{selectedReportId ||
+								(activeTab === 'history' ? 'Select a report' : 'Latest compatible evidence')}
+						</p>
 					</div>
 					{#if selectedReport}
-						<button type="button" onclick={() => { selectedReport = null; selectedReportId = ''; }}>
+						<button
+							type="button"
+							onclick={() => {
+								selectedReport = null;
+								selectedReportId = '';
+							}}
+						>
 							Compare archive
 						</button>
 					{/if}
@@ -1274,10 +1667,22 @@
 				{#if selectedReport}
 					<div class="detail report-summary-strip">
 						<dl>
-							<div><dt>Status</dt><dd>{String(selectedReport.status ?? '-')}</dd></div>
-							<div><dt>Measured rows</dt><dd>{reportRows.length}</dd></div>
-							<div><dt>Planned configs</dt><dd>{reportPlan.length}</dd></div>
-							<div><dt>Created</dt><dd>{String(selectedReport.created_at ?? '-')}</dd></div>
+							<div>
+								<dt>Status</dt>
+								<dd>{String(selectedReport.status ?? '-')}</dd>
+							</div>
+							<div>
+								<dt>Measured rows</dt>
+								<dd>{reportRows.length}</dd>
+							</div>
+							<div>
+								<dt>Planned configs</dt>
+								<dd>{reportPlan.length}</dd>
+							</div>
+							<div>
+								<dt>Created</dt>
+								<dd>{String(selectedReport.created_at ?? '-')}</dd>
+							</div>
 						</dl>
 						{#if selectedReportSummary() && canDeleteReport(selectedReportSummary()!)}
 							<button type="button" onclick={() => deletePendingReport(selectedReportSummary()!)}>
@@ -1291,24 +1696,117 @@
 								<pre>{planLauncher(reportRows[0])}</pre>
 							</details>
 						{/if}
+					</div>
+				{/if}
+				{#if selectedReport || resultRows.length > 0}
+					<div class="calibr-report">
+						<div class="calibr-title">
+							<div>
+								<h2><span>calibr</span> benchmark report</h2>
+								<p>
+									{selectedReport
+										? `Selected ${String(selectedReport.created_at ?? selectedReportId)}`
+										: 'Historical archive across completed runs'}
+								</p>
+							</div>
+							<strong
+								>{okAnalyticsRows.length}/{scopedAnalyticsRows.length ||
+									resultRows.length ||
+									reportRows.length} successful configs</strong
+							>
 						</div>
 
-					{/if}
-					{#if selectedReport || resultRows.length > 0}
-						<div class="calibr-report">
-							<div class="calibr-title">
-								<div>
-									<h2><span>calibr</span> benchmark report</h2>
-									<p>{selectedReport ? `Selected ${String(selectedReport.created_at ?? selectedReportId)}` : 'Historical archive across completed runs'}</p>
+						{#if bestWinner}
+							<section class="recommendation-hero">
+								<div class="winner-answer">
+									<span class="eyebrow">Recommended on this hardware</span>
+									<h3>{rowText(bestWinner, ['model'], '-')}</h3>
+									<p>
+										{rowText(
+											bestWinner,
+											['selection_reason'],
+											'Selected by the backend recommendation policy.'
+										)}
+									</p>
+									<div class="evidence-badges">
+										<b>{rowText(bestWinner, ['evidence_level'], 'unverified')}</b>
+										<b class:pass={rowBool(bestWinner, 'quality_gate_passed')}
+											>{rowBool(bestWinner, 'quality_gate_passed')
+												? `quality ${Math.round(qualityScore(bestWinner) * 100)}%`
+												: 'quality gate missing'}</b
+										>
+										<b>{rowText(bestWinner, ['measurement_confidence'], 'unknown confidence')}</b>
+									</div>
+									<button
+										type="button"
+										class="primary"
+										onclick={() => configureCaliberRow(bestWinner)}
+										disabled={!canFitCaliberRow(bestWinner)}
+										><CheckCircle2 size={15} />Apply known-good preset</button
+									>
 								</div>
-								<strong>{okAnalyticsRows.length}/{scopedAnalyticsRows.length || resultRows.length || reportRows.length} successful configs</strong>
+								<div class="answer-metrics">
+									<div>
+										<span>Decode</span><strong
+											>{fmtNumber(rowNum(bestWinner, ['eval_tps', 'tps']), 1)} t/s</strong
+										>
+									</div>
+									<div>
+										<span>First token</span><strong
+											>{fmtNumber(rowNum(bestWinner, ['e2e_ttft_ms']), 0)} ms</strong
+										>
+									</div>
+									<div>
+										<span>Context proved</span><strong
+											>{Math.round(rowNum(bestWinner, ['ctx_size']) / 1024)}k</strong
+										>
+									</div>
+									<div>
+										<span>Peak memory</span><strong>{fmtMib(reportMemoryMib(bestWinner))}</strong>
+									</div>
+								</div>
+							</section>
+							{#if bestAlternatives.length > 0}
+								<div class="alternative-grid">
+									{#each bestAlternatives as alternative, index (rowIdentity(alternative))}
+										<div>
+											<span>Alternative {index + 1}</span><strong
+												>{rowText(alternative, ['model'], '-')}</strong
+											>
+											<p>
+												{rowText(
+													alternative,
+													['selection_reason'],
+													`${fmtNumber(rowNum(alternative, ['eval_tps']), 1)} t/s`
+												)}
+											</p>
+										</div>
+									{/each}
+								</div>
+							{/if}
+						{:else}
+							<div class="methodology-warning">
+								<strong>No production winner yet</strong><span
+									>A winner needs a healthy artifact, streaming measurements, verified context and a
+									passing {useCase} quality pack. Run the missing quality evidence in
+									<a href="#/ds4-eval">DS4 expert evaluator</a>.</span
+								>
 							</div>
+						{/if}
 
 						<div class="hardware-strip">
 							<strong>Hardware:</strong>
 							<span>{fitSystem?.gpu_name ?? 'GPU scan pending'}</span>
-							<span>{fitSystem ? `${fmtGb(fitSystem.total_gpu_vram_gb)} aggregate VRAM` : 'VRAM unavailable'}</span>
-							<span>{fitSystem ? `${fitSystem.cpu_name} / ${fitSystem.cpu_cores} threads` : 'CPU unavailable'}</span>
+							<span
+								>{fitSystem
+									? `${fmtGb(fitSystem.total_gpu_vram_gb)} aggregate VRAM`
+									: 'VRAM unavailable'}</span
+							>
+							<span
+								>{fitSystem
+									? `${fitSystem.cpu_name} / ${fitSystem.cpu_cores} threads`
+									: 'CPU unavailable'}</span
+							>
 							<span>llama-server: native router</span>
 						</div>
 
@@ -1318,8 +1816,16 @@
 								{#if selectedReport}
 									<button type="button" class:active={true}>Selected report</button>
 								{:else}
-									<button type="button" class:active={reportScope === 'latest'} onclick={() => (reportScope = 'latest')}>Latest campaign</button>
-									<button type="button" class:active={reportScope === 'all'} onclick={() => (reportScope = 'all')}>Compatible history</button>
+									<button
+										type="button"
+										class:active={reportScope === 'latest'}
+										onclick={() => (reportScope = 'latest')}>Latest campaign</button
+									>
+									<button
+										type="button"
+										class:active={reportScope === 'all'}
+										onclick={() => (reportScope = 'all')}>Compatible history</button
+									>
 								{/if}
 							</div>
 							<em>{reportGroups.length} models, {okAnalyticsRows.length} configs in view</em>
@@ -1328,8 +1834,12 @@
 						<div class="filter-bar">
 							<span>Winner criterion:</span>
 							<div class="segmented">
-								{#each Object.entries(profileLabels) as [id, item]}
-									<button type="button" class:active={profile === id} onclick={() => (profile = id as ProfileId)}>{item.title}</button>
+								{#each Object.entries(profileLabels) as [id, item] (id)}
+									<button
+										type="button"
+										class:active={profile === id}
+										onclick={() => (profile = id as ProfileId)}>{item.title}</button
+									>
 								{/each}
 							</div>
 							<em>{String(activeDecision?.reason ?? profileLabels[profile].help)}</em>
@@ -1338,25 +1848,36 @@
 						{#if syntheticRows > 0}
 							<div class="methodology-warning">
 								<strong>Synthetic benchmark</strong>
-								<span>{syntheticRows} row(s) measured with llama-bench. Eval speed uses the generation row; full streaming timeline requires the server-runner telemetry backend.</span>
+								<span
+									>{syntheticRows} row(s) measured with llama-bench. Eval speed uses the generation row;
+									full streaming timeline requires the server-runner telemetry backend.</span
+								>
 							</div>
 						{/if}
 
 						<section class="report-section">
 							<div class="section-heading">
 								<h3>Memory vs latency</h3>
-								<p>One dot per successful config. X is total prompt + generation time; Y is peak VRAM plus observed spill. Hover a point for model details.</p>
+								<p>
+									One dot per successful config. X is total prompt + generation time; Y is peak VRAM
+									plus observed spill. Hover a point for model details.
+								</p>
 							</div>
 							<div class="memory-latency-grid">
 								<div class="chart-shell">
-									<svg class="report-scatter" viewBox="0 0 980 360" role="img" aria-label="Memory versus latency">
+									<svg
+										class="report-scatter"
+										viewBox="0 0 980 360"
+										role="img"
+										aria-label="Memory versus latency"
+									>
 										<line class="axis" x1="70" y1="312" x2="930" y2="312" />
 										<line class="axis" x1="70" y1="54" x2="70" y2="312" />
 										<line class="budget" x1="70" y1="180" x2="930" y2="180" />
 										<text x="72" y="344">Total time, log scale</text>
 										<text x="12" y="58">Memory used</text>
 										<text x="780" y="174">GPU VRAM budget</text>
-										{#each reportScatterRows.slice(0, 360) as row, index}
+										{#each reportScatterRows.slice(0, 360) as row, index (`${index}-${rowIdentity(row)}`)}
 											<circle
 												cx={70 + ((reportScatterX(row) - 58) / 662) * 860}
 												cy={54 + ((reportScatterY(row) - 54) / 244) * 258}
@@ -1364,7 +1885,14 @@
 												class={`dot-${index % 5}`}
 												class:candidate={isReportCandidate(row)}
 											>
-												<title>{rowText(row, ['model'], '-')} / {fmtNumber(rowNum(row, ['eval_tps', 'tps']), 1)} t/s / {fmtMib(reportMemoryMib(row))} / ctx {rowNum(row, ['ctx_size']) || '-'}</title>
+												<title
+													>{rowText(row, ['model'], '-')} / {fmtNumber(
+														rowNum(row, ['eval_tps', 'tps']),
+														1
+													)} t/s / {fmtMib(reportMemoryMib(row))} / ctx {rowNum(row, [
+														'ctx_size'
+													]) || '-'}</title
+												>
 											</circle>
 										{/each}
 									</svg>
@@ -1373,16 +1901,25 @@
 								<div class="metric-panel">
 									<div class="analytics-cards">
 										<div><span>Models</span><strong>{reportGroups.length}</strong></div>
-										<div><span>Measured configs</span><strong>{okAnalyticsRows.length}</strong></div>
-										<div><span>Winner rule</span><strong>{profileLabels[profile].title}</strong></div>
+										<div>
+											<span>Measured configs</span><strong>{okAnalyticsRows.length}</strong>
+										</div>
+										<div>
+											<span>Winner rule</span><strong>{profileLabels[profile].title}</strong>
+										</div>
 										<div><span>Metric</span><strong>{reportMetricLabel(reportMetric)}</strong></div>
 									</div>
 									<div class="leader-bars compact">
-										{#each reportLeaderboard.slice(0, 8) as row}
+										{#each reportLeaderboard.slice(0, 8) as row (rowIdentity(row))}
 											<div class="leader-row">
 												<span>{rowText(row, ['model'], '-')}</span>
 												<div><i style={`width:${reportBarWidth(row)}%`}></i></div>
-												<strong>{reportMetricUnit(reportMetric, reportMetricValue(row, reportMetric))}</strong>
+												<strong
+													>{reportMetricUnit(
+														reportMetric,
+														reportMetricValue(row, reportMetric)
+													)}</strong
+												>
 											</div>
 										{/each}
 									</div>
@@ -1390,20 +1927,142 @@
 							</div>
 						</section>
 
+						{#if bestWinner}
+							<section class="report-section report-visual-grid">
+								<div>
+									<div class="section-heading">
+										<h3>Tuned vs vanilla</h3>
+										<p>
+											Normalized speed, prompt, context, memory safety and task quality. Larger is
+											better.
+										</p>
+									</div>
+									<svg
+										class="radar-chart"
+										viewBox="0 0 220 210"
+										role="img"
+										aria-label="Tuned versus vanilla radar chart"
+									>
+										<polygon class="radar-grid" points="110,27 184,81 156,168 64,168 36,81" />
+										{#if matchedVanilla(bestWinner)}<polygon
+												class="radar-vanilla"
+												points={radarPoints(matchedVanilla(bestWinner)!)}
+											/>{/if}
+										<polygon class="radar-winner" points={radarPoints(bestWinner)} />
+										<text x="94" y="16">decode</text><text x="180" y="74">prompt</text><text
+											x="157"
+											y="191">context</text
+										><text x="9" y="191">memory</text><text x="2" y="74">quality</text>
+									</svg>
+									<div class="chart-legend">
+										<span class="winner-line">winner</span><span class="vanilla-line"
+											>matched vanilla</span
+										>
+									</div>
+								</div>
+								<div>
+									<div class="section-heading">
+										<h3>Streaming timeline</h3>
+										<p>
+											Process-scoped VRAM, GPU utilization and RAM samples from the isolated server.
+										</p>
+									</div>
+									{#if bestTimeline.length > 1}
+										<svg
+											class="timeline-chart"
+											viewBox="0 0 760 280"
+											role="img"
+											aria-label="Streaming telemetry timeline"
+										>
+											<line x1="44" y1="250" x2="720" y2="250" /><line
+												x1="44"
+												y1="60"
+												x2="44"
+												y2="250"
+											/>
+											<polyline
+												class="vram-line"
+												points={bestTimeline
+													.map((sample) => `${timelineX(sample)},${timelineY(sample, 1)}`)
+													.join(' ')}
+											/>
+											<polyline
+												class="util-line"
+												points={bestTimeline
+													.map((sample) => `${timelineX(sample)},${timelineY(sample, 2)}`)
+													.join(' ')}
+											/>
+											<polyline
+												class="ram-line"
+												points={bestTimeline
+													.map((sample) => `${timelineX(sample)},${timelineY(sample, 3)}`)
+													.join(' ')}
+											/>
+											<text x="46" y="272"
+												>0 → {fmtNumber((bestTimeline.at(-1)?.[0] ?? 0) / 1000, 1)} seconds</text
+											>
+										</svg>
+										<div class="chart-legend">
+											<span class="vram-line">VRAM</span><span class="util-line"
+												>GPU utilization</span
+											><span class="ram-line">process RAM</span>
+										</div>
+									{:else}<p class="empty">No compact streaming timeline in this report.</p>{/if}
+								</div>
+							</section>
+						{/if}
+
+						<section class="report-section">
+							<div class="section-heading">
+								<h3>Prefill & KV-depth load curve</h3>
+								<p>
+									Diagnostic rows show whether throughput or fit collapses as the prompt and KV
+									cache grow.
+								</p>
+							</div>
+							{#if loadCurveRows.length > 0}
+								<div class="load-curves">
+									{#each loadCurveRows as row, index (`${index}-${rowIdentity(row)}`)}<div>
+											<span
+												>{rowText(row, ['model'], '-')} · {rowText(row, ['workload_kind'])} · {Math.round(
+													loadTarget(row) / 1024
+												)}k</span
+											>
+											<div><i style={`width:${loadCurveWidth(row)}%`}></i></div>
+											<strong>{fmtNumber(rowNum(row, ['prompt_tps', 'eval_tps']), 1)} t/s</strong>
+										</div>{/each}
+								</div>
+							{:else}<p class="empty">
+									Run a Decision or Deep campaign to collect prefill and KV-depth points.
+								</p>{/if}
+						</section>
+
 						<section class="report-section">
 							<div class="section-heading">
 								<h3>Models (winners per current filter)</h3>
-								<p>Each row shows the selected winner for one model. Expand it to inspect all measured configs.</p>
+								<p>
+									Each row shows the selected winner for one model. Expand it to inspect all
+									measured configs.
+								</p>
 							</div>
 							<div class="analytics-models">
-								{#each reportGroups as group, index}
+								{#each reportGroups as group, index (group.model)}
 									<details class="analytics-model" open={index === 0}>
 										<summary>
 											<div class="summary-main">
-												<span class={`rank-tag ${group.winner ? reportFitClass(group.winner) : 'low'}`}>{group.winner ? reportFitLabel(group.winner) : 'n/a'}</span>
+												<span
+													class={`rank-tag ${group.winner ? reportFitClass(group.winner) : 'low'}`}
+													>{group.winner ? reportFitLabel(group.winner) : 'n/a'}</span
+												>
 												<strong>{group.model}</strong>
 												{#if group.winner}
-													<code>{rowText(group.winner, ['variant', 'quant', 'kv_cache'], rowText(group.winner, ['row_role'], 'candidate'))}</code>
+													<code
+														>{rowText(
+															group.winner,
+															['variant', 'quant', 'kv_cache'],
+															rowText(group.winner, ['row_role'], 'candidate')
+														)}</code
+													>
 												{/if}
 											</div>
 											{#if group.winner}
@@ -1415,7 +2074,9 @@
 														type="button"
 														onclick={() => configureCaliberRow(group.winner as CaliberRow)}
 														disabled={!canFitCaliberRow(group.winner as CaliberRow)}
-														title={canFitCaliberRow(group.winner as CaliberRow) ? 'Apply measured winner' : 'Requires decision-grade streaming evidence'}
+														title={canFitCaliberRow(group.winner as CaliberRow)
+															? 'Apply measured winner'
+															: 'Requires decision-grade streaming evidence'}
 													>
 														<CheckCircle2 size={14} />
 														FIT winner
@@ -1435,15 +2096,25 @@
 												<span>Memory</span>
 												<span>Fit</span>
 											</div>
-											{#each group.rows as row}
-												<div class="table-row" class:winner={Boolean(group.winner) && rowIdentity(group.winner as CaliberRow) === rowIdentity(row)}>
+											{#each group.rows as row, rowIndex (`${rowIndex}-${rowIdentity(row)}`)}
+												<div
+													class="table-row"
+													class:winner={Boolean(group.winner) &&
+														rowIdentity(group.winner as CaliberRow) === rowIdentity(row)}
+												>
 													<span>{rowText(row, ['row_role'], '-')}</span>
 													<span>{rowText(row, ['workload_kind'], '-')}</span>
 													<span>{rowNum(row, ['ctx_size']) || '-'}</span>
 													<span>{fmtNumber(rowNum(row, ['prompt_tps']), 1)} t/s</span>
 													<span>{fmtNumber(rowNum(row, ['eval_tps', 'tps']), 1)} t/s</span>
 													<span>{fmtMib(reportMemoryMib(row))}</span>
-													<span>{rowText(row, ['decode_usability', 'residency', 'memory_state', 'fit_status'], '-')}</span>
+													<span
+														>{rowText(
+															row,
+															['decode_usability', 'residency', 'memory_state', 'fit_status'],
+															'-'
+														)}</span
+													>
 												</div>
 											{/each}
 										</div>
@@ -1454,36 +2125,112 @@
 
 						<section class="report-section">
 							<div class="section-heading">
+								<h3>Metric glossary</h3>
+								<p>What the decision-grade measurements mean.</p>
+							</div>
+							<div class="glossary">
+								<div><b>TTFT</b><span>Time from request to first streamed token.</span></div>
+								<div>
+									<b>TPOT / ITL</b><span>Average / percentile delay between generated tokens.</span>
+								</div>
+								<div><b>Prompt t/s</b><span>Prompt ingestion or prefill throughput.</span></div>
+								<div><b>Decode t/s</b><span>Generated tokens per second after prefill.</span></div>
+								<div>
+									<b>Quality floor</b><span
+										>Minimum measured task score before cost optimization.</span
+									>
+								</div>
+								<div>
+									<b>FIT eligible</b><span
+										>Streaming, context, memory and quality evidence all pass policy.</span
+									>
+								</div>
+							</div>
+							<details class="raw-table">
+								<summary>All technical columns ({scopedAnalyticsRows.length} rows)</summary>
+								<div class="raw-scroll">
+									<table>
+										<thead
+											><tr
+												>{#each technicalColumns as column (column)}<th>{column}</th>{/each}</tr
+											></thead
+										><tbody
+											>{#each scopedAnalyticsRows as row, rowIndex (`${rowIndex}-${rowIdentity(row)}`)}<tr
+													>{#each technicalColumns as column (column)}<td
+															>{String(row[column] ?? '-')}</td
+														>{/each}</tr
+												>{/each}</tbody
+										>
+									</table>
+								</div>
+							</details>
+						</section>
+
+						<section class="report-section">
+							<div class="section-heading">
 								<h3>Throughput & memory</h3>
 								<p>The selected metric changes the ordering and bar scale.</p>
 							</div>
 							<div class="segmented metric-tabs">
-								{#each reportMetrics as metric}
-									<button type="button" class:active={reportMetric === metric} onclick={() => (reportMetric = metric)}>{reportMetricLabel(metric)}</button>
+								{#each reportMetrics as metric (metric)}
+									<button
+										type="button"
+										class:active={reportMetric === metric}
+										onclick={() => (reportMetric = metric)}>{reportMetricLabel(metric)}</button
+									>
 								{/each}
 							</div>
 							<div class="throughput-bars">
-								{#each reportLeaderboard as row}
+								{#each reportLeaderboard as row (rowIdentity(row))}
 									<div class="throughput-row">
 										<span>
 											<b class={`rank-tag ${reportFitClass(row)}`}>{reportFitLabel(row)}</b>
 											{rowText(row, ['model'], '-')}
 										</span>
-										<div class="throughput-track"><i style={`width:${reportBarWidth(row)}%`}></i></div>
-										<strong>{reportMetricUnit(reportMetric, reportMetricValue(row, reportMetric))}</strong>
+										<div class="throughput-track">
+											<i style={`width:${reportBarWidth(row)}%`}></i>
+										</div>
+										<strong
+											>{reportMetricUnit(
+												reportMetric,
+												reportMetricValue(row, reportMetric)
+											)}</strong
+										>
 									</div>
 								{/each}
 							</div>
 						</section>
-						</div>
-					{:else}
-						<p class="empty">No historical Caliber rows yet.</p>
-					{/if}
+					</div>
+				{:else}
+					<p class="empty">No historical Caliber rows yet.</p>
+				{/if}
 			</div>
 		</section>
 	{/if}
 
-	{#if activeTab === 'diagnostics'}
+	{#if activeTab === 'router'}
+		<section class="router-hero panel">
+			<div>
+				<span class="eyebrow">Stable virtual models</span>
+				<h2>Ask for an outcome, not a filename</h2>
+				<p>
+					The local router filters by context, quality and features, then accounts for load cost and
+					keeps a suitable resident model when possible.
+				</p>
+			</div>
+			<div class="alias-grid">
+				{#each [['local-auto', 'Balanced measured default'], ['local-fast', 'Lowest interactive latency'], ['local-best', 'Highest qualified quality'], ['local-code', 'Coding and FIM qualified'], ['local-long', 'Long-context retrieval qualified'], ['local-vision', 'Vision-capable artifact']] as alias (alias[0])}
+					<div><code>{alias[0]}</code><span>{alias[1]}</span><a href="#/">Use in chat</a></div>
+				{/each}
+			</div>
+			<p class="note">
+				Route decisions and their evidence appear here after the least-cost policy has handled
+				traffic.
+			</p>
+		</section>
+	{/if}
+
+	{#if activeTab === 'doctor'}
 		<section class="grid">
 			<div class="panel">
 				<div class="panel-head">
@@ -1495,12 +2242,30 @@
 				</div>
 				<div class="detail">
 					<dl>
-						<div><dt>CPU</dt><dd>{fitSystem?.cpu_name ?? '-'}</dd></div>
-						<div><dt>Threads</dt><dd>{fitSystem?.cpu_cores ?? '-'}</dd></div>
-						<div><dt>RAM total</dt><dd>{fitSystem ? fmtGb(fitSystem.total_ram_gb) : '-'}</dd></div>
-						<div><dt>GPU</dt><dd>{fitSystem?.gpu_name ?? '-'}</dd></div>
-						<div><dt>GPU count</dt><dd>{fitSystem?.gpu_count ?? '-'}</dd></div>
-						<div><dt>Aggregate VRAM</dt><dd>{fitSystem ? fmtGb(fitSystem.total_gpu_vram_gb) : '-'}</dd></div>
+						<div>
+							<dt>CPU</dt>
+							<dd>{fitSystem?.cpu_name ?? '-'}</dd>
+						</div>
+						<div>
+							<dt>Threads</dt>
+							<dd>{fitSystem?.cpu_cores ?? '-'}</dd>
+						</div>
+						<div>
+							<dt>RAM total</dt>
+							<dd>{fitSystem ? fmtGb(fitSystem.total_ram_gb) : '-'}</dd>
+						</div>
+						<div>
+							<dt>GPU</dt>
+							<dd>{fitSystem?.gpu_name ?? '-'}</dd>
+						</div>
+						<div>
+							<dt>GPU count</dt>
+							<dd>{fitSystem?.gpu_count ?? '-'}</dd>
+						</div>
+						<div>
+							<dt>Aggregate VRAM</dt>
+							<dd>{fitSystem ? fmtGb(fitSystem.total_gpu_vram_gb) : '-'}</dd>
+						</div>
 					</dl>
 				</div>
 			</div>
@@ -1516,7 +2281,15 @@
 						<li>Downloads and initial FIT reuse Fit Advisor.</li>
 						<li>Campaigns run server-side; browser closure does not cancel them.</li>
 						<li>Winner comparisons ignore reports without measured rows.</li>
-						<li>The current runner uses `llama-bench`; the full original llama-server telemetry loop remains a deeper parity target.</li>
+						<li>
+							Finalists use an isolated streaming llama-server; llama-bench is retained only for
+							fast synthetic racing.
+						</li>
+						<li>FIT is blocked until context, memory and the selected quality pack pass.</li>
+						<li>
+							Use the expert <a href="#/ds4-eval">quality evaluator</a> or
+							<a href="#/ds4-bench">context bench</a> when Doctor reports missing evidence.
+						</li>
 					</ul>
 				</div>
 			</div>
@@ -1745,6 +2518,16 @@
 		gap: 8px;
 		padding: 12px;
 		text-align: left;
+	}
+
+	.compact-choice {
+		min-height: 78px;
+	}
+
+	.intent-controls {
+		display: grid;
+		grid-template-columns: 1fr 1fr;
+		gap: 10px;
 	}
 
 	.model-list {
@@ -2006,6 +2789,13 @@
 		padding: 12px;
 	}
 
+	.status-message {
+		border-left: 3px solid var(--primary);
+		background: color-mix(in oklch, var(--muted) 45%, transparent);
+		padding: 10px 12px;
+		color: var(--muted-foreground);
+	}
+
 	.reports-layout {
 		display: grid;
 		grid-template-columns: 1fr;
@@ -2123,6 +2913,242 @@
 
 	.methodology-warning strong {
 		color: #fde68a;
+	}
+
+	.methodology-warning a,
+	.router-hero a {
+		color: #c4b5fd;
+		text-decoration: underline;
+	}
+
+	.recommendation-hero {
+		display: grid;
+		grid-template-columns: minmax(0, 1.3fr) minmax(320px, 0.7fr);
+		gap: 18px;
+		border: 1px solid #6d5ce7;
+		border-radius: 8px;
+		background: linear-gradient(135deg, rgba(76, 29, 149, 0.62), rgba(30, 30, 30, 0.96));
+		padding: 18px;
+	}
+
+	.winner-answer,
+	.answer-metrics,
+	.alternative-grid,
+	.evidence-badges {
+		display: grid;
+		gap: 10px;
+	}
+
+	.winner-answer h3 {
+		margin: 0;
+		color: #fff;
+		font-size: 26px;
+	}
+
+	.eyebrow {
+		color: #c4b5fd !important;
+		font-size: 11px;
+		font-weight: 800;
+		letter-spacing: 0.12em;
+		text-transform: uppercase;
+	}
+
+	.evidence-badges {
+		grid-template-columns: repeat(3, max-content);
+	}
+
+	.evidence-badges b {
+		border: 1px solid #64748b;
+		border-radius: 999px;
+		padding: 4px 8px;
+		color: #cbd5e1;
+		font-size: 11px;
+	}
+
+	.evidence-badges b.pass {
+		border-color: #22c55e;
+		color: #86efac;
+	}
+
+	.answer-metrics {
+		grid-template-columns: repeat(2, 1fr);
+	}
+
+	.answer-metrics > div,
+	.alternative-grid > div {
+		display: grid;
+		gap: 4px;
+		border: 1px solid #4f4f4f;
+		border-radius: 6px;
+		background: rgba(17, 17, 17, 0.72);
+		padding: 11px;
+	}
+
+	.answer-metrics strong,
+	.alternative-grid strong {
+		color: #fff;
+	}
+
+	.alternative-grid {
+		grid-template-columns: repeat(3, 1fr);
+	}
+
+	.report-visual-grid {
+		grid-template-columns: minmax(280px, 0.55fr) minmax(480px, 1.45fr);
+	}
+
+	.radar-chart,
+	.timeline-chart {
+		width: 100%;
+		min-height: 250px;
+		background: #202020;
+	}
+
+	.radar-grid {
+		fill: transparent;
+		stroke: #52525b;
+	}
+
+	.radar-winner {
+		fill: rgba(139, 92, 246, 0.35);
+		stroke: #a78bfa;
+		stroke-width: 2;
+	}
+
+	.radar-vanilla {
+		fill: rgba(148, 163, 184, 0.12);
+		stroke: #94a3b8;
+		stroke-dasharray: 4 3;
+	}
+
+	.radar-chart text,
+	.timeline-chart text {
+		fill: #cbd5e1;
+		font-size: 10px;
+	}
+
+	.timeline-chart line {
+		stroke: #52525b;
+	}
+
+	.timeline-chart polyline {
+		fill: none;
+		stroke-width: 2;
+	}
+
+	.vram-line {
+		stroke: #a78bfa;
+		color: #a78bfa;
+	}
+	.util-line {
+		stroke: #22c55e;
+		color: #22c55e;
+	}
+	.ram-line {
+		stroke: #38bdf8;
+		color: #38bdf8;
+	}
+
+	.chart-legend {
+		display: flex;
+		gap: 14px;
+		padding: 8px 0;
+	}
+
+	.chart-legend span::before {
+		content: '';
+		display: inline-block;
+		width: 18px;
+		height: 2px;
+		margin-right: 5px;
+		background: currentColor;
+		vertical-align: middle;
+	}
+
+	.winner-line {
+		color: #a78bfa !important;
+	}
+	.vanilla-line {
+		color: #94a3b8 !important;
+	}
+
+	.load-curves {
+		display: grid;
+		gap: 7px;
+	}
+
+	.load-curves > div {
+		display: grid;
+		grid-template-columns: minmax(240px, 1fr) minmax(240px, 1.5fr) 90px;
+		gap: 10px;
+		align-items: center;
+	}
+
+	.load-curves > div > div {
+		height: 12px;
+		background: #111;
+	}
+
+	.load-curves i {
+		display: block;
+		height: 100%;
+		background: linear-gradient(90deg, #8b5cf6, #22c55e);
+	}
+
+	.glossary {
+		display: grid;
+		grid-template-columns: repeat(3, 1fr);
+		gap: 8px;
+	}
+
+	.glossary > div,
+	.alias-grid > div {
+		display: grid;
+		gap: 4px;
+		border: 1px solid #4f4f4f;
+		border-radius: 6px;
+		padding: 10px;
+	}
+
+	.glossary b,
+	.alias-grid code {
+		color: #f8fafc;
+	}
+
+	.raw-table summary {
+		cursor: pointer;
+		color: #f8fafc;
+		font-weight: 700;
+	}
+
+	.raw-scroll {
+		margin-top: 10px;
+		overflow: auto;
+	}
+
+	.raw-scroll table {
+		border-collapse: collapse;
+		font-size: 11px;
+	}
+
+	.raw-scroll th,
+	.raw-scroll td {
+		border: 1px solid #4f4f4f;
+		padding: 6px;
+		white-space: nowrap;
+		color: #cbd5e1;
+	}
+
+	.router-hero {
+		display: grid;
+		gap: 18px;
+		padding: 18px;
+	}
+
+	.alias-grid {
+		display: grid;
+		grid-template-columns: repeat(3, 1fr);
+		gap: 10px;
 	}
 
 	.report-section {
@@ -2362,12 +3388,17 @@
 
 	@media (max-width: 1100px) {
 		.page-header,
-			.answer-strip,
-			.wizard-grid,
-			.grid,
-			.memory-latency-grid,
-			.analytics-cards,
-			.workflow {
+		.answer-strip,
+		.wizard-grid,
+		.grid,
+		.memory-latency-grid,
+		.recommendation-hero,
+		.report-visual-grid,
+		.alternative-grid,
+		.glossary,
+		.alias-grid,
+		.analytics-cards,
+		.workflow {
 			display: flex;
 			flex-direction: column;
 		}
@@ -2376,18 +3407,25 @@
 			grid-template-columns: 1fr;
 		}
 
+		.intent-controls,
+		.answer-metrics,
+		.evidence-badges,
+		.load-curves > div {
+			grid-template-columns: 1fr;
+		}
+
 		.table-head {
 			display: none;
 		}
 
-			.plan-table .table-row,
-			.catalog-table .table-row,
-			.reports-table .table-row,
-			.config-matrix .table-row,
-			.leader-row,
-			.throughput-row,
-			.analytics-model summary {
-				grid-template-columns: 1fr;
-			}
+		.plan-table .table-row,
+		.catalog-table .table-row,
+		.reports-table .table-row,
+		.config-matrix .table-row,
+		.leader-row,
+		.throughput-row,
+		.analytics-model summary {
+			grid-template-columns: 1fr;
 		}
+	}
 </style>

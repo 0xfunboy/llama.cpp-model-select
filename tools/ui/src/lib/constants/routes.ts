@@ -33,5 +33,7 @@ export const ROUTES = {
 	/** Model fit advisor dashboard. */
 	FIT_ADVISOR: '#/fit-advisor',
 	/** Caliber benchmark advisor dashboard. */
-	CALIBER_ADVISOR: '#/caliber-advisor'
+	CALIBER_ADVISOR: '#/caliber-advisor',
+	/** Unified local model discovery, testing and routing product. */
+	AUTOPILOT: '#/caliber-advisor'
 } as const;

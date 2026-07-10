@@ -1,4 +1,4 @@
-import { Activity, ClipboardCheck, Gauge, Search, Settings, SquarePen } from '@lucide/svelte';
+import { Gauge, Search, Settings, SquarePen } from '@lucide/svelte';
 import McpLogo from '$lib/components/app/mcp/McpLogo.svelte';
 import type { Component } from 'svelte';
 import { ROUTES } from './routes';
@@ -29,22 +29,10 @@ export const SIDEBAR_ACTIONS_ITEMS: DesktopIconStripItem[] = [
 		activeRouteId: '/mcp-servers'
 	},
 	{
-		icon: Activity,
-		tooltip: 'Fit Advisor',
-		route: ROUTES.FIT_ADVISOR,
-		activeRouteId: '/fit-advisor'
-	},
-	{
 		icon: Gauge,
-		tooltip: 'Caliber Advisor',
-		route: ROUTES.CALIBER_ADVISOR,
+		tooltip: 'Local LLM Autopilot',
+		route: ROUTES.AUTOPILOT,
 		activeRouteId: '/caliber-advisor'
-	},
-	{
-		icon: ClipboardCheck,
-		tooltip: 'DS4-Eval',
-		route: ROUTES.DS4_EVAL,
-		activeRouteId: '/ds4-eval'
 	},
 	{
 		icon: Settings,
