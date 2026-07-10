@@ -6,6 +6,7 @@
 #include "server-common.h"
 #include "server-http.h"
 #include "server-queue.h"
+#include "model-registry.h"
 
 #include <mutex>
 #include <condition_variable>
@@ -288,6 +289,7 @@ struct server_models_routes {
     std::condition_variable switch_cv;
     bool switch_in_progress = false;
     server_models models;
+    model_registry::index registry;
     server_models_routes(const common_params & params, int argc, char ** argv)
             : params(params), models(params, argc, argv) {
         const std::string & cfg = this->params.ui_config_json;
@@ -304,6 +306,7 @@ struct server_models_routes {
     }
 
     void init_routes();
+    json scan_model_registry(bool refresh = false);
     // handlers using lambda function, so that they can capture `this` without `std::bind`
     server_http_context::handler_t get_router_props;
     server_http_context::handler_t proxy_get;
@@ -316,6 +319,7 @@ struct server_models_routes {
     server_http_context::handler_t post_router_models;
     server_http_context::handler_t del_router_models;
     server_http_context::handler_t get_admin_models;
+    server_http_context::handler_t get_model_registry;
     server_http_context::handler_t post_admin_switch;
 
     // router side handlers for the resumable streaming routes. each resolves the child that owns

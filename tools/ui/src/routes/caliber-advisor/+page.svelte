@@ -160,7 +160,7 @@
 	const hasPendingDownload = $derived(downloads.some((job) => isActiveDownloadStatus(job.status)));
 	const selectedModels = $derived(models.filter((model) => selectedLocalIds.includes(model.id)));
 	const pendingSelectedIds = $derived(selectedLocalIds.filter((id) => !hasHistoricModelResult(id)));
-	const selectableModels = $derived(models.filter((model) => Boolean(model.path)));
+	const selectableModels = $derived(models.filter((model) => model.loadable !== false && Boolean(model.path)));
 	const planModels = $derived(uniqueStrings(plan.map((item) => item.model)).length);
 	const targetContext = $derived(contextOptions.find((item) => item.value === contextSize));
 	const readyToRun = $derived(pendingSelectedIds.length > 0 && !running);

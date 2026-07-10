@@ -458,28 +458,6 @@ static std::optional<json::iterator> find_model_entry(json & models, const std::
     return std::nullopt;
 }
 
-static json model_meta_json(const server_model_meta & meta) {
-    const std::string path = model_path_from_meta(meta);
-    json out = {
-        {"id", meta.name},
-        {"name", meta.name},
-        {"source", server_model_source_to_string(meta.source)},
-        {"status", server_model_status_to_string(meta.status)},
-        {"path", path.empty() ? json(nullptr) : json(path)},
-        {"hf_repo", hf_repo_from_meta(meta).empty() ? json(nullptr) : json(hf_repo_from_meta(meta))},
-        {"tags", json::array()},
-    };
-    for (const auto & tag : meta.tags) out["tags"].push_back(tag);
-    if (!path.empty() && std::filesystem::exists(path)) {
-        try {
-            out["plan_meta"] = caliber::read_gguf_plan_meta(path);
-        } catch (...) {
-            out["plan_meta_error"] = "failed to read GGUF metadata";
-        }
-    }
-    return out;
-}
-
 static json default_plan_cfg() {
     return {
         {"hardware", {
@@ -660,12 +638,26 @@ struct server_caliber_advisor_routes::impl {
             metas.push_back(caliber::read_gguf_plan_meta(requested_path));
             return metas;
         }
-        for (const auto & meta : router.models.get_all_meta()) {
-            if (!requested.empty() && requested != meta.name) continue;
-            if (!requested_models.empty() && !requested_models.count(meta.name)) continue;
-            const std::string path = model_path_from_meta(meta);
-            if (path.empty() || !std::filesystem::exists(path)) continue;
-            metas.push_back(caliber::read_gguf_plan_meta(path));
+        const json registry = router.scan_model_registry(false);
+        if (!registry.contains("artifacts") || !registry["artifacts"].is_array()) return metas;
+        for (const auto & artifact : registry["artifacts"]) {
+            if (!artifact.value("loadable", false)) continue;
+            const std::string artifact_id = json_value(artifact, "artifact_id", std::string());
+            bool configured_match = false;
+            if (artifact.contains("configured_ids") && artifact["configured_ids"].is_array()) {
+                for (const auto & id : artifact["configured_ids"]) {
+                    if (id.is_string() && (id.get<std::string>() == requested || requested_models.count(id.get<std::string>()))) configured_match = true;
+                }
+            }
+            if (!requested.empty() && requested != artifact_id && !configured_match) continue;
+            if (!requested_models.empty() && !requested_models.count(artifact_id) && !configured_match) continue;
+            json meta = json_value(artifact, "metadata", json::object());
+            meta["path"] = json_value(artifact, "primary_path", std::string());
+            meta["artifact_id"] = artifact_id;
+            meta["model_id"] = json_value(artifact, "model_id", std::string());
+            meta["preset_id"] = json_value(artifact, "preset_id", std::string());
+            meta["mmproj"] = artifact.value("mmproj_path", json(nullptr));
+            metas.push_back(std::move(meta));
         }
         return metas;
     }
@@ -690,7 +682,28 @@ struct server_caliber_advisor_routes::impl {
         if (!req.get_param("reload").empty()) router.models.load_models();
         auto res = std::make_unique<server_http_res>();
         json models = json::array();
-        for (const auto & meta : router.models.get_all_meta()) models.push_back(model_meta_json(meta));
+        const json registry = router.scan_model_registry(!req.get_param("reload").empty());
+        if (registry.contains("artifacts") && registry["artifacts"].is_array()) {
+            for (const auto & artifact : registry["artifacts"]) {
+                const bool loadable = artifact.value("loadable", false);
+                models.push_back({
+                    {"id", json_value(artifact, "artifact_id", std::string())},
+                    {"artifact_id", json_value(artifact, "artifact_id", std::string())},
+                    {"model_id", json_value(artifact, "model_id", std::string())},
+                    {"preset_id", json_value(artifact, "preset_id", std::string())},
+                    {"name", json_value(artifact, "name", std::string())},
+                    {"source", "registry"},
+                    {"status", json_value(artifact, "health", std::string())},
+                    {"loadable", loadable},
+                    {"configured", artifact.value("configured", false)},
+                    {"path", loadable ? artifact.value("primary_path", json(nullptr)) : json(nullptr)},
+                    {"plan_meta", artifact.value("metadata", json::object())},
+                    {"missing_shards", artifact.value("missing_shards", json::array())},
+                    {"duplicate_of", artifact.value("duplicate_of", json(nullptr))},
+                    {"redundant_quantization", artifact.value("redundant_quantization", false)},
+                });
+            }
+        }
         res_ok(res, {{"object", "list"}, {"data", models}});
         return res;
     }

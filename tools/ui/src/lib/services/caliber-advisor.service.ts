@@ -7,6 +7,8 @@ export interface CaliberModel {
 	name: string;
 	source: string;
 	status: string;
+	loadable?: boolean;
+	configured?: boolean;
 	path?: string | null;
 	plan_meta?: Record<string, unknown>;
 }

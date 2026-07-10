@@ -1330,33 +1330,26 @@ static std::string tensor_split_from_system(const json & system) {
     return out;
 }
 
-static std::string model_path_from_meta(const server_model_meta & meta) {
-    std::string path;
-    if (meta.preset.get_option("LLAMA_ARG_MODEL", path)) {
-        return path;
-    }
-    return "";
-}
-
-static std::string hf_repo_from_meta(const server_model_meta & meta) {
-    std::string repo;
-    if (meta.preset.get_option("LLAMA_ARG_HF_REPO", repo)) {
-        return repo;
-    }
-    return "";
-}
-
 static json router_installed_index(server_models_routes & router) {
     json installed = json::array();
-    for (const auto & meta : router.models.get_all_meta()) {
-        const std::string path = model_path_from_meta(meta);
-        const std::string repo = hf_repo_from_meta(meta);
+    const json registry = router.scan_model_registry(false);
+    if (!registry.contains("artifacts") || !registry["artifacts"].is_array()) return installed;
+    for (const auto & artifact : registry["artifacts"]) {
+        std::string id = json_value(artifact, "model_id", std::string());
+        if (artifact.contains("configured_ids") && artifact["configured_ids"].is_array() && !artifact["configured_ids"].empty()) {
+            id = artifact["configured_ids"].front().get<std::string>();
+        }
         installed.push_back({
-            {"id", meta.name},
-            {"path", path.empty() ? nullptr : json(path)},
-            {"hf_repo", repo.empty() ? nullptr : json(repo)},
-            {"source", server_model_source_to_string(meta.source)},
-            {"status", server_model_status_to_string(meta.status)},
+            {"id", id},
+            {"artifact_id", json_value(artifact, "artifact_id", std::string())},
+            {"model_id", json_value(artifact, "model_id", std::string())},
+            {"preset_id", json_value(artifact, "preset_id", std::string())},
+            {"path", artifact.value("primary_path", json(nullptr))},
+            {"hf_repo", artifact.value("hf_repo", json(nullptr))},
+            {"source", "registry"},
+            {"status", json_value(artifact, "health", std::string())},
+            {"configured", artifact.value("configured", false)},
+            {"loadable", artifact.value("loadable", false)},
         });
     }
     return installed;

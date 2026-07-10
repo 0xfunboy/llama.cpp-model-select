@@ -688,7 +688,7 @@ json read_gguf_plan_meta(const std::string & path) {
     std::string model = stem;
     std::string variant = "unknown";
     std::smatch m;
-    if (std::regex_search(stem, m, std::regex(R"((.*?)[\.-]((?:UD-)?(?:IQ|Q|F|BF|FP)[A-Za-z0-9_\.-]+)$)", std::regex::icase))) {
+    if (std::regex_search(stem, m, std::regex(R"((.*?)[\.-]((?:UD-)?(?:IQ[1-4][A-Za-z0-9_]*|Q[2-8][A-Za-z0-9_]*|F(?:16|32)|BF16|FP(?:8|16|32)|MXFP4)(?:[\.-].*)?)$)", std::regex::icase))) {
         model = m[1].str();
         variant = m[2].str();
     }
@@ -703,7 +703,10 @@ json read_gguf_plan_meta(const std::string & path) {
     };
     gguf_init_params params = { true, nullptr };
     gguf_context * ctx = gguf_init_from_file(path.c_str(), params);
+    meta["gguf_readable"] = ctx != nullptr;
     if (!ctx) return meta;
+    const json general_name = gguf_scalar(ctx, {"general.name", "general.basename"});
+    if (general_name.is_string() && !general_name.get<std::string>().empty()) meta["model"] = general_name;
     const json arch = gguf_scalar(ctx, {"general.architecture"});
     if (arch.is_string()) {
         const std::string a = arch.get<std::string>();

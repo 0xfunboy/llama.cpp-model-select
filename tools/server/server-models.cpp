@@ -1746,6 +1746,49 @@ static std::optional<server_model_meta> resolve_child_for_conv(
     return std::nullopt;
 }
 
+json server_models_routes::scan_model_registry(bool refresh) {
+    std::vector<std::filesystem::path> roots;
+    if (!params.models_dir.empty()) {
+        roots.emplace_back(params.models_dir);
+    } else if (const char * home = std::getenv("HOME")) {
+        roots.emplace_back(std::filesystem::path(home) / "models");
+    }
+    if (const char * home = std::getenv("HOME")) {
+        const auto hf_cache = std::filesystem::path(home) / ".cache" / "huggingface" / "hub";
+        std::error_code ec;
+        if (std::filesystem::exists(hf_cache, ec)) roots.push_back(hf_cache);
+    }
+
+    std::vector<model_registry::configured_model> configured;
+    for (const auto & meta : models.get_all_meta()) {
+        std::string path;
+        meta.preset.get_option("LLAMA_ARG_MODEL", path);
+        if (path.empty()) continue;
+        configured.push_back({
+            meta.name,
+            path,
+            server_model_source_to_string(meta.source),
+            server_model_status_to_string(meta.status),
+        });
+        const auto parent = std::filesystem::path(path).parent_path();
+        if (!parent.empty()) {
+            std::error_code ec;
+            const auto canonical_parent = std::filesystem::weakly_canonical(parent, ec);
+            bool covered = false;
+            for (const auto & root : roots) {
+                const auto canonical_root = std::filesystem::weakly_canonical(root, ec);
+                const auto relative = std::filesystem::relative(canonical_parent, canonical_root, ec);
+                if (!ec && !relative.empty() && *relative.begin() != "..") {
+                    covered = true;
+                    break;
+                }
+            }
+            if (!covered) roots.push_back(parent);
+        }
+    }
+    return registry.scan(roots, configured, refresh);
+}
+
 void server_models_routes::init_routes() {
     this->get_router_props = [this](const server_http_req & req) {
         std::string name = req.get_param("model");
@@ -1923,6 +1966,12 @@ void server_models_routes::init_routes() {
             {"data", models_json},
             {"object", "list"},
         });
+        return res;
+    };
+
+    this->get_model_registry = [this](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        res_ok(res, scan_model_registry(!req.get_param("refresh", "").empty()));
         return res;
     };
 

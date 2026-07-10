@@ -158,7 +158,7 @@ static std::string isoish_timestamp() {
     return buf;
 }
 
-static json model_meta_to_ds4_json(const server_model_meta & meta) {
+static json model_meta_to_ds4_json(const server_model_meta & meta, const std::string & artifact_id) {
     std::string model_path;
     meta.preset.get_option("LLAMA_ARG_MODEL", model_path);
 
@@ -170,6 +170,7 @@ static json model_meta_to_ds4_json(const server_model_meta & meta) {
 
     return {
         {"id", meta.name},
+        {"artifact_id", artifact_id.empty() ? json(nullptr) : json(artifact_id)},
         {"aliases", meta.aliases},
         {"tags", meta.tags},
         {"path", model_path},
@@ -2046,8 +2047,11 @@ void server_ds4_routes::init_routes() {
             {"tags", json::array({"batch"})},
             {"aliases", json::array()},
         });
+        const json registry = p->router.scan_model_registry(!req.get_param("reload", "").empty());
         for (const auto & meta : p->router.models.get_all_meta()) {
-            models.push_back(model_meta_to_ds4_json(meta));
+            std::string model_path;
+            meta.preset.get_option("LLAMA_ARG_MODEL", model_path);
+            models.push_back(model_meta_to_ds4_json(meta, model_registry::artifact_id_for_path(registry, model_path)));
         }
         ds4_res_ok(res, {{"data", models}, {"object", "list"}});
         return res;

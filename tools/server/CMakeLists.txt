@@ -42,6 +42,8 @@ add_library(${TARGET}
     caliber-plan.h
     caliber-scoring.cpp
     caliber-scoring.h
+    model-registry.cpp
+    model-registry.h
     server-caliber-advisor.cpp
     server-caliber-advisor.h
     server.cpp
@@ -102,6 +104,25 @@ if(LLAMA_BUILD_TESTS)
 
     add_test(NAME caliber-scoring COMMAND test-caliber-scoring)
     add_test(NAME caliber-plan COMMAND test-caliber-plan)
+
+    add_executable(test-model-registry
+        tests/test-model-registry.cpp
+        model-registry.cpp
+        model-registry.h
+        caliber-plan.cpp
+        caliber-plan.h
+        caliber-scoring.cpp
+        caliber-scoring.h
+    )
+    target_compile_features(test-model-registry PRIVATE cxx_std_17)
+    target_include_directories(test-model-registry PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_SOURCE_DIR}
+        ${CMAKE_SOURCE_DIR}/vendor
+        ${CMAKE_SOURCE_DIR}/ggml/include
+    )
+    target_link_libraries(test-model-registry PRIVATE ggml)
+    add_test(NAME model-registry COMMAND test-model-registry)
 endif()
 
 # llama-server executable
