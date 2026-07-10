@@ -3,6 +3,8 @@
 #include "server-models.h"
 #include "server-context.h"
 #include "server-stream.h"
+#include "server-persistence.h"
+#include "least-cost-router.h"
 
 #include "build-info.h"
 #include "preset.h"
@@ -1280,7 +1282,7 @@ bool server_models::ensure_model_ready(const std::string & name) {
     return true;
 }
 
-server_http_res_ptr server_models::proxy_request(const server_http_req & req, const std::string & method, const std::string & name, bool update_last_used) {
+server_http_res_ptr server_models::proxy_request(const server_http_req & req, const std::string & method, const std::string & name, bool update_last_used, const std::string & body_override) {
     auto meta = get_meta(name);
     if (!meta.has_value()) {
         throw std::runtime_error("model name=" + name + " is not found");
@@ -1304,7 +1306,7 @@ server_http_res_ptr server_models::proxy_request(const server_http_req & req, co
             meta->port,
             proxy_path,
             req.headers,
-            req.body,
+            body_override.empty() ? req.body : body_override,
             req.files,
             req.should_stop,
             base_params.timeout_read,
@@ -1857,8 +1859,44 @@ void server_models_routes::init_routes() {
         std::string method = "POST";
         json body = json::parse(req.body);
         std::string name = json_value(body, "model", std::string());
-        bool autoload = is_autoload(params, req);
         auto error_res = std::make_unique<server_http_res>();
+        std::string routed_body;
+        json route_decision;
+        if (least_cost_router::is_virtual_alias(name)) {
+            const std::string requested_alias = name;
+            const json registry_snapshot = scan_model_registry(false);
+            std::vector<json> candidates;
+            for (const auto & meta : models.get_all_meta()) {
+                std::string model_path;
+                meta.preset.get_option("LLAMA_ARG_MODEL", model_path);
+                candidates.push_back({
+                    {"model", meta.name},
+                    {"artifact_id", model_registry::artifact_id_for_path(registry_snapshot, model_path)},
+                    {"resident", meta.is_running()},
+                    {"vision", meta.multimodal.inp_vision},
+                    {"audio", meta.multimodal.inp_audio},
+                    {"tags", meta.tags},
+                });
+            }
+            std::vector<json> reports;
+            for (const auto & report : server_persistence::load_reports("caliber-advisor")) reports.push_back(report);
+            const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            const json decision = least_cost_router::select(
+                requested_alias, body, candidates, reports, server_persistence::load_route_events(100), now_ms);
+            if (!decision.value("ok", false)) {
+                res_err(error_res, format_error_response(decision.value("reason", std::string("no eligible local model")), ERROR_TYPE_UNAVAILABLE));
+                const json route_error = {{"error", json::parse(error_res->data).value("error", json::object())}, {"route", decision}};
+                error_res->data = safe_json_to_str(route_error);
+                return error_res;
+            }
+            route_decision = decision;
+            name = decision.value("selected_model", std::string());
+            body["model"] = name;
+            routed_body = body.dump();
+            SRV_INF("virtual model %s selected %s: %s\n", requested_alias.c_str(), name.c_str(), decision.value("reason", std::string()).c_str());
+        }
+        bool autoload = is_autoload(params, req);
         if (autoload) {
             router_switch_guard guard(*this);
             if (auto wait_res = start_switch_or_wait(*this, req, guard)) {
@@ -1872,13 +1910,14 @@ void server_models_routes::init_routes() {
                 return error_res;
             }
         }
+        if (route_decision.is_object()) server_persistence::record_route_decision(route_decision);
         // remember which child serves this conversation so the stream routes can route straight
         // to it without polling, keyed on the exact conv id from the header
         std::string conv_id = stream_conv_id_from_headers(req.headers);
         if (!conv_id.empty()) {
             models.conv_models.remember(conv_id, name);
         }
-        auto response = models.proxy_request(req, method, name, true); // update last usage for POST request only
+        auto response = models.proxy_request(req, method, name, true, routed_body); // update last usage for POST request only
         if (auto * proxy = dynamic_cast<server_http_proxy *>(response.get())) {
             auto cleanup = proxy->cleanup;
             proxy->cleanup = [cleanup, operation]() {
@@ -1976,6 +2015,16 @@ void server_models_routes::init_routes() {
             }
             models_json.push_back(model_info);
         }
+        const json virtual_aliases = least_cost_router::aliases();
+        for (const auto & [alias, policy] : virtual_aliases.items()) {
+            models_json.push_back({
+                {"id", alias}, {"aliases", json::array()}, {"tags", json::array({"virtual", "least-cost"})},
+                {"object", "model"}, {"owned_by", "llamacpp-local-router"}, {"created", t},
+                {"status", {{"value", "virtual"}}},
+                {"architecture", {{"input_modalities", alias == "local-vision" ? json::array({"text", "image"}) : json::array({"text"})}, {"output_modalities", json::array({"text"})}}},
+                {"source", "virtual"}, {"can_remove", false}, {"routing_policy", policy},
+            });
+        }
         res_ok(res, {
             {"data", models_json},
             {"object", "list"},
@@ -2067,6 +2116,35 @@ void server_models_routes::init_routes() {
             {"reload",   reload},
             {"unloaded", to_unload},
         });
+        return res;
+    };
+
+    this->get_virtual_aliases = [](const server_http_req &) {
+        auto res = std::make_unique<server_http_res>();
+        res_ok(res, {{"object", "virtual-model-list"}, {"aliases", least_cost_router::aliases()},
+            {"policy", {{"id", "local-least-cost"}, {"version", 1}}}});
+        return res;
+    };
+
+    this->get_router_decisions = [](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        int limit = 100;
+        try { if (!req.get_param("limit").empty()) limit = std::stoi(req.get_param("limit")); } catch (...) {}
+        res_ok(res, {{"object", "route-event-list"}, {"data", server_persistence::load_route_events(limit)}});
+        return res;
+    };
+
+    this->post_router_feedback = [this](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        if (!require_admin_api_key(req, params, res)) return res;
+        const json body = req.body.empty() ? json::object() : json::parse(req.body);
+        const std::string decision_id = json_value(body, "decision_id", std::string());
+        if (decision_id.empty()) {
+            res_err(res, format_error_response("decision_id is required", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        server_persistence::record_route_feedback(decision_id, body);
+        res_ok(res, {{"saved", true}, {"decision_id", decision_id}});
         return res;
     };
 

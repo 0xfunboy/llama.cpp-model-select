@@ -86,10 +86,16 @@ int main() {
     server_persistence::delete_report("caliber-advisor", "fast");
     require(scalar_text("SELECT report_id FROM best_results WHERE module='caliber-advisor'") == "slow", "deleting winner promotes next result");
 
+    server_persistence::record_route_decision({{"id", "route-1"}, {"alias", "local-auto"}, {"selected_model", "gguf-test"}, {"api_key", "must-not-export"}});
+    server_persistence::record_route_feedback("route-1", {{"rating", 1}, {"note", "worked"}});
+    const json route_events = server_persistence::load_route_events();
+    require(route_events.size() == 2 && route_events.at(0).at("event_type") == "feedback", "route decisions and feedback persist locally");
+
     server_persistence::record_configuration("caliber-advisor", "gguf-test", "preset", {{"model_path", "/home/person/models/model.gguf"}});
     const std::function<bool()> stop = []() { return false; };
     auto export_response = server_persistence::handle_archive_export(request_with_body("", stop));
     require(export_response->data.find("super-secret") == std::string::npos, "archive omits secrets");
+    require(export_response->data.find("must-not-export") == std::string::npos, "route event secrets are redacted");
     require(export_response->data.find("/home/person") == std::string::npos, "archive omits host paths");
     const json archive = json::parse(export_response->data);
     require(!archive.contains("database_path"), "archive omits database path");

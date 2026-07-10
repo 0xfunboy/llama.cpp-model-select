@@ -251,7 +251,7 @@ public:
     bool ensure_model_ready(const std::string & name);
 
     // proxy an HTTP request to the model instance
-    server_http_res_ptr proxy_request(const server_http_req & req, const std::string & method, const std::string & name, bool update_last_used);
+    server_http_res_ptr proxy_request(const server_http_req & req, const std::string & method, const std::string & name, bool update_last_used, const std::string & body_override = {});
 
     // handle message sent from server_child::notify_to_router()
     // raw input must starts with CMD_CHILD_TO_ROUTER_STATE, followed by a JSON string
@@ -324,6 +324,9 @@ struct server_models_routes {
     server_http_context::handler_t get_admin_models;
     server_http_context::handler_t get_model_registry;
     server_http_context::handler_t post_admin_switch;
+    server_http_context::handler_t get_router_decisions;
+    server_http_context::handler_t get_virtual_aliases;
+    server_http_context::handler_t post_router_feedback;
 
     // router side handlers for the resumable streaming routes. each resolves the child that owns
     // a conversation through the conv_id -> model map, no probing or fan out

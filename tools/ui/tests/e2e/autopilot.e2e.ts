@@ -99,6 +99,24 @@ async function mockProductApi(page: Page) {
 		if (url.pathname === '/api/fit-advisor/downloads') return route.fulfill({ json: { data: [] } });
 		if (url.pathname === '/api/fit-advisor/downloads/sse')
 			return route.fulfill({ status: 200, contentType: 'text/event-stream', body: '' });
+		if (url.pathname === '/api/router/decisions')
+			return route.fulfill({
+				json: {
+					object: 'route-event-list',
+					data: [
+						{
+							event_type: 'decision',
+							object_id: 'route-1',
+							created_at: '2026-07-10T20:00:00Z',
+							payload: {
+								alias: 'local-auto',
+								selected_model: winner.model,
+								reason: 'Qualified resident model avoided a switch.'
+							}
+						}
+					]
+				}
+			});
 		if (url.pathname === '/props')
 			return route.fulfill({ json: { model_path: '', modalities: {} } });
 		if (url.pathname === '/models') return route.fulfill({ json: { data: [], object: 'list' } });
@@ -135,6 +153,8 @@ test('guided flow exposes one qualified answer and three alternatives', async ({
 	await expect(page.getByText('Alternative 3')).toBeVisible();
 	await expect(page.getByText('Streaming timeline')).toBeVisible();
 	await expect(page.getByText('Metric glossary')).toBeVisible();
+	await page.getByRole('button', { name: 'Router', exact: true }).click();
+	await expect(page.getByText('Qualified resident model avoided a switch.')).toBeVisible();
 });
 
 test('mobile product navigation wraps without horizontal overflow', async ({ page }) => {

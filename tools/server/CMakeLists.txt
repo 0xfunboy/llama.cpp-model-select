@@ -46,6 +46,8 @@ add_library(${TARGET}
     model-registry.h
     model-operations.cpp
     model-operations.h
+    least-cost-router.cpp
+    least-cost-router.h
     quality-evidence.cpp
     quality-evidence.h
     streaming-profiler.cpp
@@ -149,6 +151,11 @@ if(LLAMA_BUILD_TESTS)
     target_compile_features(test-quality-evidence PRIVATE cxx_std_17)
     target_include_directories(test-quality-evidence PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/vendor)
     add_test(NAME quality-evidence COMMAND test-quality-evidence)
+
+    add_executable(test-least-cost-router tests/test-least-cost-router.cpp least-cost-router.cpp)
+    target_compile_features(test-least-cost-router PRIVATE cxx_std_17)
+    target_include_directories(test-least-cost-router PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/vendor)
+    add_test(NAME least-cost-router COMMAND test-least-cost-router)
 endif()
 
 # llama-server executable

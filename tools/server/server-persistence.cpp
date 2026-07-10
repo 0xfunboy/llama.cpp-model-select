@@ -1087,6 +1087,35 @@ void record_job(const std::string & module, const std::string & id, const std::s
     }
 }
 
+void record_route_decision(const json & decision) {
+    std::lock_guard<std::mutex> guard(g_mutex);
+    auto db = open_database_locked();
+    insert_event_locked(db.db, "least-cost-router", "decision", first_string(decision, {"id"}), decision);
+}
+
+void record_route_feedback(const std::string & decision_id, const json & feedback) {
+    std::lock_guard<std::mutex> guard(g_mutex);
+    auto db = open_database_locked();
+    insert_event_locked(db.db, "least-cost-router", "feedback", decision_id, feedback);
+}
+
+json load_route_events(int limit) {
+    std::lock_guard<std::mutex> guard(g_mutex);
+    auto db = open_database_locked();
+    limit = std::clamp(limit, 1, 1000);
+    auto stmt = prepare(db.db,
+        "SELECT event_type, object_id, created_at, payload_json FROM events "
+        "WHERE module='least-cost-router' ORDER BY rowid DESC LIMIT ?;");
+    sqlite3_bind_int(stmt.stmt, 1, limit);
+    json events = json::array();
+    while (sqlite3_step(stmt.stmt) == SQLITE_ROW) {
+        json payload = col_json(stmt.stmt, 3);
+        events.push_back(json{{"event_type", col_text(stmt.stmt, 0)}, {"object_id", col_text(stmt.stmt, 1)},
+            {"created_at", col_text(stmt.stmt, 2)}, {"payload", payload}});
+    }
+    return events;
+}
+
 server_http_res_ptr handle_archive_status(const server_http_req &) {
     import_existing_reports_once();
     auto res = std::make_unique<server_http_res>();

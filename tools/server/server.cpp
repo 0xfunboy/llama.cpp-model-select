@@ -210,6 +210,9 @@ int llama_server(int argc, char ** argv) {
         ctx_http.get ("/admin/models",         ex_wrapper(models_routes->get_admin_models));
         ctx_http.post("/admin/switch",         ex_wrapper(models_routes->post_admin_switch));
         ctx_http.get ("/api/model-registry",   ex_wrapper(models_routes->get_model_registry));
+        ctx_http.get ("/api/router/aliases",   ex_wrapper(models_routes->get_virtual_aliases));
+        ctx_http.get ("/api/router/decisions", ex_wrapper(models_routes->get_router_decisions));
+        ctx_http.post("/api/router/feedback",  ex_wrapper(models_routes->post_router_feedback));
 
         ds4_routes.emplace(*models_routes);
         ctx_http.get ("/api/ds4/models",           ex_wrapper(ds4_routes->get_models));

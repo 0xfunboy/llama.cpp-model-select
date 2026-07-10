@@ -32,6 +32,7 @@
 		type FitAdvisorModel,
 		type FitAdvisorSystem
 	} from '$lib/services/fit-advisor.service';
+	import { RouterService, type LocalRouteEvent } from '$lib/services/router.service';
 
 	type TabId =
 		| 'home'
@@ -179,6 +180,7 @@
 	let error = $state('');
 	let message = $state('');
 	let loadAfterConfigure = $state(false);
+	let routeEvents = $state<LocalRouteEvent[]>([]);
 
 	let fitSystem = $state<FitAdvisorSystem | null>(null);
 	let catalogModels = $state<FitAdvisorModel[]>([]);
@@ -256,6 +258,7 @@
 		void loadCatalog();
 		void refreshDownloads();
 		void restoreActiveSweep();
+		void refreshRouteEvents();
 		startDownloadStream();
 	});
 
@@ -710,6 +713,14 @@
 
 	function pushEvent(line: string) {
 		eventLog = [`${new Date().toLocaleTimeString()} ${line}`, ...eventLog].slice(0, 80);
+	}
+
+	async function refreshRouteEvents() {
+		try {
+			routeEvents = (await RouterService.localRouteEvents()).data;
+		} catch {
+			routeEvents = [];
+		}
 	}
 
 	function sweepIsLive(snapshot: CaliberSweepStatus | null): boolean {
@@ -2223,10 +2234,26 @@
 					<div><code>{alias[0]}</code><span>{alias[1]}</span><a href="#/">Use in chat</a></div>
 				{/each}
 			</div>
-			<p class="note">
-				Route decisions and their evidence appear here after the least-cost policy has handled
-				traffic.
-			</p>
+			<div class="route-log">
+				<div class="panel-head">
+					<div>
+						<h3>Recent route decisions</h3>
+						<p>Inspectable local policy evidence; prompt content is not stored.</p>
+					</div>
+					<button type="button" onclick={refreshRouteEvents}><RefreshCw size={15} />Refresh</button>
+				</div>
+				{#if routeEvents.filter((event) => event.event_type === 'decision').length > 0}
+					{#each routeEvents.filter((event) => event.event_type === 'decision') as event (event.object_id)}
+						<div class="route-row">
+							<code>{String(event.payload.alias ?? '-')}</code><strong
+								>{String(event.payload.selected_model ?? '-')}</strong
+							><span>{String(event.payload.reason ?? '-')}</span><small>{event.created_at}</small>
+						</div>
+					{/each}
+				{:else}
+					<p class="empty">No virtual-alias traffic has been routed yet.</p>
+				{/if}
+			</div>
 		</section>
 	{/if}
 
@@ -3151,6 +3178,24 @@
 		gap: 10px;
 	}
 
+	.route-log {
+		border: 1px solid var(--border);
+		border-radius: var(--radius);
+	}
+
+	.route-row {
+		display: grid;
+		grid-template-columns: 110px minmax(180px, 0.6fr) minmax(280px, 1fr) 160px;
+		gap: 12px;
+		align-items: center;
+		border-top: 1px solid var(--border);
+		padding: 10px 12px;
+	}
+
+	.route-row small {
+		color: var(--muted-foreground);
+	}
+
 	.report-section {
 		display: grid;
 		gap: 12px;
@@ -3410,7 +3455,8 @@
 		.intent-controls,
 		.answer-metrics,
 		.evidence-badges,
-		.load-curves > div {
+		.load-curves > div,
+		.route-row {
 			grid-template-columns: 1fr;
 		}
 

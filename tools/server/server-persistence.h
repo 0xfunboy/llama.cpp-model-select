@@ -32,6 +32,9 @@ void record_download(const json & snapshot);
 void record_fit_recommendations(const json & response);
 void record_configuration(const std::string & module, const std::string & model_id, const std::string & preset_id, const json & payload);
 void record_job(const std::string & module, const std::string & id, const std::string & status, const json & payload);
+void record_route_decision(const json & decision);
+void record_route_feedback(const std::string & decision_id, const json & feedback);
+json load_route_events(int limit = 200);
 
 server_http_res_ptr handle_archive_status(const server_http_req & req);
 server_http_res_ptr handle_archive_export(const server_http_req & req);
