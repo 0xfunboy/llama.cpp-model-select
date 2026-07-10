@@ -4,6 +4,7 @@
 #include "caliber-scoring.h"
 #include "server-common.h"
 #include "server-models.h"
+#include "server-persistence.h"
 
 #include <algorithm>
 #include <array>
@@ -251,25 +252,71 @@ static std::string normalized_tensor_split(std::string value) {
     return value;
 }
 
-static std::vector<std::string> llama_bench_args_for_item(const json & item, const json & cfg) {
+struct llama_bench_dims {
+    int requested_context = 0;
+    int allocated_context = 0;
+    int prompt_tokens = 512;
+    int generate_tokens = 128;
+    int depth_tokens = 0;
+};
+
+static int requested_context_for_item(const json & item, const json & cfg) {
+    const std::vector<std::string> source = split_cli_args(json_value(item, "extra_args", std::string()));
+    const int ctx = arg_int_value(source, {"--ctx-size", "-c"}, 0);
+    if (ctx <= 0) return 0;
+    const int model_cap = json_value(item, "gguf_context_length", 0);
+    const int global_cap = json_value(cfg, "max_context_cap", 0);
+    int capped = ctx;
+    if (model_cap > 0) capped = std::min(capped, model_cap);
+    if (global_cap > 0) capped = std::min(capped, global_cap);
+    return std::max(0, capped);
+}
+
+static llama_bench_dims llama_bench_dims_for_item(const json & item, const json & cfg) {
+    llama_bench_dims dims;
+    dims.requested_context = requested_context_for_item(item, cfg);
+    dims.generate_tokens = json_value(json_value(cfg, "bench", json::object()), "n_predict", 128);
+    dims.generate_tokens = std::max(1, dims.generate_tokens);
+
+    const std::string workload = json_value(item, "workload_kind", std::string("baseline"));
+    const int ctx = dims.requested_context > 0 ? dims.requested_context : 8192;
+    if (workload == "prefill") {
+        const int target = json_value(item, "prefill_target_tokens", 0);
+        dims.prompt_tokens = target > 0 ? target : std::min(std::max(2048, ctx / 4), std::max(512, ctx - 512));
+    } else if (workload == "kv-fill") {
+        const int target = json_value(item, "kv_fill_target_tokens", 0);
+        dims.prompt_tokens = 512;
+        dims.depth_tokens = target > 0 ? target : std::min(std::max(2048, (ctx * 3) / 4), std::max(0, ctx - dims.prompt_tokens - dims.generate_tokens));
+    }
+
+    if (dims.requested_context > 0) {
+        const int max_prompt = std::max(1, dims.requested_context - dims.generate_tokens);
+        dims.prompt_tokens = std::min(std::max(1, dims.prompt_tokens), max_prompt);
+        const int max_depth = std::max(0, dims.requested_context - dims.prompt_tokens - dims.generate_tokens);
+        dims.depth_tokens = std::min(std::max(0, dims.depth_tokens), max_depth);
+    }
+    dims.allocated_context = dims.prompt_tokens + dims.generate_tokens + dims.depth_tokens;
+    return dims;
+}
+
+static std::vector<std::string> llama_bench_args_for_item(const json & item, const json & cfg, llama_bench_dims & dims) {
     const std::vector<std::string> source = split_cli_args(json_value(item, "extra_args", std::string()));
     const std::string model_path = json_value(item, "model_path", json_value(item, "path", std::string()));
     if (model_path.empty()) throw std::runtime_error("plan item has no model path");
-    const std::string workload = json_value(item, "workload_kind", std::string("baseline"));
-    const int ctx = arg_int_value(source, {"--ctx-size", "-c"}, 8192);
-    const int n_predict = json_value(json_value(cfg, "bench", json::object()), "n_predict", 128);
-    int prompt_tokens = 512;
-    if (workload == "prefill") prompt_tokens = std::min(std::max(2048, ctx / 4), std::max(512, ctx - 512));
-    else if (workload == "kv-fill") prompt_tokens = std::min(std::max(2048, (ctx * 3) / 4), std::max(512, ctx - 512));
+    dims = llama_bench_dims_for_item(item, cfg);
 
     std::vector<std::string> out = {
         "-m", model_path,
         "-o", "json",
         "-r", "1",
         "--no-warmup",
-        "-p", std::to_string(prompt_tokens),
-        "-n", std::to_string(n_predict),
+        "-p", std::to_string(dims.prompt_tokens),
+        "-n", std::to_string(dims.generate_tokens),
     };
+    if (dims.depth_tokens > 0) {
+        out.push_back("-d");
+        out.push_back(std::to_string(dims.depth_tokens));
+    }
 
     auto push_value = [&](const std::string & dst, const std::vector<std::string> & names, bool tensor_split = false) {
         std::string value = arg_value(source, names);
@@ -292,8 +339,21 @@ static std::vector<std::string> llama_bench_args_for_item(const json & item, con
     return out;
 }
 
+static json first_bench_row(const json & rows, bool generation) {
+    if (!rows.is_array()) return nullptr;
+    for (const auto & row : rows) {
+        if (!row.is_object()) continue;
+        const int prompt = json_value(row, "n_prompt", 0);
+        const int gen = json_value(row, "n_gen", 0);
+        if (generation && gen > 0) return row;
+        if (!generation && prompt > 0 && gen == 0) return row;
+    }
+    return nullptr;
+}
+
 static json run_llama_bench_item(const json & item, const json & cfg) {
-    const auto args = llama_bench_args_for_item(item, cfg);
+    llama_bench_dims dims;
+    const auto args = llama_bench_args_for_item(item, cfg, dims);
     std::string command = shell_quote((current_executable_dir() / "llama-bench").string());
     for (const auto & arg : args) command += " " + shell_quote(arg);
     int exit_code = 0;
@@ -303,12 +363,31 @@ static json run_llama_bench_item(const json & item, const json & cfg) {
     if (!parsed.is_array() || parsed.empty() || !parsed[0].is_object()) {
         throw std::runtime_error("llama-bench returned no result rows");
     }
-    json bench = parsed[0];
+    const json prompt_row = first_bench_row(parsed, false);
+    const json gen_row = first_bench_row(parsed, true);
+    if (!prompt_row.is_object() && !gen_row.is_object()) {
+        throw std::runtime_error("llama-bench returned neither prompt nor generation rows");
+    }
+    json bench = gen_row.is_object() ? gen_row : prompt_row;
     json run = bench;
     run["ok"] = true;
-    run["eval_tps"] = json_value(bench, "avg_ts", 0.0);
-    run["prompt_tps"] = 0;
-    run["ctx_size"] = arg_int_value(split_cli_args(json_value(item, "extra_args", std::string())), {"--ctx-size", "-c"}, 8192);
+    run["eval_tps"] = gen_row.is_object() ? json_value(gen_row, "avg_ts", 0.0) : 0.0;
+    run["prompt_tps"] = prompt_row.is_object() ? json_value(prompt_row, "avg_ts", 0.0) : 0.0;
+    run["prompt_n"] = prompt_row.is_object() ? json_value(prompt_row, "n_prompt", dims.prompt_tokens) : dims.prompt_tokens;
+    run["eval_n"] = gen_row.is_object() ? json_value(gen_row, "n_gen", dims.generate_tokens) : 0;
+    run["n_prompt"] = dims.prompt_tokens;
+    run["n_gen"] = dims.generate_tokens;
+    run["n_depth"] = dims.depth_tokens;
+    run["ctx_size"] = dims.requested_context > 0 ? dims.requested_context : dims.allocated_context;
+    run["requested_context_size"] = dims.requested_context > 0 ? json(dims.requested_context) : json(nullptr);
+    run["benchmark_allocated_context_size"] = dims.allocated_context;
+    run["benchmark_depth_tokens"] = dims.depth_tokens;
+    run["benchmark_prompt_tokens"] = dims.prompt_tokens;
+    run["benchmark_generate_tokens"] = dims.generate_tokens;
+    run["benchmark_rows"] = parsed;
+    if (prompt_row.is_object()) run["llama_bench_prompt_row"] = prompt_row;
+    if (gen_row.is_object()) run["llama_bench_generation_row"] = gen_row;
+    run["benchmark_note"] = "llama-bench synthetic benchmark; eval_tps is the tg row, prompt_tps is the pp row";
     const double model_size_bytes = json_value(bench, "model_size", 0.0);
     if (model_size_bytes > 0) run["vram_peak_mib"] = model_size_bytes / 1024.0 / 1024.0;
     if (!run.contains("shared_peak_mib")) run["shared_peak_mib"] = 0;
@@ -391,6 +470,38 @@ static json report_summary(const json & report, const std::filesystem::path & pa
         {"rows", report.contains("rows") && report["rows"].is_array() ? report["rows"].size() : 0},
         {"path", path.string()},
     };
+}
+
+static bool is_legacy_invalid_llama_bench_row(const json & row) {
+    if (json_value(row, "benchmark_backend", std::string()) != "llama-bench") return false;
+    if (row.contains("benchmark_note") || row.contains("benchmark_allocated_context_size")) return false;
+    const bool missing_ctx = !row.contains("ctx_size") || row["ctx_size"].is_null() || json_value(row, "ctx_size", 0) <= 0;
+    const bool no_prompt_metric = json_value(row, "prompt_tps", 0.0) <= 0.0;
+    bool first_run_is_prompt_only = false;
+    if (row.contains("runs") && row["runs"].is_array() && !row["runs"].empty() && row["runs"][0].is_object()) {
+        first_run_is_prompt_only = json_value(row["runs"][0], "n_prompt", 0) > 0 && json_value(row["runs"][0], "n_gen", 0) == 0;
+    }
+    return missing_ctx && (no_prompt_metric || first_run_is_prompt_only);
+}
+
+static json normalize_report_for_api(json report) {
+    if (!report.contains("rows") || !report["rows"].is_array()) return report;
+    int invalid = 0;
+    for (auto & row : report["rows"]) {
+        if (!row.is_object() || !is_legacy_invalid_llama_bench_row(row)) continue;
+        row["ok"] = false;
+        row["eval_tps"] = 0;
+        row["measurement_confidence"] = "invalid";
+        row["failure_reason"] = "legacy_invalid_llama_bench_prompt_row";
+        row["recommendation"] = "rerun-required";
+        row["recommendation_reason"] = "This row was produced before llama-bench prompt/generation rows were separated; rerun the benchmark.";
+        ++invalid;
+    }
+    if (invalid > 0) {
+        report["legacy_invalid_rows"] = invalid;
+        report["status_note"] = "Contains legacy invalid llama-bench rows; rerun required for comparison/FIT.";
+    }
+    return report;
 }
 
 } // namespace
@@ -524,10 +635,12 @@ struct server_caliber_advisor_routes::impl {
                         publish(job, "row", {{"ok", true}, {"item", json_value(item, "id", json_value(item, "label", std::string()))}, {"eval_tps", json_value(row, "eval_tps", 0.0)}});
                     } catch (const std::exception & e) {
                         json row = item;
+                        const int requested_ctx = requested_context_for_item(item, payload["cfg"]);
                         row["ok"] = false;
                         row["failure_reason"] = e.what();
                         row["eval_tps"] = 0;
-                        row["ctx_size"] = caliber::context_size_from_args(json_value(item, "extra_args", std::string()));
+                        row["ctx_size"] = requested_ctx > 0 ? requested_ctx : caliber::context_size_from_args(json_value(item, "extra_args", std::string()));
+                        row["requested_context_size"] = requested_ctx > 0 ? json(requested_ctx) : json(nullptr);
                         row["shared_peak_mib"] = 0;
                         row["vram_peak_mib"] = 0;
                         rows.push_back(row);
@@ -560,7 +673,16 @@ struct server_caliber_advisor_routes::impl {
                     {"rows", rows},
                     {"winners", winners},
                 };
-                write_text_file(reports_dir() / (report_id + ".json"), report.dump(2) + "\n");
+                const auto report_path = reports_dir() / (report_id + ".json");
+                write_text_file(report_path, report.dump(2) + "\n");
+                server_persistence::record_report(
+                    "caliber-advisor",
+                    report_id,
+                    "campaign",
+                    json_value(report, "status", std::string()),
+                    json_value(report, "model", std::string()),
+                    report_path,
+                    report);
                 {
                     std::lock_guard<std::mutex> lock(job->mutex);
                     job->status = "completed";
@@ -668,7 +790,7 @@ struct server_caliber_advisor_routes::impl {
             res_err(res, "report not found", 404);
             return res;
         }
-        res_ok(res, json::parse(read_text_file(path)));
+        res_ok(res, normalize_report_for_api(json::parse(read_text_file(path))));
         return res;
     }
 
@@ -682,6 +804,7 @@ struct server_caliber_advisor_routes::impl {
         const auto path = reports_dir() / (slugify(id) + ".json");
         bool removed = false;
         if (std::filesystem::exists(path)) removed = std::filesystem::remove(path);
+        if (removed) server_persistence::delete_report("caliber-advisor", slugify(id));
         res_ok(res, {{"success", removed}, {"id", id}});
         return res;
     }
@@ -694,7 +817,7 @@ struct server_caliber_advisor_routes::impl {
         for (const auto & entry : std::filesystem::directory_iterator(reports_dir())) {
             if (!entry.is_regular_file() || entry.path().extension() != ".json") continue;
             try {
-                json report = json::parse(read_text_file(entry.path()));
+                json report = normalize_report_for_api(json::parse(read_text_file(entry.path())));
                 reports.push_back(report_summary(report, entry.path()));
                 if (report.contains("rows") && report["rows"].is_array()) {
                     for (const auto & row : report["rows"]) all_rows.push_back(row);
@@ -762,7 +885,9 @@ struct server_caliber_advisor_routes::impl {
         router.models.load_models();
         const bool load_now = json_value(body, "load_now", false);
         if (load_now) router.models.load(model);
-        res_ok(res, {{"success", true}, {"model", model}, {"models_preset", preset_path}, {"entry", entry}, {"loaded", load_now}});
+        const json response = {{"success", true}, {"model", model}, {"models_preset", preset_path}, {"entry", entry}, {"loaded", load_now}};
+        server_persistence::record_configuration("caliber-advisor", model, model, response);
+        res_ok(res, response);
         return res;
     }
 };

@@ -259,6 +259,18 @@ bool ctx_allowed(int64_t ctx, int64_t global_cap, int64_t per_model_cap) {
     return true;
 }
 
+int64_t choose_sweep_context(const std::vector<json> & candidates, int64_t global_cap, int64_t per_model_cap, int64_t fallback) {
+    int64_t best = 0;
+    for (const auto & candidate : candidates) {
+        const int64_t ctx = int_value(candidate, "ctx");
+        if (ctx > 0 && ctx_allowed(ctx, global_cap, per_model_cap)) best = std::max(best, ctx);
+    }
+    if (best <= 0) best = fallback;
+    if (global_cap > 0) best = std::min(best, global_cap);
+    if (per_model_cap > 0) best = std::min(best, per_model_cap);
+    return std::max<int64_t>(1024, best);
+}
+
 std::vector<json> matched_vanilla_baselines(const json & meta, const std::string & sweep, const json & level, int64_t ctx, const std::string & kv_k, const std::string & kv_v, const std::string & target_id) {
     std::vector<json> rows = {
         {{"args", "--ctx-size " + std::to_string(ctx)}, {"label", "llama_cpp_matched_ctx=" + std::to_string(ctx) + "_default"}, {"dims", {"ctx"}}, {"reason", "raw llama.cpp constrained to the anchor candidate context"}},
@@ -652,15 +664,17 @@ std::vector<json> invoke_plan(const std::vector<json> & catalog, const json & cf
         } else if (sweep == "moe-cpu") {
             std::vector<int> sweep_values = ints_from_array(planning, "moecpu_sweep");
             if (sweep_values.empty()) sweep_values = {28, 30, 32, 34, 36};
+            const int64_t sweep_ctx = choose_sweep_context(ctx_candidates, global_cap, per_model_cap, 16384);
             for (int n : sweep_values) {
-                const std::string args = "--ctx-size 16384 --gpu-layers 99 --n-cpu-moe " + std::to_string(n) + " --cache-type-k q8_0 --cache-type-v q8_0" + suffix;
+                const std::string args = "--ctx-size " + std::to_string(sweep_ctx) + " --gpu-layers 99 --n-cpu-moe " + std::to_string(n) + " --cache-type-k q8_0 --cache-type-v q8_0" + suffix;
                 plan.push_back(new_plan_item(meta, sweep, level, args, "ncpumoe_" + std::to_string(n), json::object(), nullptr, mmap_policy));
             }
         } else {
             std::vector<int> sweep_values = ints_from_array(planning, "offload_sweep");
             if (sweep_values.empty()) sweep_values = {20, 24, 28, 32, 36};
+            const int64_t sweep_ctx = choose_sweep_context(ctx_candidates, global_cap, per_model_cap, 16384);
             for (int n : sweep_values) {
-                const std::string args = "--ctx-size 16384 --gpu-layers " + std::to_string(n) + " --cache-type-k q8_0 --cache-type-v q8_0" + suffix;
+                const std::string args = "--ctx-size " + std::to_string(sweep_ctx) + " --gpu-layers " + std::to_string(n) + " --cache-type-k q8_0 --cache-type-v q8_0" + suffix;
                 plan.push_back(new_plan_item(meta, sweep, level, args, "ngl_" + std::to_string(n), json::object(), nullptr, mmap_policy));
             }
         }

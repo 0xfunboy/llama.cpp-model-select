@@ -724,7 +724,7 @@
 	<title>{title}</title>
 </svelte:head>
 
-<main class="mx-auto flex min-h-dvh w-full max-w-[92rem] flex-col gap-5 px-4 py-5 md:px-8">
+<main class="flex min-h-dvh w-full flex-col gap-5 px-4 py-5 md:px-8">
 	<header class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
 		<div>
 			<div class="flex items-center gap-2 text-sm text-muted-foreground">

@@ -97,6 +97,50 @@
         "perfect",
         "reasoning"
       ]
+    },
+    {
+      "ctx_size": 65536,
+      "cache_type_k": "q8_0",
+      "cache_type_v": "q8_0",
+      "flash_attn": "on",
+      "threads": 20,
+      "batch_size": 512,
+      "ubatch_size": 512,
+      "load_on_startup": false,
+      "model": "../models/deepseek-coder-33b-base/deepseek-coder-33b-base.Q4_K_M.gguf",
+      "n_gpu_layers": 99,
+      "split_mode": "layer",
+      "tensor_split": "24,24",
+      "id": "deepseek-ai-deepseek-coder-33b-base",
+      "alias": "deepseek-coder-33b-base",
+      "tags": [
+        "33.3B",
+        "Q4_K_M",
+        "good",
+        "coding"
+      ]
+    },
+    {
+      "ctx_size": 131072,
+      "cache_type_k": "q8_0",
+      "cache_type_v": "q8_0",
+      "flash_attn": "on",
+      "threads": 20,
+      "batch_size": 512,
+      "ubatch_size": 512,
+      "load_on_startup": false,
+      "model": "../models/iquest-coder-v1-40b-instruct/IQuest-Coder-V1-40B-Instruct.Q4_K_M.gguf",
+      "n_gpu_layers": 99,
+      "split_mode": "layer",
+      "tensor_split": "24,24",
+      "id": "iquestlab-iquest-coder-v1-40b-instruct",
+      "alias": "IQuest-Coder-V1-40B-Instruct",
+      "tags": [
+        "39.8B",
+        "Q4_K_M",
+        "marginal",
+        "coding"
+      ]
     }
   ]
 }

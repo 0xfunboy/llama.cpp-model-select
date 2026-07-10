@@ -277,7 +277,7 @@
 </svelte:head>
 
 <main class="min-h-screen bg-background text-foreground">
-	<div class="mx-auto flex max-w-[1500px] flex-col gap-5 px-4 py-5 lg:px-6">
+	<div class="flex w-full flex-col gap-5 px-4 py-5 lg:px-6">
 		<header class="flex flex-col gap-3 border-b pb-4 md:flex-row md:items-end md:justify-between">
 			<div>
 				<div class="flex items-center gap-2 text-sm text-muted-foreground">

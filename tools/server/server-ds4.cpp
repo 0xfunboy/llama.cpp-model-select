@@ -3,6 +3,7 @@
 #include "common.h"
 #include "server-common.h"
 #include "server-models.h"
+#include "server-persistence.h"
 
 #include <cpp-httplib/httplib.h>
 
@@ -1151,6 +1152,15 @@ struct server_ds4_routes::impl {
             throw std::runtime_error(string_format("cannot write report '%s'", path.string().c_str()));
         }
         out << snapshot.dump(2) << "\n";
+        const std::string kind = json_value(snapshot, "kind", job->kind);
+        server_persistence::record_report(
+            kind == "bench" ? "ds4-bench" : "ds4-eval",
+            json_value(snapshot, "id", job->id),
+            kind,
+            json_value(snapshot, "status", std::string()),
+            json_value(snapshot, "model_selector", job->model_selector),
+            path,
+            snapshot);
     }
 
     void store_report(const std::shared_ptr<ds4_job> & job, json report) {
@@ -1954,6 +1964,7 @@ struct server_ds4_routes::impl {
         }
 
         const std::string report_id = json_value(report, "id", std::filesystem::path(path).stem().string());
+        const std::string kind = json_value(report, "kind", std::string());
         const std::string status = json_value(report, "status", std::string());
         if (status == "completed" || json_value(report, "resumable", false) == false) {
             ds4_res_err(res, format_error_response("completed or archived DS4 reports cannot be deleted from the pending-report action", ERROR_TYPE_INVALID_REQUEST));
@@ -1972,6 +1983,7 @@ struct server_ds4_routes::impl {
             ds4_res_err(res, format_error_response("failed to delete DS4 report", ERROR_TYPE_SERVER));
             return res;
         }
+        server_persistence::delete_report(kind == "bench" ? "ds4-bench" : "ds4-eval", report_id);
         ds4_res_ok(res, {{"deleted", true}, {"id", report_id}});
         return res;
     }

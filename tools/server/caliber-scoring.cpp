@@ -973,10 +973,17 @@ json derive_result_fields(const json & result, double vram_total_mib) {
         ? round_to((prompt_n / prompt_tps) + (eval_n / eval_tps), 2)
         : std::numeric_limits<double>::quiet_NaN();
     const int64_t headroom = std::max<int64_t>(0, (int64_t) std::trunc(vram_total_mib) - int_value(result, "vram_peak_mib"));
+    const int64_t arg_ctx = context_size_from_args(str_value(result, "extra_args"));
+    const double direct_ctx = nullable_num(result, "ctx_size");
+    const double requested_ctx = nullable_num(result, "requested_context_size");
+    json ctx_size = nullptr;
+    if (arg_ctx > 0) ctx_size = arg_ctx;
+    else if (std::isfinite(direct_ctx) && direct_ctx > 0) ctx_size = (int64_t) std::trunc(direct_ctx);
+    else if (std::isfinite(requested_ctx) && requested_ctx > 0) ctx_size = (int64_t) std::trunc(requested_ctx);
     return {
         {"time_total_sec", number_or_null(time_total, 2)},
         {"headroom_mib", headroom},
-        {"ctx_size", context_size_from_args(str_value(result, "extra_args")) > 0 ? json(context_size_from_args(str_value(result, "extra_args"))) : json(nullptr)},
+        {"ctx_size", ctx_size},
     };
 }
 
@@ -1103,7 +1110,13 @@ json aggregate_bench_result(const json & item, const json & cfg, const std::vect
         {"model_path", item.value("model_path", json(nullptr))},
         {"mmproj_path", item.value("mmproj_path", json(nullptr))},
         {"extra_args", item.value("extra_args", json(nullptr))},
+        {"ctx_size", first.value("ctx_size", json(nullptr))},
         {"requested_context_size", arg_int(extra_args, {"--ctx-size", "-c"}, 0) > 0 ? json(arg_int(extra_args, {"--ctx-size", "-c"})) : json(nullptr)},
+        {"benchmark_allocated_context_size", first.value("benchmark_allocated_context_size", json(nullptr))},
+        {"benchmark_depth_tokens", first.value("benchmark_depth_tokens", json(nullptr))},
+        {"benchmark_prompt_tokens", first.value("benchmark_prompt_tokens", json(nullptr))},
+        {"benchmark_generate_tokens", first.value("benchmark_generate_tokens", json(nullptr))},
+        {"benchmark_note", first.value("benchmark_note", json(nullptr))},
         {"requested_cache_type_k", arg_value(extra_args, {"--cache-type-k", "-ctk"}).empty() ? json(nullptr) : json(arg_value(extra_args, {"--cache-type-k", "-ctk"}))},
         {"requested_cache_type_v", arg_value(extra_args, {"--cache-type-v", "-ctv"}).empty() ? json(nullptr) : json(arg_value(extra_args, {"--cache-type-v", "-ctv"}))},
         {"requested_gpu_layers", arg_int(extra_args, {"--gpu-layers", "-ngl"}, 0) > 0 ? json(arg_int(extra_args, {"--gpu-layers", "-ngl"})) : json(nullptr)},

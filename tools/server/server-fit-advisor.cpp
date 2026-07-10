@@ -4,6 +4,7 @@
 #include "download.h"
 #include "server-common.h"
 #include "server-models.h"
+#include "server-persistence.h"
 
 #include <algorithm>
 #include <chrono>
@@ -1045,6 +1046,7 @@ static void publish_download_snapshot(const std::shared_ptr<fit_download_job> & 
         }
     }
     g_fit_download_cv.notify_all();
+    server_persistence::record_download(data);
 }
 
 static void update_download_job(const std::shared_ptr<fit_download_job> & job, const std::function<void(fit_download_job &)> & fn) {
@@ -1901,7 +1903,7 @@ struct server_fit_advisor_routes::impl {
         const json system = detect_system_json();
         const json installed = router_installed_index(router);
         const json models = sorted_filtered_models(catalog, system, installed, router, req);
-        fit_res_ok(res, {
+        const json response = {
             {"object", "list"},
             {"system", system},
             {"catalog", catalog_status_json(from_cache)},
@@ -1909,7 +1911,9 @@ struct server_fit_advisor_routes::impl {
             {"returned_models", models.size()},
             {"installed", installed},
             {"models", models},
-        });
+        };
+        server_persistence::record_fit_recommendations(response);
+        fit_res_ok(res, response);
         return res;
     }
 
@@ -2206,13 +2210,15 @@ struct server_fit_advisor_routes::impl {
                 router.models.load(id);
                 loaded = true;
             }
-            fit_res_ok(res, {
+            const json response = {
                 {"success", true},
                 {"model", id},
                 {"models_preset", preset_path},
                 {"entry", entry},
                 {"loaded", loaded},
-            });
+            };
+            server_persistence::record_configuration("fit-advisor", id, id, response);
+            fit_res_ok(res, response);
         } catch (const std::exception & e) {
             fit_res_err(res, format_error_response(e.what(), ERROR_TYPE_SERVER));
         }

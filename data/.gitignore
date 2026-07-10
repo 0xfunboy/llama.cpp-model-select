@@ -1,0 +1,4 @@
+# Runtime SQLite archive. Use Settings -> Import/Export for portable backups.
+*.sqlite
+*.sqlite-*
+!.gitignore
