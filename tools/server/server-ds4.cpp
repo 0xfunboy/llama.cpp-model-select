@@ -4,6 +4,7 @@
 #include "server-common.h"
 #include "server-models.h"
 #include "server-persistence.h"
+#include "quality-evidence.h"
 
 #include <cpp-httplib/httplib.h>
 
@@ -159,9 +160,11 @@ static std::string isoish_timestamp() {
     return buf;
 }
 
-static json model_meta_to_ds4_json(const server_model_meta & meta, const std::string & artifact_id) {
+static json model_meta_to_ds4_json(const server_model_meta & meta, const json & artifact) {
     std::string model_path;
     meta.preset.get_option("LLAMA_ARG_MODEL", model_path);
+
+    const std::string artifact_id = artifact.value("artifact_id", std::string());
 
     json status = {
         {"value", server_model_status_to_string(meta.status)},
@@ -172,6 +175,11 @@ static json model_meta_to_ds4_json(const server_model_meta & meta, const std::st
     return {
         {"id", meta.name},
         {"artifact_id", artifact_id.empty() ? json(nullptr) : json(artifact_id)},
+        {"name", artifact.value("name", meta.name)},
+        {"model_id", artifact.value("model_id", meta.name)},
+        {"variant", artifact.value("variant", std::string())},
+        {"configured", true},
+        {"evaluator_eligible", true},
         {"aliases", meta.aliases},
         {"tags", meta.tags},
         {"path", model_path},
@@ -1437,6 +1445,7 @@ struct server_ds4_routes::impl {
                 {"thinking", thinking},
                 {"temperature", temperature},
                 {"packs", request.value("packs", json::array())},
+                {"product_intent", {{"use_case", request.value("use_case", std::string("general"))}}},
                 {"prompt_pack_source", request.contains("local_prompt_pack") ? "user-owned" : "built-in"},
                 {"evaluation_profile", {{"template", "router-default"}, {"reasoning_format", "deepseek"},
                     {"thinking", thinking}, {"thinking_budget_tokens", think_budget}, {"max_tokens", max_tokens},
@@ -2125,7 +2134,8 @@ server_ds4_routes::~server_ds4_routes() = default;
 
 void server_ds4_routes::init_routes() {
     get_models = [p = pimpl](const server_http_req & req) {
-        if (!req.get_param("reload", "").empty()) {
+        const bool reload = !req.get_param("reload", "").empty();
+        if (reload) {
             p->router.models.load_models();
         }
         auto res = std::make_unique<server_http_res>();
@@ -2136,12 +2146,47 @@ void server_ds4_routes::init_routes() {
             {"status", {{"value", "virtual"}, {"loaded", false}, {"running", false}}},
             {"tags", json::array({"batch"})},
             {"aliases", json::array()},
+            {"configured", true},
+            {"evaluator_eligible", true},
         });
-        const json registry = p->router.scan_model_registry(!req.get_param("reload", "").empty());
+        const json registry = p->router.scan_model_registry(reload);
+        std::set<std::string> represented_artifacts;
         for (const auto & meta : p->router.models.get_all_meta()) {
             std::string model_path;
             meta.preset.get_option("LLAMA_ARG_MODEL", model_path);
-            models.push_back(model_meta_to_ds4_json(meta, model_registry::artifact_id_for_path(registry, model_path)));
+            const std::string artifact_id = model_registry::artifact_id_for_path(registry, model_path);
+            json artifact = json::object();
+            if (registry.contains("artifacts") && registry["artifacts"].is_array()) {
+                for (const auto & candidate : registry["artifacts"]) {
+                    if (candidate.value("artifact_id", std::string()) == artifact_id) {
+                        artifact = candidate;
+                        break;
+                    }
+                }
+            }
+            if (!artifact_id.empty()) represented_artifacts.insert(artifact_id);
+            models.push_back(model_meta_to_ds4_json(meta, artifact));
+        }
+        if (registry.contains("artifacts") && registry["artifacts"].is_array()) {
+            for (const auto & artifact : registry["artifacts"]) {
+                const std::string artifact_id = artifact.value("artifact_id", std::string());
+                if (artifact_id.empty() || represented_artifacts.count(artifact_id)) continue;
+                models.push_back({
+                    {"id", artifact_id},
+                    {"artifact_id", artifact_id},
+                    {"name", artifact.value("name", artifact.value("model_id", artifact_id))},
+                    {"model_id", artifact.value("model_id", artifact_id)},
+                    {"variant", artifact.value("variant", std::string())},
+                    {"aliases", json::array()},
+                    {"tags", json::array({artifact.value("variant", std::string("GGUF")), artifact.value("health", std::string("discovered"))})},
+                    {"path", artifact.value("primary_path", std::string())},
+                    {"loadable", artifact.value("loadable", false)},
+                    {"configured", false},
+                    {"evaluator_eligible", false},
+                    {"source", "registry"},
+                    {"status", {{"value", artifact.value("health", std::string("discovered"))}, {"loaded", false}, {"running", false}}},
+                });
+            }
         }
         ds4_res_ok(res, {{"data", models}, {"object", "list"}});
         return res;
@@ -2170,9 +2215,11 @@ void server_ds4_routes::init_routes() {
     get_reports = [p = pimpl](const server_http_req &) {
         auto res = std::make_unique<server_http_res>();
         json reports = json::array();
+        std::vector<json> eval_reports;
         for (const std::string module : {"ds4-eval", "ds4-bench"}) {
             for (const auto & report : server_persistence::load_reports(module)) {
                 if (!report.is_object()) continue;
+                if (module == "ds4-eval") eval_reports.push_back(report);
                 reports.push_back({
                     {"id", json_value(report, "id", std::string())},
                     {"kind", json_value(report, "kind", std::string())},
@@ -2190,7 +2237,20 @@ void server_ds4_routes::init_routes() {
             return json_value(a, "updated_at", json_value(a, "created_at", std::string())) >
                    json_value(b, "updated_at", json_value(b, "created_at", std::string()));
         });
-        ds4_res_ok(res, {{"data", reports}, {"object", "list"}});
+        const json registry = p->router.scan_model_registry(false);
+        json quality_profiles = quality_evidence::build_profiles(eval_reports, registry);
+        if (registry.contains("artifacts") && registry["artifacts"].is_array()) {
+            for (const auto & artifact : registry["artifacts"]) {
+                const std::string artifact_id = artifact.value("artifact_id", std::string());
+                if (artifact_id.empty() || !quality_profiles.contains(artifact_id)) continue;
+                auto & profile = quality_profiles[artifact_id];
+                profile["name"] = artifact.value("name", artifact.value("model_id", artifact_id));
+                profile["model_id"] = artifact.value("model_id", std::string());
+                profile["variant"] = artifact.value("variant", std::string());
+                profile["configured_ids"] = artifact.value("configured_ids", json::array());
+            }
+        }
+        ds4_res_ok(res, {{"data", reports}, {"quality_profiles", quality_profiles}, {"object", "list"}});
         return res;
     };
 

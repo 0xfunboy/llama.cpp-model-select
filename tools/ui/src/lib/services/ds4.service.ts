@@ -4,9 +4,15 @@ import { getAuthHeaders } from '$lib/utils/api-headers';
 
 export interface Ds4Model {
 	id: string;
+	artifact_id?: string | null;
+	name?: string;
+	model_id?: string;
+	variant?: string;
 	source: string;
 	path?: string;
 	loadable?: boolean;
+	configured?: boolean;
+	evaluator_eligible?: boolean;
 	status: {
 		value: string;
 		loaded: boolean;
@@ -63,6 +69,25 @@ export interface Ds4ReportSummary {
 export interface Ds4ReportsResponse {
 	object: 'list';
 	data: Ds4ReportSummary[];
+	quality_profiles?: Record<string, Ds4QualityProfile>;
+}
+
+export interface Ds4QualityEvidence {
+	score: number;
+	pass: number;
+	samples: number;
+	report_id?: string;
+	created_at?: string;
+}
+
+export interface Ds4QualityProfile extends Ds4QualityEvidence {
+	artifact_id: string;
+	name?: string;
+	model_id?: string;
+	variant?: string;
+	configured_ids?: string[];
+	evidence_level?: string;
+	packs?: Record<string, Ds4QualityEvidence>;
 }
 
 export interface Ds4DeleteReportResponse {
@@ -107,6 +132,8 @@ export interface Ds4EvalRequest {
 	thinking?: boolean;
 	temperature?: number;
 	limit?: number;
+	packs?: string[];
+	use_case?: string;
 }
 
 export interface Ds4BenchRequest {
@@ -149,9 +176,8 @@ function parseSseBlock(block: string): Ds4Event | null {
 }
 
 export class Ds4Service {
-	static listModels(_reload = false): Promise<Ds4ModelsResponse> {
-		void _reload;
-		return apiFetch<Ds4ModelsResponse>('/api/ds4/models', {
+	static listModels(reload = false): Promise<Ds4ModelsResponse> {
+		return apiFetch<Ds4ModelsResponse>(`/api/ds4/models${reload ? '?reload=1' : ''}`, {
 			authOnly: true
 		});
 	}

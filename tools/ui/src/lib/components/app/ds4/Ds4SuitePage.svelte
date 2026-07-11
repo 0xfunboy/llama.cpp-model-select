@@ -20,9 +20,12 @@
 		type Ds4Report,
 		type Ds4ReportSummary
 	} from '$lib/services/ds4.service';
+	import { compactModelName, normalizeModelName, uniqueModelTags } from '$lib/utils/model-display';
 
 	interface Props {
 		mode: 'eval' | 'bench';
+		embedded?: boolean;
+		initialModels?: string[];
 	}
 
 	interface EvalRow {
@@ -71,19 +74,19 @@
 		delta: number;
 	}
 
-	let { mode }: Props = $props();
+	let { mode, embedded = false, initialModels = [] }: Props = $props();
 
 	const isEval = $derived(mode === 'eval');
-	const title = $derived(isEval ? 'DS4-Eval' : 'DS4-Bench');
+	const title = $derived(isEval ? 'Use-case Evaluator' : 'Context Benchmark');
 	const subtitle = $derived(
 		isEval
-			? 'Regression suite: 92 logic, reasoning and cybersecurity cases.'
+			? 'DS4-Eval measures reasoning, coding, knowledge, RAG, tool use and long-context skills with reproducible local evidence.'
 			: 'Performance suite: prompt processing, decode throughput and context scaling.'
 	);
 
 	let models = $state<Ds4Model[]>([]);
 	let reports = $state<Ds4ReportSummary[]>([]);
-	let selectedModels = $state<string[]>(['ALL']);
+	let selectedModels = $state<string[]>([]);
 	let isLoadingModels = $state(false);
 	let isRunning = $state(false);
 	let isResuming = $state(false);
@@ -124,7 +127,9 @@
 	const terminalHtml = $derived(ansiToHtml(terminalText));
 	const isAllSelected = $derived(selectedModels.includes('ALL'));
 	const selectedModelLabel = $derived(isAllSelected ? 'ALL' : selectedModels.join(', '));
-	const concreteModelCount = $derived(models.filter((model) => model.id !== 'ALL').length);
+	const concreteModelCount = $derived(
+		models.filter((model) => model.id !== 'ALL' && model.evaluator_eligible !== false).length
+	);
 	const selectedModelCount = $derived(isAllSelected ? concreteModelCount : selectedModels.length);
 	const canStart = $derived(!isRunning && selectedModels.length > 0 && !otherActiveJob);
 	const displayEvalRows = $derived.by(() => {
@@ -185,6 +190,7 @@
 	});
 
 	onMount(() => {
+		selectedModels = initialModels.length > 0 ? [...initialModels] : ['ALL'];
 		void initialize();
 		return () => {
 			streamController?.abort();
@@ -449,8 +455,21 @@
 	function modelLabel(model: Ds4Model): string {
 		if (model.id === 'ALL') return 'ALL models';
 		const file = basename(model.path);
-		const tags = model.tags?.length ? ' · ' + model.tags.join(', ') : '';
-		return model.id + (file ? ' · ' + file : '') + tags;
+		const details = uniqueModelTags([
+			model.variant,
+			...(model.tags ?? []),
+			model.configured === false ? 'configure in Library first' : ''
+		]);
+		return [normalizeModelName(model.name || model.model_id || model.id), file, ...details]
+			.filter(Boolean)
+			.join(' · ');
+	}
+
+	function modelDisplayName(value: string): string {
+		const model = models.find(
+			(item) => item.id === value || item.aliases?.includes(value) || item.model_id === value
+		);
+		return compactModelName(model?.name || model?.model_id || value);
 	}
 
 	function reportLabel(report: Ds4ReportSummary): string {
@@ -494,6 +513,8 @@
 			selectedModels = ['ALL'];
 			return;
 		}
+		const target = models.find((model) => model.id === id);
+		if (target?.evaluator_eligible === false) return;
 		const withoutAll = selectedModels.filter((value) => value !== 'ALL');
 		if (withoutAll.includes(id)) {
 			selectedModels = withoutAll.filter((value) => value !== id);
@@ -515,7 +536,9 @@
 		try {
 			const response = await Ds4Service.listModels(reload);
 			models = response.data;
-			const available = new Set(models.map((model) => model.id));
+			const available = new Set(
+				models.filter((model) => model.evaluator_eligible !== false).map((model) => model.id)
+			);
 			if (selectedModels.includes('ALL')) {
 				selectedModels = ['ALL'];
 			} else {
@@ -576,6 +599,12 @@
 		if (snapshot.error) error = snapshot.error;
 		if (snapshot.report && Object.keys(snapshot.report).length > 0) {
 			activeReport = snapshot.report;
+			if (Array.isArray(snapshot.report.models)) {
+				const reportModels = snapshot.report.models.filter(
+					(value): value is string => typeof value === 'string'
+				);
+				if (reportModels.length > 0) selectedModels = reportModels;
+			}
 		}
 	}
 
@@ -777,7 +806,11 @@
 	<title>{title}</title>
 </svelte:head>
 
-<main class="flex min-h-dvh w-full flex-col gap-5 px-4 py-5 md:px-8">
+<main
+	class={embedded
+		? 'flex w-full flex-col gap-5 py-4'
+		: 'flex min-h-dvh w-full flex-col gap-5 px-4 py-5 md:px-8'}
+>
 	<header class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
 		<div>
 			<div class="flex items-center gap-2 text-sm text-muted-foreground">
@@ -786,10 +819,16 @@
 				{:else}
 					<Activity class="h-4 w-4" />
 				{/if}
-				<span>llama.cpp integrated suite</span>
+				<span>Local LLM Autopilot · DS4 evidence engine</span>
 			</div>
 			<h1 class="mt-1 text-2xl font-semibold tracking-normal">{title}</h1>
 			<p class="mt-1 max-w-3xl text-sm text-muted-foreground">{subtitle}</p>
+			{#if isEval}
+				<p class="mt-2 max-w-3xl text-xs text-amber-600 dark:text-amber-300">
+					A complete multi-model evaluation can take many hours or several days. Runs are saved
+					server-side and can be resumed safely.
+				</p>
+			{/if}
 		</div>
 
 		<button
@@ -846,18 +885,24 @@
 				<div class="max-h-72 space-y-1 overflow-auto rounded-md border p-2">
 					{#each models as model (model.id)}
 						<label
-							class="flex cursor-pointer items-start gap-2 rounded-md px-2 py-2 text-sm hover:bg-muted"
+							class="flex items-start gap-2 rounded-md px-2 py-2 text-sm hover:bg-muted"
+							class:cursor-pointer={model.evaluator_eligible !== false}
+							class:opacity-55={model.evaluator_eligible === false}
 						>
 							<input
 								class="mt-1"
 								type="checkbox"
 								checked={isModelSelected(model.id)}
-								disabled={isRunning}
+								disabled={isRunning || model.evaluator_eligible === false}
 								onchange={() => toggleModel(model.id)}
 							/>
 							<span class="min-w-0 flex-1">
-								<span class="block truncate font-medium"
-									>{model.id === 'ALL' ? 'ALL' : model.id}</span
+								<span
+									class="block truncate font-medium"
+									title={normalizeModelName(model.name || model.id)}
+									>{model.id === 'ALL'
+										? 'All configured models'
+										: compactModelName(model.name || model.model_id || model.id)}</span
 								>
 								<span class="block truncate text-xs text-muted-foreground">{modelLabel(model)}</span
 								>
@@ -1120,7 +1165,9 @@
 											'reasoning'} · {row.id}
 									</div>
 								</td>
-								<td class="px-3 py-2">{row.model}</td>
+								<td class="px-3 py-2" title={normalizeModelName(row.model || '')}
+									>{modelDisplayName(row.model || '')}</td
+								>
 								<td class="px-3 py-2">{row.expected}</td>
 								<td class="px-3 py-2">{row.got}</td>
 								<td class="px-3 py-2">{num(row.reasoning_tokens)}</td>
@@ -1188,7 +1235,7 @@
 								disabled={reportModels.length === 0}
 							>
 								{#each reportModels as model (model)}
-									<option value={model}>{model}</option>
+									<option value={model}>{modelDisplayName(model)}</option>
 								{/each}
 							</select>
 						{:else}
@@ -1197,7 +1244,9 @@
 								class="h-10 min-w-56 rounded-md border bg-background px-3 text-sm"
 							>
 								{#each reportModels as model (model)}
-									<option value={model} disabled={model === raceModelB}>{model}</option>
+									<option value={model} disabled={model === raceModelB}
+										>{modelDisplayName(model)}</option
+									>
 								{/each}
 							</select>
 							<select
@@ -1205,7 +1254,9 @@
 								class="h-10 min-w-56 rounded-md border bg-background px-3 text-sm"
 							>
 								{#each reportModels as model (model)}
-									<option value={model} disabled={model === raceModelA}>{model}</option>
+									<option value={model} disabled={model === raceModelA}
+										>{modelDisplayName(model)}</option
+									>
 								{/each}
 							</select>
 						{/if}
@@ -1220,7 +1271,9 @@
 					<div class="mt-4 grid gap-3 md:grid-cols-4">
 						<div class="rounded-md border bg-background p-3">
 							<div class="text-xs text-muted-foreground">Model</div>
-							<div class="mt-1 truncate text-lg font-semibold">{singleReportModel}</div>
+							<div class="mt-1 truncate text-lg font-semibold" title={singleReportModel}>
+								{modelDisplayName(singleReportModel)}
+							</div>
 						</div>
 						<div class="rounded-md border bg-background p-3">
 							<div class="text-xs text-muted-foreground">Score</div>
@@ -1279,7 +1332,7 @@
 				{:else}
 					<div class="mt-4 grid gap-3 md:grid-cols-3">
 						<div class="rounded-md border bg-background p-3">
-							<div class="text-xs text-muted-foreground">{raceModelA}</div>
+							<div class="text-xs text-muted-foreground">{modelDisplayName(raceModelA)}</div>
 							<div class="mt-1 text-2xl font-semibold">{raceModelSummaryA?.score ?? 0}%</div>
 							<div class="text-xs text-muted-foreground">
 								{raceModelSummaryA?.pass ?? 0}/{raceModelSummaryA?.total ?? 0} pass
@@ -1291,9 +1344,9 @@
 								{#if (raceModelSummaryA?.score ?? 0) === (raceModelSummaryB?.score ?? 0)}
 									Tie
 								{:else if (raceModelSummaryA?.score ?? 0) > (raceModelSummaryB?.score ?? 0)}
-									{raceModelA}
+									{modelDisplayName(raceModelA)}
 								{:else}
-									{raceModelB}
+									{modelDisplayName(raceModelB)}
 								{/if}
 							</div>
 							<div class="text-xs text-muted-foreground">
@@ -1303,7 +1356,7 @@
 							</div>
 						</div>
 						<div class="rounded-md border bg-background p-3">
-							<div class="text-xs text-muted-foreground">{raceModelB}</div>
+							<div class="text-xs text-muted-foreground">{modelDisplayName(raceModelB)}</div>
 							<div class="mt-1 text-2xl font-semibold">{raceModelSummaryB?.score ?? 0}%</div>
 							<div class="text-xs text-muted-foreground">
 								{raceModelSummaryB?.pass ?? 0}/{raceModelSummaryB?.total ?? 0} pass
@@ -1316,8 +1369,8 @@
 							<thead class="bg-background text-muted-foreground">
 								<tr>
 									<th class="px-3 py-2">Sector</th>
-									<th class="px-3 py-2">{raceModelA}</th>
-									<th class="px-3 py-2">{raceModelB}</th>
+									<th class="px-3 py-2">{modelDisplayName(raceModelA)}</th>
+									<th class="px-3 py-2">{modelDisplayName(raceModelB)}</th>
 									<th class="px-3 py-2">Delta</th>
 									<th class="px-3 py-2">Cases</th>
 								</tr>
@@ -1378,7 +1431,9 @@
 						{#each displayBenchRows as row (`${row.model}-${row.ctx}`)}
 							<tr class="border-t">
 								<td class="px-3 py-2">{row.ctx}</td>
-								<td class="px-3 py-2">{row.model}</td>
+								<td class="px-3 py-2" title={normalizeModelName(row.model || '')}
+									>{modelDisplayName(row.model || '')}</td
+								>
 								<td class="px-3 py-2">{num(row.prompt_tokens_per_second).toFixed(1)}</td>
 								<td class="px-3 py-2">{num(row.decode_tokens_per_second).toFixed(1)}</td>
 								<td class="px-3 py-2">{num(row.prompt_seconds).toFixed(2)}</td>
