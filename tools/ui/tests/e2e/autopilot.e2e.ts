@@ -45,6 +45,35 @@ const alternatives = ['Mistral Local 12B', 'Code Local 9B', 'Reason Local 20B'].
 	})
 );
 
+const diagnosticRows = [
+	{
+		...winner,
+		id: 'prefill-2k',
+		row_role: 'diagnostic',
+		workload_kind: 'prefill',
+		prefill_target_tokens: 2048,
+		prompt_tps: 900
+	},
+	{
+		...winner,
+		id: 'kv-32k',
+		row_role: 'diagnostic',
+		workload_kind: 'kv-fill',
+		prefill_target_tokens: 0,
+		kv_fill_target_tokens: 32768,
+		prompt_tps: 720
+	},
+	{
+		...winner,
+		id: 'kv-64k',
+		row_role: 'diagnostic',
+		workload_kind: 'kv-fill',
+		prefill_target_tokens: 0,
+		kv_fill_target_tokens: 65536,
+		prompt_tps: 400
+	}
+];
+
 async function mockProductApi(page: Page) {
 	await page.route('**/*', async (route) => {
 		const url = new URL(route.request().url());
@@ -67,7 +96,7 @@ async function mockProductApi(page: Page) {
 		if (url.pathname === '/api/caliber-advisor/results')
 			return route.fulfill({
 				json: {
-					rows: [winner, ...alternatives],
+					rows: [winner, ...alternatives, ...diagnosticRows],
 					recommendations: {
 						overall: {
 							winner,
@@ -123,8 +152,13 @@ async function mockProductApi(page: Page) {
 							object_id: 'route-1',
 							created_at: '2026-07-10T20:00:00Z',
 							payload: {
+								ok: true,
 								alias: 'local-auto',
 								selected_model: winner.model,
+								quality: 0.88,
+								quality_pack: 'overall',
+								required_context: 4096,
+								evidence: winner,
 								reason: 'Qualified resident model avoided a switch.'
 							}
 						}
@@ -146,28 +180,33 @@ test('guided flow exposes one qualified answer and three alternatives', async ({
 	if (await dismiss.count()) await dismiss.click();
 
 	await expect(page.getByRole('heading', { name: 'Local LLM Autopilot' })).toBeVisible();
-	for (const label of [
-		'Home',
-		'Library',
-		'Test Lab',
-		'Recommendations',
-		'Router',
-		'History',
-		'Doctor'
-	]) {
+	for (const label of ['Library', 'Test Lab', 'Recommendations', 'Router', 'History', 'Doctor']) {
 		await expect(page.getByRole('button', { name: label, exact: true })).toBeVisible();
 	}
+	await expect(page.getByRole('button', { name: 'Home', exact: true })).toHaveCount(0);
+	await expect(page.getByText('Downloadable recommendations')).toBeVisible();
 	await expect(page.getByText('Pick first 4')).toHaveCount(0);
+	await page.getByRole('button', { name: 'Test Lab', exact: true }).click();
 	await expect(page.getByLabel('Context target')).toHaveValue('32768');
 
 	await page.getByRole('button', { name: 'Recommendations', exact: true }).click();
 	await expect(page.getByText('Recommended on this hardware')).toBeVisible();
-	await expect(page.getByRole('heading', { name: 'Qwen Local 14B' })).toBeVisible();
-	await expect(page.getByText(/quality 88%/)).toBeVisible();
+	await expect(page.getByRole('heading', { name: 'Qwen Local · 14B' })).toBeVisible();
+	await expect(page.getByText(/quality 88%/).first()).toBeVisible();
 	await expect(page.getByText('Alternative 3')).toBeVisible();
 	await expect(page.getByText('Streaming timeline')).toBeVisible();
+	await expect(page.getByText('Qwen Local · 14B · kv-fill · 32k')).toBeVisible();
+	await expect(page.getByText('Qwen Local · 14B · kv-fill · 64k')).toBeVisible();
+	await expect(page.getByText(/kv-fill · 0k/)).toHaveCount(0);
+	const throughput = page.getByRole('heading', { name: 'Throughput & memory' });
+	const scatter = page.getByRole('heading', { name: 'Memory vs latency' });
+	await expect(throughput).toBeVisible();
+	await expect(scatter).toBeVisible();
+	expect((await throughput.boundingBox())!.y).toBeLessThan((await scatter.boundingBox())!.y);
+	await expect(page.getByText('Total request time (log scale)')).toBeVisible();
 	await expect(page.getByText('Metric glossary')).toBeVisible();
 	await page.getByRole('button', { name: 'Router', exact: true }).click();
+	await expect(page.getByText('Current winner')).toBeVisible();
 	await expect(page.getByText('Qualified resident model avoided a switch.')).toBeVisible();
 	await page.getByRole('button', { name: 'Doctor', exact: true }).click();
 	await expect(page.getByText('1 ready · 0 unhealthy')).toBeVisible();

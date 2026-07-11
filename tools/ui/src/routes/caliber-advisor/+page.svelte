@@ -33,15 +33,9 @@
 		type FitAdvisorSystem
 	} from '$lib/services/fit-advisor.service';
 	import { RouterService, type LocalRouteEvent } from '$lib/services/router.service';
+	import { compactModelName, normalizeModelName } from '$lib/utils/model-display';
 
-	type TabId =
-		| 'home'
-		| 'library'
-		| 'test-lab'
-		| 'recommendations'
-		| 'router'
-		| 'history'
-		| 'doctor';
+	type TabId = 'library' | 'test-lab' | 'recommendations' | 'router' | 'history' | 'doctor';
 	type UseCaseId = 'general' | 'chat' | 'coding' | 'reasoning' | 'rag' | 'tools' | 'long-context';
 	type ProfileId = 'overall' | 'speed' | 'efficiency' | 'safety';
 	type RunScope = 'quick' | 'standard' | 'deep';
@@ -59,7 +53,6 @@
 		{ label: '262k', value: 262144, hint: 'Only when the model really supports it' }
 	];
 	const tabs: { id: TabId; label: string }[] = [
-		{ id: 'home', label: 'Home' },
 		{ id: 'library', label: 'Library' },
 		{ id: 'test-lab', label: 'Test Lab' },
 		{ id: 'recommendations', label: 'Recommendations' },
@@ -138,6 +131,30 @@
 		{ id: 'moe_offload', label: 'MoE offload' },
 		{ id: 'balanced', label: 'Balanced' }
 	];
+	const aliasCards = [
+		{
+			id: 'local-auto',
+			description: 'Balanced measured default',
+			tags: ['balanced', 'overall quality']
+		},
+		{
+			id: 'local-fast',
+			description: 'Lowest interactive latency',
+			tags: ['latency', 'TTFT-aware']
+		},
+		{
+			id: 'local-best',
+			description: 'Highest qualified quality',
+			tags: ['quality-first', 'quality-gated']
+		},
+		{ id: 'local-code', description: 'Coding and FIM qualified', tags: ['coding', 'FIM', 'tools'] },
+		{
+			id: 'local-long',
+			description: 'Long-context retrieval qualified',
+			tags: ['long context', 'retrieval']
+		},
+		{ id: 'local-vision', description: 'Vision-capable artifact', tags: ['vision', 'multimodal'] }
+	];
 	const reportMetrics: ReportMetric[] = ['eval', 'prompt', 'memory', 'latency', 'vram'];
 	const technicalColumns = [
 		'model',
@@ -159,7 +176,7 @@
 		'fit_eligible'
 	];
 
-	let activeTab = $state<TabId>('home');
+	let activeTab = $state<TabId>('library');
 	let profile = $state<ProfileId>('overall');
 	let useCase = $state<UseCaseId>('general');
 	let installedOnly = $state(true);
@@ -225,15 +242,17 @@
 		Math.max(1, ...reportLeaderboard.map((row) => reportMetricValue(row, reportMetric)))
 	);
 	const reportScatterRows = $derived(okAnalyticsRows.filter((row) => reportTimeSec(row) > 0));
-	const loadCurveRows = $derived(
-		scopedAnalyticsRows.filter((row) =>
-			['prefill', 'kv-fill'].includes(rowText(row, ['workload_kind']))
-		)
-	);
+	const loadCurveRows = $derived(buildLoadCurveRows(scopedAnalyticsRows));
 	const reportMaxTime = $derived(Math.max(1, ...reportScatterRows.map(reportTimeSec)));
 	const reportMaxMemory = $derived(
-		Math.max(1, ...reportScatterRows.map((row) => reportMemoryMib(row)))
+		Math.max(
+			1,
+			...reportScatterRows.map((row) => reportMemoryMib(row)),
+			(fitSystem?.total_gpu_vram_gb ?? 0) * 1024
+		)
 	);
+	const scatterTickRatios = [0, 0.25, 0.5, 0.75, 1];
+	const reportVramBudgetMib = $derived((fitSystem?.total_gpu_vram_gb ?? 0) * 1024);
 	const syntheticRows = $derived(
 		scopedAnalyticsRows.filter((row) => rowText(row, ['benchmark_backend']) === 'llama-bench')
 			.length
@@ -397,12 +416,79 @@
 	}
 
 	function loadTarget(row: CaliberRow): number {
-		return rowNum(row, ['prefill_target_tokens', 'kv_fill_target_tokens', 'prompt_n']);
+		return rowText(row, ['workload_kind']) === 'kv-fill'
+			? rowNum(row, [
+					'kv_fill_measured_tokens',
+					'kv_fill_target_tokens',
+					'benchmark_depth_tokens',
+					'prompt_n'
+				])
+			: rowNum(row, ['prefill_target_tokens', 'benchmark_prompt_tokens', 'prompt_n']);
 	}
 
 	function loadCurveWidth(row: CaliberRow): number {
-		const max = Math.max(1, ...loadCurveRows.map(loadTarget));
-		return Math.max(2, Math.min(100, (loadTarget(row) / max) * 100));
+		const model = rowText(row, ['model', 'model_id']);
+		const workload = rowText(row, ['workload_kind']);
+		const peers = loadCurveRows.filter(
+			(item) =>
+				rowText(item, ['model', 'model_id']) === model &&
+				rowText(item, ['workload_kind']) === workload
+		);
+		const max = Math.max(1, ...peers.map(loadCurveSpeed));
+		return Math.max(2, Math.min(100, (loadCurveSpeed(row) / max) * 100));
+	}
+
+	function loadCurveSpeed(row: CaliberRow): number {
+		return rowNum(row, ['prompt_tps', 'eval_tps']);
+	}
+
+	function loadCurveBand(row: CaliberRow): string {
+		const retention = loadCurveWidth(row);
+		if (retention >= 80) return 'healthy';
+		if (retention >= 55) return 'degraded';
+		return 'collapse';
+	}
+
+	function medianValues(values: number[]): number {
+		const finite = values.filter(Number.isFinite).sort((a, b) => a - b);
+		if (finite.length === 0) return 0;
+		const middle = Math.floor(finite.length / 2);
+		return finite.length % 2 ? finite[middle] : (finite[middle - 1] + finite[middle]) / 2;
+	}
+
+	function buildLoadCurveRows(rows: CaliberRow[]): CaliberRow[] {
+		const groups = new SvelteMap<string, CaliberRow[]>();
+		for (const row of rows) {
+			const workload = rowText(row, ['workload_kind']);
+			if (!['prefill', 'kv-fill'].includes(workload) || rowText(row, ['ok']) === 'false') continue;
+			const target = loadTarget(row);
+			if (target <= 0) continue;
+			const key = `${rowText(row, ['model', 'model_id'])}|${workload}|${target}`;
+			groups.set(key, [...(groups.get(key) ?? []), row]);
+		}
+		return [...groups.values()]
+			.map((samples) => ({
+				...samples[0],
+				prompt_tps: medianValues(samples.map((row) => rowNum(row, ['prompt_tps', 'eval_tps']))),
+				eval_tps: medianValues(samples.map((row) => rowNum(row, ['eval_tps']))),
+				curve_samples: samples.length
+			}))
+			.sort((a, b) => {
+				const modelOrder = modelDisplayName(rowText(a, ['model', 'model_id'])).localeCompare(
+					modelDisplayName(rowText(b, ['model', 'model_id']))
+				);
+				if (modelOrder !== 0) return modelOrder;
+				const workloadOrder = rowText(a, ['workload_kind']).localeCompare(
+					rowText(b, ['workload_kind'])
+				);
+				return workloadOrder !== 0 ? workloadOrder : loadTarget(a) - loadTarget(b);
+			});
+	}
+
+	function fmtTokens(value: number): string {
+		if (value < 1024) return `${Math.round(value)} tokens`;
+		const thousands = value / 1024;
+		return `${fmtNumber(thousands, thousands >= 10 ? 0 : 1)}k`;
 	}
 
 	function reportSessionKey(row: CaliberRow): string {
@@ -491,11 +577,21 @@
 			.filter(Boolean)
 			.map((row) => rowText(row as CaliberRow, ['model', 'model_id']));
 		return [...map.entries()]
-			.map(([model, groupRows]) => ({
-				model,
-				rows: groupRows,
-				winner: asRecord(bestByModel[model]) as CaliberRow | null
-			}))
+			.map(([model, groupRows]) => {
+				const fallback = [...groupRows]
+					.filter(
+						(row) =>
+							rowText(row, ['ok']) !== 'false' &&
+							['candidate', ''].includes(rowText(row, ['row_role'])) &&
+							rowText(row, ['workload_kind'], 'baseline') === 'baseline'
+					)
+					.sort((a, b) => rowNum(b, ['eval_tps', 'tps']) - rowNum(a, ['eval_tps', 'tps']))[0];
+				return {
+					model,
+					rows: groupRows,
+					winner: (asRecord(bestByModel[model]) as CaliberRow | null) ?? fallback ?? null
+				};
+			})
 			.sort((a, b) => {
 				const ai = ordered.indexOf(a.model);
 				const bi = ordered.indexOf(b.model);
@@ -541,6 +637,89 @@
 		return value.toLowerCase().replace(/[^a-z0-9]+/g, '');
 	}
 
+	function registryModel(value: string): CaliberModel | undefined {
+		const identity = normalizeIdentity(value);
+		if (!identity) return undefined;
+		return models.find((model) =>
+			[model.id, model.name, ...(model.configured_ids ?? []), ...(model.aliases ?? [])]
+				.filter(Boolean)
+				.some((candidate) => {
+					const normalized = normalizeIdentity(candidate);
+					return (
+						normalized === identity ||
+						normalized.includes(identity) ||
+						identity.includes(normalized)
+					);
+				})
+		);
+	}
+
+	function modelFullName(value: string): string {
+		const matched = registryModel(value);
+		const source = matched?.name || value || 'Unknown model';
+		return normalizeModelName(source);
+	}
+
+	function modelDisplayName(value: string): string {
+		return compactModelName(modelFullName(value));
+	}
+
+	function modelTags(model: CaliberModel): string[] {
+		const metadata = asRecord(model.plan_meta);
+		return uniqueStrings([
+			...(model.tags ?? []),
+			rowText(metadata ?? {}, ['variant']),
+			rowText(metadata ?? {}, ['gguf_architecture']),
+			model.configured ? 'configured' : '',
+			...(model.aliases ?? []).slice(0, 2).map((alias) => `alias: ${alias}`)
+		]).slice(0, 7);
+	}
+
+	function reportRowTags(row: CaliberRow): string[] {
+		const quality = asRecord(row.quality_evidence);
+		return uniqueStrings([
+			rowText(row, ['variant']),
+			rowNum(row, ['ctx_size']) > 0 ? `${fmtTokens(rowNum(row, ['ctx_size']))} ctx` : '',
+			rowText(row, ['evidence_level']),
+			rowBool(row, 'quality_gate_passed')
+				? `quality ${Math.round(Number(quality?.score ?? 0) * 100)}%`
+				: '',
+			rowText(row, ['residency', 'memory_state'])
+		]).slice(0, 6);
+	}
+
+	function fitBlockReason(row: CaliberRow): string {
+		if (canFitCaliberRow(row)) return '';
+		if (rowText(row, ['benchmark_backend']) !== 'llama-server-streaming')
+			return 'Needs a streaming Test Lab run; synthetic llama-bench rows cannot become presets.';
+		if (!rowBool(row, 'context_target_met')) return 'The requested context was not proved.';
+		if (rowBool(row, 'quality_gate_required') && !rowBool(row, 'quality_gate_passed'))
+			return 'The required quality pack has not passed.';
+		if (!rowBool(row, 'fit_eligible'))
+			return 'Memory or measurement confidence is not decision-grade.';
+		return 'This row is not eligible for a production preset.';
+	}
+
+	function selectRowForTest(row: CaliberRow) {
+		const identity = rowText(row, ['model', 'model_id']);
+		const match = registryModel(identity);
+		if (match && !selectedLocalIds.includes(match.id))
+			selectedLocalIds = [...selectedLocalIds, match.id];
+		activeTab = 'test-lab';
+		message = match
+			? `${modelDisplayName(identity)} selected. Review scope and start a Decision run to unlock FIT.`
+			: `Open Test Lab and select ${modelDisplayName(identity)} for a streaming Decision run.`;
+	}
+
+	function aliasDecision(alias: string): Record<string, unknown> | null {
+		for (const event of routeEvents) {
+			if (event.event_type !== 'decision') continue;
+			if (String(event.payload.alias ?? '') === alias && event.payload.ok !== false)
+				return event.payload;
+		}
+		return null;
+	}
+
 	function hasHistoricModelResult(modelId: string): boolean {
 		const model = models.find((item) => item.id === modelId);
 		const identities = [modelId, model?.name ?? '', model?.path ?? '']
@@ -567,12 +746,25 @@
 
 	function reportScatterX(row: CaliberRow): number {
 		const ratio = Math.log10(reportTimeSec(row) + 1) / Math.log10(reportMaxTime + 1);
-		return 58 + Math.max(0, Math.min(1, ratio)) * 662;
+		return 70 + Math.max(0, Math.min(1, ratio)) * 860;
 	}
 
 	function reportScatterY(row: CaliberRow): number {
 		const ratio = reportMemoryMib(row) / reportMaxMemory;
-		return 298 - Math.max(0, Math.min(1, ratio)) * 244;
+		return 312 - Math.max(0, Math.min(1, ratio)) * 258;
+	}
+
+	function scatterTimeTick(ratio: number): number {
+		return Math.expm1(Math.log1p(reportMaxTime) * ratio);
+	}
+
+	function scatterMemoryTick(ratio: number): number {
+		return reportMaxMemory * ratio;
+	}
+
+	function reportBudgetY(): number {
+		if (reportVramBudgetMib <= 0) return 312;
+		return 312 - Math.min(1, reportVramBudgetMib / reportMaxMemory) * 258;
 	}
 
 	function reportBarWidth(row: CaliberRow): number {
@@ -980,17 +1172,17 @@
 	}
 
 	function downloadFor(model: FitAdvisorModel): FitAdvisorDownloadJob | null {
-		return (
-			downloads.find(
-				(job) =>
-					sameNonEmpty(job.model_id, model.id) ||
-					sameNonEmpty(job.hf_ref, model.download?.hf_ref) ||
-					sameNonEmpty(job.target_dir, model.download?.target_dir ?? model.target_dir) ||
-					sameNonEmpty(job.local_path, model.local_path)
-			) ??
-			model.download_progress ??
-			null
-		);
+		const exact = model.download?.hf_ref
+			? downloads.find((job) => sameNonEmpty(job.hf_ref, model.download?.hf_ref))
+			: downloads.find(
+					(job) =>
+						sameNonEmpty(job.target_dir, model.target_dir) ||
+						sameNonEmpty(job.local_path, model.local_path)
+				);
+		if (exact) return exact;
+		if (!model.download)
+			return downloads.find((job) => sameNonEmpty(job.model_id, model.id)) ?? null;
+		return model.download_progress ?? null;
 	}
 
 	function isActiveDownloadStatus(status: string): boolean {
@@ -1017,6 +1209,7 @@
 			return `Downloading${progress}`;
 		}
 		const status = downloadStatus(model);
+		if (!model.download || status === 'unavailable') return 'No GGUF source';
 		if (status === 'partial' || model.partial) return 'Resume DL';
 		if (status === 'failed') return 'Retry DL';
 		if (status === 'downloaded' || status === 'configured') return 'Downloaded';
@@ -1150,7 +1343,7 @@
 			</p>
 		</div>
 		<div class="hero-actions">
-			<button type="button" onclick={() => (activeTab = 'home')} class="primary">
+			<button type="button" onclick={() => (activeTab = 'library')} class="primary">
 				Find my model
 				<ChevronRight size={16} />
 			</button>
@@ -1171,7 +1364,11 @@
 	<section class="answer-strip">
 		<div>
 			<span>Best answer</span>
-			<strong>{bestWinner ? rowText(bestWinner, ['model'], '-') : 'No winner yet'}</strong>
+			<strong title={bestWinner ? modelFullName(rowText(bestWinner, ['model'], '-')) : ''}
+				>{bestWinner
+					? modelDisplayName(rowText(bestWinner, ['model'], '-'))
+					: 'No winner yet'}</strong
+			>
 			<p>
 				{bestWinner
 					? rowText(
@@ -1211,7 +1408,7 @@
 				class:active={activeTab === tab.id}
 				onclick={() => (activeTab = tab.id)}
 			>
-				{#if tab.id === 'home' || tab.id === 'test-lab'}<Gauge size={16} />{/if}
+				{#if tab.id === 'test-lab'}<Gauge size={16} />{/if}
 				{#if tab.id === 'library'}<Download size={16} />{/if}
 				{#if tab.id === 'recommendations' || tab.id === 'history'}<FileJson size={16} />{/if}
 				{#if tab.id === 'router'}<Route size={16} />{/if}
@@ -1221,7 +1418,7 @@
 		{/each}
 	</nav>
 
-	{#if activeTab === 'home' || activeTab === 'test-lab'}
+	{#if activeTab === 'test-lab'}
 		<section class="wizard-grid">
 			<div class="panel">
 				<div class="panel-head">
@@ -1316,8 +1513,13 @@
 						>
 							<span class="checkbox">{selectedLocalIds.includes(model.id) ? '✓' : ''}</span>
 							<div>
-								<strong>{model.name || model.id}</strong>
-								<span>{modelParamLabel(model)}</span>
+								<strong title={modelFullName(model.name || model.id)}
+									>{modelDisplayName(model.name || model.id)}</strong
+								>
+								<span>{modelFullName(model.name || model.id)} · {modelParamLabel(model)}</span>
+								<div class="tag-list">
+									{#each modelTags(model) as tag (tag)}<b>{tag}</b>{/each}
+								</div>
 							</div>
 						</button>
 					{/each}
@@ -1515,7 +1717,7 @@
 				<h2>Need more models?</h2>
 				<p>
 					Download candidates here, then press FIT to add them to local models. They will appear in
-					Start here and can be selected for the benchmark campaign.
+					Test Lab and can be selected for the benchmark campaign.
 				</p>
 			</div>
 		</section>
@@ -1578,8 +1780,13 @@
 						<span class={`fit ${model.fit_level}`}>{model.fit_level}</span>
 						<strong>{fmtNumber(model.score, 1)}</strong>
 						<div class="model-cell">
-							<strong>{model.name}</strong>
-							<span>{model.provider} / {model.quant} / {model.gpu_mode}</span>
+							<strong title={modelFullName(model.name)}>{modelDisplayName(model.name)}</strong>
+							<span>{modelFullName(model.name)}</span>
+							<div class="tag-list">
+								{#each uniqueStrings( [model.provider, model.download?.provider ? `GGUF: ${model.download.provider}` : '', ...(model.tags ?? [])] ).slice(0, 8) as tag (tag)}<b
+										>{tag}</b
+									>{/each}
+							</div>
 						</div>
 						<span>{fmtGb(model.memory_required_gb)}</span>
 						<span>{fmtNumber(model.estimated_tps, 1)} tok/s</span>
@@ -1590,12 +1797,16 @@
 									<span style={`width:${Math.min(100, job.percent || 0)}%`}></span>
 								</div>
 							{/if}
+							{#if job?.error}<small class="download-error">{job.error}</small>{/if}
+							{#if !model.download}<small>No verified GGUF repository; download disabled.</small
+								>{/if}
 						</div>
 						<div class="row-actions">
 							<button
 								type="button"
 								onclick={() => downloadModel(model)}
 								disabled={!canStartDownload(model)}
+								title={job?.error ?? (!model.download ? 'No verified GGUF source' : '')}
 							>
 								<Download size={15} />
 								{downloadActionLabel(model)}
@@ -1735,7 +1946,12 @@
 							<section class="recommendation-hero">
 								<div class="winner-answer">
 									<span class="eyebrow">Recommended on this hardware</span>
-									<h3>{rowText(bestWinner, ['model'], '-')}</h3>
+									<h3 title={modelFullName(rowText(bestWinner, ['model'], '-'))}>
+										{modelDisplayName(rowText(bestWinner, ['model'], '-'))}
+									</h3>
+									<small class="full-model-name"
+										>{modelFullName(rowText(bestWinner, ['model'], '-'))}</small
+									>
 									<p>
 										{rowText(
 											bestWinner,
@@ -1759,6 +1975,14 @@
 										disabled={!canFitCaliberRow(bestWinner)}
 										><CheckCircle2 size={15} />Apply known-good preset</button
 									>
+									{#if !canFitCaliberRow(bestWinner)}
+										<div class="fit-blocked">
+											<span>{fitBlockReason(bestWinner)}</span>
+											<button type="button" onclick={() => selectRowForTest(bestWinner)}
+												>Test for FIT</button
+											>
+										</div>
+									{/if}
 								</div>
 								<div class="answer-metrics">
 									<div>
@@ -1786,8 +2010,11 @@
 									{#each bestAlternatives as alternative, index (rowIdentity(alternative))}
 										<div>
 											<span>Alternative {index + 1}</span><strong
-												>{rowText(alternative, ['model'], '-')}</strong
+												>{modelDisplayName(rowText(alternative, ['model'], '-'))}</strong
 											>
+											<div class="tag-list">
+												{#each reportRowTags(alternative) as tag (tag)}<b>{tag}</b>{/each}
+											</div>
 											<p>
 												{rowText(
 													alternative,
@@ -1870,7 +2097,50 @@
 							</div>
 						{/if}
 
-						<section class="report-section">
+						<section class="report-section throughput-section">
+							<div class="section-heading">
+								<h3>Throughput & memory</h3>
+								<p>Compare each model winner before opening the detailed memory/latency plot.</p>
+							</div>
+							<div class="segmented metric-tabs">
+								{#each reportMetrics as metric (metric)}
+									<button
+										type="button"
+										class:active={reportMetric === metric}
+										onclick={() => (reportMetric = metric)}>{reportMetricLabel(metric)}</button
+									>
+								{/each}
+							</div>
+							<div class="metric-legend">
+								<span><i></i>Bar length is normalized within the selected metric.</span>
+								<strong
+									>{metricHigherIsBetter(reportMetric)
+										? 'Longer is better for throughput.'
+										: 'Longer means lower cost for memory/latency.'}</strong
+								>
+							</div>
+							<div class="throughput-bars">
+								{#each reportLeaderboard as row (rowIdentity(row))}
+									<div class="throughput-row">
+										<span title={modelFullName(rowText(row, ['model'], '-'))}>
+											<b class={`rank-tag ${reportFitClass(row)}`}>{reportFitLabel(row)}</b>
+											{modelDisplayName(rowText(row, ['model'], '-'))}
+										</span>
+										<div class="throughput-track">
+											<i style={`width:${reportBarWidth(row)}%`}></i>
+										</div>
+										<strong
+											>{reportMetricUnit(
+												reportMetric,
+												reportMetricValue(row, reportMetric)
+											)}</strong
+										>
+									</div>
+								{/each}
+							</div>
+						</section>
+
+						<section class="report-section scatter-section">
 							<div class="section-heading">
 								<h3>Memory vs latency</h3>
 								<p>
@@ -1888,20 +2158,45 @@
 									>
 										<line class="axis" x1="70" y1="312" x2="930" y2="312" />
 										<line class="axis" x1="70" y1="54" x2="70" y2="312" />
-										<line class="budget" x1="70" y1="180" x2="930" y2="180" />
-										<text x="72" y="344">Total time, log scale</text>
-										<text x="12" y="58">Memory used</text>
-										<text x="780" y="174">GPU VRAM budget</text>
+										{#each scatterTickRatios as ratio (ratio)}
+											{@const x = 70 + ratio * 860}
+											{@const y = 312 - ratio * 258}
+											<line class="grid-line" x1={x} y1="54" x2={x} y2="312" />
+											<line class="grid-line" x1="70" y1={y} x2="930" y2={y} />
+											<text class="tick-label" {x} y="330" text-anchor="middle"
+												>{fmtNumber(
+													scatterTimeTick(ratio),
+													scatterTimeTick(ratio) < 10 ? 1 : 0
+												)}s</text
+											>
+											<text class="tick-label" x="64" y={y + 4} text-anchor="end"
+												>{ratio === 0 ? '0' : fmtMib(scatterMemoryTick(ratio))}</text
+											>
+										{/each}
+										{#if reportVramBudgetMib > 0 && reportVramBudgetMib <= reportMaxMemory * 1.05}
+											<line
+												class="budget"
+												x1="70"
+												y1={reportBudgetY()}
+												x2="930"
+												y2={reportBudgetY()}
+											/>
+											<text class="budget-label" x="924" y={reportBudgetY() - 6} text-anchor="end"
+												>VRAM budget {fmtMib(reportVramBudgetMib)}</text
+											>
+										{/if}
+										<text x="420" y="352">Total request time (log scale)</text>
+										<text x="16" y="46">Peak memory</text>
 										{#each reportScatterRows.slice(0, 360) as row, index (`${index}-${rowIdentity(row)}`)}
 											<circle
-												cx={70 + ((reportScatterX(row) - 58) / 662) * 860}
-												cy={54 + ((reportScatterY(row) - 54) / 244) * 258}
+												cx={reportScatterX(row)}
+												cy={reportScatterY(row)}
 												r={isReportCandidate(row) ? 5.8 : 4}
 												class={`dot-${index % 5}`}
 												class:candidate={isReportCandidate(row)}
 											>
 												<title
-													>{rowText(row, ['model'], '-')} / {fmtNumber(
+													>{modelFullName(rowText(row, ['model'], '-'))} / {fmtNumber(
 														rowNum(row, ['eval_tps', 'tps']),
 														1
 													)} t/s / {fmtMib(reportMemoryMib(row))} / ctx {rowNum(row, [
@@ -1927,7 +2222,9 @@
 									<div class="leader-bars compact">
 										{#each reportLeaderboard.slice(0, 8) as row (rowIdentity(row))}
 											<div class="leader-row">
-												<span>{rowText(row, ['model'], '-')}</span>
+												<span title={modelFullName(rowText(row, ['model'], '-'))}
+													>{modelDisplayName(rowText(row, ['model'], '-'))}</span
+												>
 												<div><i style={`width:${reportBarWidth(row)}%`}></i></div>
 												<strong
 													>{reportMetricUnit(
@@ -2031,20 +2328,31 @@
 							<div class="section-heading">
 								<h3>Prefill & KV-depth load curve</h3>
 								<p>
-									Diagnostic rows show whether throughput or fit collapses as the prompt and KV
-									cache grow.
+									Prefill measures prompt ingestion. KV-fill measures decode after the cache was
+									filled to the stated depth. Repeated points at the same depth are shown as their
+									median.
 								</p>
 							</div>
 							{#if loadCurveRows.length > 0}
+								<div class="curve-legend">
+									<span><i class="healthy"></i>≥80% of this model's fastest point</span>
+									<span><i class="degraded"></i>55–79% degradation</span>
+									<span><i class="collapse"></i>&lt;55% possible collapse</span>
+									<strong>Bar = speed retention; number = absolute prompt throughput.</strong>
+								</div>
 								<div class="load-curves">
 									{#each loadCurveRows as row, index (`${index}-${rowIdentity(row)}`)}<div>
-											<span
-												>{rowText(row, ['model'], '-')} · {rowText(row, ['workload_kind'])} · {Math.round(
-													loadTarget(row) / 1024
-												)}k</span
+											<span title={modelFullName(rowText(row, ['model'], '-'))}
+												>{modelDisplayName(rowText(row, ['model'], '-'))} · {rowText(row, [
+													'workload_kind'
+												])} · {fmtTokens(loadTarget(row))}{rowNum(row, ['curve_samples']) > 1
+													? ` · median of ${rowNum(row, ['curve_samples'])}`
+													: ''}</span
 											>
-											<div><i style={`width:${loadCurveWidth(row)}%`}></i></div>
-											<strong>{fmtNumber(rowNum(row, ['prompt_tps', 'eval_tps']), 1)} t/s</strong>
+											<div>
+												<i class={loadCurveBand(row)} style={`width:${loadCurveWidth(row)}%`}></i>
+											</div>
+											<strong>{fmtNumber(loadCurveSpeed(row), 1)} t/s</strong>
 										</div>{/each}
 								</div>
 							{:else}<p class="empty">
@@ -2054,10 +2362,10 @@
 
 						<section class="report-section">
 							<div class="section-heading">
-								<h3>Models (winners per current filter)</h3>
+								<h3>Preset actions by model</h3>
 								<p>
-									Each row shows the selected winner for one model. Expand it to inspect all
-									measured configs.
+									Expand a model to inspect every config. FIT is enabled only for its own streaming,
+									context-verified and quality-qualified row; otherwise use Test for FIT.
 								</p>
 							</div>
 							<div class="analytics-models">
@@ -2069,7 +2377,9 @@
 													class={`rank-tag ${group.winner ? reportFitClass(group.winner) : 'low'}`}
 													>{group.winner ? reportFitLabel(group.winner) : 'n/a'}</span
 												>
-												<strong>{group.model}</strong>
+												<strong title={modelFullName(group.model)}
+													>{modelDisplayName(group.model)}</strong
+												>
 												{#if group.winner}
 													<code
 														>{rowText(
@@ -2091,11 +2401,18 @@
 														disabled={!canFitCaliberRow(group.winner as CaliberRow)}
 														title={canFitCaliberRow(group.winner as CaliberRow)
 															? 'Apply measured winner'
-															: 'Requires decision-grade streaming evidence'}
+															: fitBlockReason(group.winner as CaliberRow)}
 													>
 														<CheckCircle2 size={14} />
 														FIT winner
 													</button>
+													{#if !canFitCaliberRow(group.winner as CaliberRow)}
+														<button
+															type="button"
+															onclick={() => selectRowForTest(group.winner as CaliberRow)}
+															>Test for FIT</button
+														>
+													{/if}
 												</div>
 											{:else}
 												<span>no winner-eligible rows</span>
@@ -2180,41 +2497,6 @@
 								</div>
 							</details>
 						</section>
-
-						<section class="report-section">
-							<div class="section-heading">
-								<h3>Throughput & memory</h3>
-								<p>The selected metric changes the ordering and bar scale.</p>
-							</div>
-							<div class="segmented metric-tabs">
-								{#each reportMetrics as metric (metric)}
-									<button
-										type="button"
-										class:active={reportMetric === metric}
-										onclick={() => (reportMetric = metric)}>{reportMetricLabel(metric)}</button
-									>
-								{/each}
-							</div>
-							<div class="throughput-bars">
-								{#each reportLeaderboard as row (rowIdentity(row))}
-									<div class="throughput-row">
-										<span>
-											<b class={`rank-tag ${reportFitClass(row)}`}>{reportFitLabel(row)}</b>
-											{rowText(row, ['model'], '-')}
-										</span>
-										<div class="throughput-track">
-											<i style={`width:${reportBarWidth(row)}%`}></i>
-										</div>
-										<strong
-											>{reportMetricUnit(
-												reportMetric,
-												reportMetricValue(row, reportMetric)
-											)}</strong
-										>
-									</div>
-								{/each}
-							</div>
-						</section>
 					</div>
 				{:else}
 					<p class="empty">No historical Caliber rows yet.</p>
@@ -2234,8 +2516,29 @@
 				</p>
 			</div>
 			<div class="alias-grid">
-				{#each [['local-auto', 'Balanced measured default'], ['local-fast', 'Lowest interactive latency'], ['local-best', 'Highest qualified quality'], ['local-code', 'Coding and FIM qualified'], ['local-long', 'Long-context retrieval qualified'], ['local-vision', 'Vision-capable artifact']] as alias (alias[0])}
-					<div><code>{alias[0]}</code><span>{alias[1]}</span><a href="#/">Use in chat</a></div>
+				{#each aliasCards as alias (alias.id)}
+					{@const decision = aliasDecision(alias.id)}
+					{@const evidence = asRecord(decision?.evidence)}
+					<div>
+						<code>{alias.id}</code><span>{alias.description}</span>
+						<div class="tag-list">
+							{#each uniqueStrings( [...alias.tags, rowText( evidence ?? {}, ['variant'] ), rowText( evidence ?? {}, ['evidence_level'] ), decision?.quality_pack ? `${String(decision.quality_pack)} pack` : ''] ).filter(Boolean) as tag (tag)}<b
+									>{tag}</b
+								>{/each}
+						</div>
+						{#if decision?.selected_model}
+							<small>Current winner</small>
+							<strong title={modelFullName(String(decision.selected_model))}
+								>{modelDisplayName(String(decision.selected_model))}</strong
+							>
+							<span
+								>{fmtNumber(Number(decision.quality ?? 0) * 100, 0)}% quality · {fmtTokens(
+									Number(decision.required_context ?? 0)
+								)} required</span
+							>
+						{:else}<small>No qualified routing decision recorded yet.</small>{/if}
+						<a href="#/">Use in chat</a>
+					</div>
 				{/each}
 			</div>
 			<div class="route-log">
@@ -2784,6 +3087,50 @@
 		min-width: 0;
 	}
 
+	.tag-list {
+		display: flex !important;
+		flex-wrap: wrap;
+		gap: 4px !important;
+	}
+
+	.tag-list b {
+		width: fit-content;
+		border: 1px solid color-mix(in oklch, var(--caliber-accent) 45%, var(--border));
+		border-radius: 999px;
+		background: color-mix(in oklch, var(--caliber-accent) 10%, transparent);
+		padding: 2px 6px;
+		color: var(--muted-foreground);
+		font-size: 10px;
+		font-weight: 650;
+		line-height: 1.25;
+	}
+
+	.download-error {
+		max-width: 260px;
+		color: #fca5a5;
+		line-height: 1.25;
+	}
+
+	.full-model-name {
+		color: #aab4c3;
+		line-height: 1.35;
+	}
+
+	.fit-blocked {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr) max-content;
+		gap: 8px;
+		align-items: center;
+		border-left: 3px solid #f59e0b;
+		background: rgba(245, 158, 11, 0.08);
+		padding: 8px 10px;
+	}
+
+	.fit-blocked span {
+		color: #fde68a;
+		font-size: 12px;
+	}
+
 	.progress,
 	.mini-progress {
 		width: 100%;
@@ -3293,6 +3640,11 @@
 		stroke: #6b7280;
 	}
 
+	.report-scatter .grid-line {
+		stroke: #3f3f46;
+		stroke-width: 0.7;
+	}
+
 	.report-scatter .budget {
 		stroke: #ef4444;
 		stroke-dasharray: 4 4;
@@ -3332,6 +3684,63 @@
 	.report-scatter text {
 		fill: #cbd5e1;
 		font-size: 12px;
+	}
+
+	.report-scatter .tick-label {
+		fill: #94a3b8;
+		font-size: 10px;
+	}
+
+	.report-scatter .budget-label {
+		fill: #fca5a5;
+		font-size: 10px;
+	}
+
+	.metric-legend,
+	.curve-legend {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 10px 18px;
+		align-items: center;
+		border: 1px solid #454545;
+		background: #202020;
+		padding: 8px 10px;
+		font-size: 11px;
+	}
+
+	.metric-legend span,
+	.curve-legend span {
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+	}
+
+	.metric-legend i {
+		display: inline-block;
+		width: 32px;
+		height: 7px;
+		background: linear-gradient(90deg, #8b5cf6, #22c55e);
+	}
+
+	.curve-legend i {
+		display: inline-block;
+		width: 18px;
+		height: 7px;
+	}
+
+	.curve-legend i.healthy,
+	.load-curves i.healthy {
+		background: #22c55e;
+	}
+
+	.curve-legend i.degraded,
+	.load-curves i.degraded {
+		background: #f59e0b;
+	}
+
+	.curve-legend i.collapse,
+	.load-curves i.collapse {
+		background: #ef4444;
 	}
 
 	.metric-panel,

@@ -2017,8 +2017,12 @@ void server_models_routes::init_routes() {
         }
         const json virtual_aliases = least_cost_router::aliases();
         for (const auto & [alias, policy] : virtual_aliases.items()) {
+            json tags = json::array({"virtual", "least-cost", "streaming-measured", "quality-gated", "context-aware"});
+            tags.push_back(json_value(policy, "objective", std::string("balanced")));
+            tags.push_back(json_value(policy, "quality_pack", std::string("overall")) + " quality");
+            if (alias == "local-vision" && std::find(tags.begin(), tags.end(), "vision") == tags.end()) tags.push_back("vision");
             models_json.push_back({
-                {"id", alias}, {"aliases", json::array()}, {"tags", json::array({"virtual", "least-cost"})},
+                {"id", alias}, {"aliases", json::array()}, {"tags", tags},
                 {"object", "model"}, {"owned_by", "llamacpp-local-router"}, {"created", t},
                 {"status", {{"value", "virtual"}}},
                 {"architecture", {{"input_modalities", alias == "local-vision" ? json::array({"text", "image"}) : json::array({"text"})}, {"output_modalities", json::array({"text"})}}},

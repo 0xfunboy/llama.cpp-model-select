@@ -845,6 +845,17 @@ struct server_caliber_advisor_routes::impl {
         if (registry.contains("artifacts") && registry["artifacts"].is_array()) {
             for (const auto & artifact : registry["artifacts"]) {
                 const bool loadable = artifact.value("loadable", false);
+                json tags = json::array();
+                json aliases = json::array();
+                if (artifact.contains("configured_ids") && artifact["configured_ids"].is_array()) {
+                    for (const auto & configured_id : artifact["configured_ids"]) {
+                        if (!configured_id.is_string()) continue;
+                        const auto meta = router.models.get_meta(configured_id.get<std::string>());
+                        if (!meta.has_value()) continue;
+                        for (const auto & tag : meta->tags) if (std::find(tags.begin(), tags.end(), tag) == tags.end()) tags.push_back(tag);
+                        for (const auto & alias : meta->aliases) if (std::find(aliases.begin(), aliases.end(), alias) == aliases.end()) aliases.push_back(alias);
+                    }
+                }
                 models.push_back({
                     {"id", json_value(artifact, "artifact_id", std::string())},
                     {"artifact_id", json_value(artifact, "artifact_id", std::string())},
@@ -855,6 +866,9 @@ struct server_caliber_advisor_routes::impl {
                     {"status", json_value(artifact, "health", std::string())},
                     {"loadable", loadable},
                     {"configured", artifact.value("configured", false)},
+                    {"configured_ids", artifact.value("configured_ids", json::array())},
+                    {"tags", tags},
+                    {"aliases", aliases},
                     {"path", loadable ? artifact.value("primary_path", json(nullptr)) : json(nullptr)},
                     {"plan_meta", artifact.value("metadata", json::object())},
                     {"missing_shards", artifact.value("missing_shards", json::array())},

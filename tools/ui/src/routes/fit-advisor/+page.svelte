@@ -8,6 +8,7 @@
 		type FitAdvisorModelsResponse
 	} from '$lib/services/fit-advisor.service';
 	import { modelsStore } from '$lib/stores/models.svelte';
+	import { compactModelName, normalizeModelName, uniqueModelTags } from '$lib/utils/model-display';
 
 	let response = $state<FitAdvisorModelsResponse | null>(null);
 	let selectedModel = $state<FitAdvisorModel | null>(null);
@@ -253,13 +254,14 @@
 	}
 
 	function downloadJobFor(model: FitAdvisorModel): FitAdvisorDownloadJob | null {
-		return (
-			downloadJobs.find(
-				(job) => job.model_id === model.id || job.hf_ref === model.download?.hf_ref
-			) ??
-			model.download_progress ??
-			null
-		);
+		if (model.download?.hf_ref) {
+			return (
+				downloadJobs.find((job) => job.hf_ref === model.download?.hf_ref) ??
+				model.download_progress ??
+				null
+			);
+		}
+		return downloadJobs.find((job) => job.model_id === model.id) ?? model.download_progress ?? null;
 	}
 
 	function isActiveDownloadStatus(status: string): boolean {
@@ -301,6 +303,7 @@
 	}
 
 	function downloadButtonLabel(model: FitAdvisorModel): string {
+		if (!model.download) return 'No GGUF source';
 		const job = downloadJobFor(model);
 		if (job && isActiveDownloadStatus(job.status)) {
 			const progress =
@@ -567,8 +570,20 @@
 									</td>
 									<td class="px-3 py-2 font-medium">{fmtNum(model.score)}</td>
 									<td class="px-3 py-2">
-										<div class="font-medium">{model.name}</div>
-										<div class="truncate text-xs text-muted-foreground">{model.id}</div>
+										<div class="font-medium" title={normalizeModelName(model.name)}>
+											{compactModelName(model.name)}
+										</div>
+										<div class="truncate text-xs text-muted-foreground">
+											{normalizeModelName(model.name)}
+										</div>
+										<div class="mt-1 flex flex-wrap gap-1">
+											{#each uniqueModelTags([model.provider, ...(model.tags ?? [])], 6) as tag (tag)}
+												<span
+													class="rounded-full border px-1.5 py-0.5 text-[10px] text-muted-foreground"
+													>{tag}</span
+												>
+											{/each}
+										</div>
 									</td>
 									<td class="px-3 py-2">{model.quant}</td>
 									<td class="px-3 py-2">{fmtGb(model.memory_required_gb)}</td>
@@ -614,8 +629,19 @@
 					{@const selectedStatus = statusFor(selectedModel)}
 					<div class="space-y-4 p-4">
 						<div>
-							<div class="text-lg font-semibold">{selectedModel.name}</div>
-							<div class="break-all text-xs text-muted-foreground">{selectedModel.id}</div>
+							<div class="text-lg font-semibold" title={normalizeModelName(selectedModel.name)}>
+								{compactModelName(selectedModel.name)}
+							</div>
+							<div class="break-all text-xs text-muted-foreground">
+								{normalizeModelName(selectedModel.name)}
+							</div>
+							<div class="mt-2 flex flex-wrap gap-1">
+								{#each uniqueModelTags( [selectedModel.provider, ...(selectedModel.tags ?? [])] ) as tag (tag)}
+									<span class="rounded-full border px-2 py-0.5 text-xs text-muted-foreground"
+										>{tag}</span
+									>
+								{/each}
+							</div>
 						</div>
 						<div class="grid grid-cols-2 gap-2 text-sm">
 							<div class="rounded-md border p-2">

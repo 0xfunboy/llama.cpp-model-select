@@ -128,12 +128,14 @@ export interface FitAdvisorModel {
 	partial?: boolean;
 	download_status?:
 		| 'available'
+		| 'unavailable'
 		| 'downloading'
 		| 'downloaded'
 		| 'configured'
 		| 'partial'
 		| 'failed';
 	installed_model_id?: string;
+	tags?: string[];
 	local_path?: string | null;
 	target_dir?: string;
 	download_progress?: FitAdvisorDownloadJob | null;

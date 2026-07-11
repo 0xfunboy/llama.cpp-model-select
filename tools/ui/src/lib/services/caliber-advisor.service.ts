@@ -9,6 +9,9 @@ export interface CaliberModel {
 	status: string;
 	loadable?: boolean;
 	configured?: boolean;
+	configured_ids?: string[];
+	tags?: string[];
+	aliases?: string[];
 	path?: string | null;
 	plan_meta?: Record<string, unknown>;
 }
