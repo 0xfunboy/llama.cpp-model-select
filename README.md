@@ -4,10 +4,11 @@
 
 This fork answers that question on the hardware in front of you. Point it at one
 or more GGUF directories and open **Local LLM Autopilot** in the embedded UI. It
-discovers complete artifacts, detects broken shards and duplicates, plans safe
-runtime settings, races candidates, measures finalists through real streaming
-`llama-server` requests, applies a task-quality floor, and presents one answer
-with inspectable alternatives.
+discovers complete artifacts, detects broken shards and duplicates, normalizes
+long model names into readable product labels, plans safe runtime settings,
+races candidates, measures finalists through real streaming `llama-server`
+requests, applies use-case quality evidence, and presents one answer with
+inspectable alternatives.
 
 The answer includes the exact context, KV cache, GPU offload/split, MoE, batch and
 thread preset that was proved on this machine. Estimates, synthetic benchmarks,
@@ -15,25 +16,30 @@ streaming measurements and quality results are labelled separately; only a
 context-verified, memory-observed, streaming-measured and quality-qualified row
 can be applied automatically.
 
-The product navigation is deliberately small:
+The fork patch set is intentionally product-shaped, not just a collection of
+tools:
 
-- **Home** — choose use case, normal context, objective, installed-only preference
-  and allowed test time.
-- **Library** — directory discovery, health, downloads, duplicates and initial fit.
-- **Test Lab** — adaptive synthetic racing, streaming profiling and quality packs.
-- **Recommendations** — one qualified winner, three alternatives and full evidence.
-- **Router** — stable `local-*` virtual models and inspectable route decisions.
-- **History** — immutable campaigns, comparison and portable archive.
-- **Doctor** — first-run readiness plus stale build/driver evidence detection.
+- **Library** - directory discovery, health, downloads, duplicates and initial
+  fit. This is the default starting point because the normal workflow begins
+  with finding or adding a model.
+- **Test Lab** - guided use-case selection, candidate selection, adaptive
+  synthetic racing, streaming profiling and quality scope planning.
+- **Recommendations** - one qualified winner, alternatives, hardware evidence
+  and DS4-derived capability rankings by use case.
+- **Evaluator** - integrated DS4 quality evaluation for reasoning, coding, RAG,
+  tool use, long context and other product packs. Large multi-model runs are
+  resumable and may take hours or days.
+- **Router** - stable `local-*` virtual models and inspectable route decisions.
+- **History** - immutable campaigns, comparison and portable archive.
+- **Doctor** - first-run readiness plus stale build/driver evidence detection.
 
 Everything is offline-first. Runtime state lives under the platform XDG data and
 state directories; sanitized JSON is an import/export format, not a second store.
 See [the operator and migration guide](docs/local-llm-autopilot.md).
 
 This fork tracks upstream `ggml-org/llama.cpp` and keeps inference on native
-`llama-server` router mode. The upstream README continues below this overview.
-
-The upstream README continues below this fork overview.
+`llama-server` router mode. The upstream README continues below this fork
+overview.
 
 ### Product capabilities
 
@@ -41,16 +47,16 @@ The upstream README continues below this fork overview.
 - **Admin router control API** for lifecycle-safe model switching:
   - `GET /admin/models`
   - `POST /admin/switch`
-- **Unified Local LLM Autopilot dashboard** at `/caliber-advisor`; Fit and DS4
-  remain progressively disclosed expert tools rather than separate novice flows.
+- **Unified Local LLM Autopilot dashboard** at `/caliber-advisor`; Fit, Caliber
+  and DS4 evidence are integrated into one novice-safe workflow.
 - **Fit engine**, backed by a native C++ advisor
   inspired by [`AlexsJones/llmfit`](https://github.com/AlexsJones/llmfit).
 - **Caliber engine**, a Svelte/native-router
   port of core planning, scoring, guided-run, benchmark and reporting ideas from
   [`SpeederX/calibr`](https://github.com/SpeederX/calibr).
-- **Quality evaluator** for resumable DwarfStar-style quality runs plus built-in
-  general, chat, coding, reasoning, FIM, RAG, tools and long-context packs,
-  inspired by [`antirez/ds4`](https://github.com/antirez/ds4).
+- **Use-case Evaluator** for resumable DwarfStar-style quality runs plus
+  built-in general, chat, coding, reasoning, FIM, RAG, tools and long-context
+  packs, inspired by [`antirez/ds4`](https://github.com/antirez/ds4).
 - **Model report and comparison views** with sector summaries, winner selection,
   per-model drilldowns, and historical comparison across completed runs.
 - **aria2c Hugging Face download manager** for resumable GGUF downloads.
@@ -159,19 +165,29 @@ local-model operations ideas from several focused projects:
 - Marks synthetic `llama-bench` rows explicitly so benchmark output is not
   confused with full streaming chat telemetry.
 
-### DS4-Eval Features
+### Use-case Evaluator And DS4 Features
 
 - Runs the test suite from `tools/server/ds4-eval-cases.json`.
-- Covers multiple subject sectors, including logic, geometry, algebra,
-  cybersecurity, philosophy, and reasoning-style cases where present in the suite.
-- Supports model subsets and `ALL` selection.
+- Uses the same model registry, compact labels, configured IDs and aliases as
+  Library, Test Lab and Recommendations.
+- Shows newly discovered GGUF artifacts immediately while keeping unconfigured
+  artifacts disabled until Library writes a router preset that DS4 can load.
+- Covers multiple subject sectors and product packs, including general,
+  chat, coding, reasoning, FIM, RAG, tools and long context where present in the
+  suite.
+- Supports model subsets, configured `ALL` selection and direct launch from the
+  Test Lab `Use-case Evaluator` scope.
 - Streams long-running job progress to the UI.
 - Keeps job state visible after page changes or browser reconnects.
 - Saves partial reports on stop and supports resuming compatible reports.
-- Writes reports under `tools/ui/static/reports`.
+- Stores canonical reports through the shared report archive and exposes JSON as
+  a derived view/export.
 - Provides a model report panel below test logs with sector-level percentages.
 - Supports single-model summaries and race-style comparison between models from
   completed evaluation runs.
+- Feeds Recommendations with weighted capability rankings so sector fit is based
+  on a mix of measured skills, evidence coverage and sample confidence rather
+  than a single raw score.
 - Retains completed model results as historical benchmark data while allowing
   interrupted or pending reports to be deleted.
 
@@ -220,6 +236,9 @@ local-model operations ideas from several focused projects:
 - Flattens non-portable historical reasoning chunks when a target template only
   accepts text assistant content.
 - Prevents automatic model load races across independent UI sections.
+- Keeps Test Lab checkbox controls visually and behaviorally independent.
+- Aligns use-case choice cards and normalizes model labels across Library, Test
+  Lab, Recommendations and Evaluator.
 - Deprioritizes creative or uncensored finetunes for DS4-style correctness and
   disables generated reasoning flags for those presets when appropriate.
 - Fixes advisor ranking issues caused by using transient free RAM instead of total
