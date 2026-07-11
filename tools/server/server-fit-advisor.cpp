@@ -1103,7 +1103,12 @@ static std::shared_ptr<fit_download_job> find_download_job(const std::string & m
     std::lock_guard<std::mutex> lock(g_fit_download_mutex);
     for (const auto & [_, job] : g_fit_download_jobs) {
         std::lock_guard<std::mutex> job_lock(job->mutex);
-        const bool matches = (!model_id.empty() && job->model_id == model_id) || (!hf_ref.empty() && job->hf_ref == hf_ref);
+        // A catalog entry may be corrected to a different GGUF repository.
+        // Do not let a failed job for the old source poison the new source just
+        // because the logical model id is the same.
+        const bool matches = !hf_ref.empty()
+            ? job->hf_ref == hf_ref
+            : (!model_id.empty() && job->model_id == model_id);
         if (!matches) {
             continue;
         }
@@ -1429,7 +1434,20 @@ static json first_gguf_source(const json & model) {
     }
     const std::string format = lower_copy(json_value(model, "format", std::string("gguf")));
     const std::string name = json_value(model, "name", std::string());
-    if (format == "gguf" && name.find('/') != std::string::npos) {
+    // llmfit occasionally classifies a Transformers/ModelOpt repository as
+    // GGUF based on its quantization metadata. Keep explicit, reviewed bridges
+    // for those cases instead of sending users to a repository with no GGUF.
+    static const std::map<std::string, std::string> known_gguf_bridges = {
+        {"nvidia/Gemma-4-31B-IT-NVFP4", "LibertAIDAI/Gemma-4-31B-IT-NVFP4-GGUF"},
+    };
+    if (const auto bridge = known_gguf_bridges.find(name); bridge != known_gguf_bridges.end()) {
+        const std::string provider = bridge->second.substr(0, bridge->second.find('/'));
+        return {{"repo", bridge->second}, {"provider", provider}, {"derived_from", name}};
+    }
+    // Without an explicit source list, only trust repositories whose identity
+    // itself declares GGUF. This avoids presenting safetensors/MLX/AWQ repos as
+    // downloadable llama.cpp artifacts merely because the catalog format lies.
+    if (format == "gguf" && name.find('/') != std::string::npos && contains_ci(name, "gguf")) {
         return {{"repo", name}, {"provider", json_value(model, "provider", std::string())}};
     }
     return json::object();
@@ -1739,7 +1757,7 @@ static json analyze_catalog_model(
     const bool partial = local_model_file_partial(local_path);
     const bool downloaded = local_model_file_ready(local_path);
     const bool configured = configured_entry && downloaded;
-    std::string download_status = "available";
+    std::string download_status = repo.empty() ? "unavailable" : "available";
     if (configured) {
         download_status = "configured";
     } else if (active_download) {
@@ -1758,11 +1776,31 @@ static json analyze_catalog_model(
     if (is_creative_uncensored_tune(id)) {
         notes.push_back("Creative/uncensored finetune: not prioritized for DS4-style correctness; reasoning is disabled in the generated preset.");
     }
+    if (repo.empty()) {
+        notes.push_back("No verified GGUF source is published for this catalog entry; download is disabled rather than guessing a repository.");
+    }
+
+    json tags = json::array();
+    auto add_tag = [&tags](const std::string & value) {
+        if (value.empty()) return;
+        if (std::find(tags.begin(), tags.end(), value) == tags.end()) tags.push_back(value);
+    };
+    add_tag(json_value(model, "parameter_count", std::string()));
+    add_tag(quant);
+    add_tag(use_case);
+    add_tag(run_mode);
+    add_tag(fit_level + " fit");
+    if (native_ctx > 0) add_tag(std::to_string((int) std::ceil(native_ctx / 1024.0)) + "k ctx");
+    if (json_value(model, "is_moe", false)) add_tag("MoE");
+    if (model.contains("capabilities") && model["capabilities"].is_array()) {
+        for (const auto & capability : model["capabilities"]) if (capability.is_string()) add_tag(capability.get<std::string>());
+    }
 
     return {
         {"id", id},
         {"name", std::filesystem::path(id).filename().string()},
         {"provider", json_value(model, "provider", std::string())},
+        {"tags", tags},
         {"params_b", params_b},
         {"parameter_count", json_value(model, "parameter_count", std::string())},
         {"is_moe", json_value(model, "is_moe", false)},
