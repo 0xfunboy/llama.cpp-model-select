@@ -84,6 +84,7 @@ async function mockProductApi(page: Page) {
 						{
 							id: 'qwen',
 							name: 'Qwen Local 14B',
+							configured_ids: ['qwen-runtime'],
 							loadable: true,
 							path: '/models/qwen.gguf',
 							plan_meta: { size_mib: 9000, gguf_context_length: 131072 }
@@ -142,6 +143,54 @@ async function mockProductApi(page: Page) {
 		if (url.pathname === '/api/fit-advisor/downloads') return route.fulfill({ json: { data: [] } });
 		if (url.pathname === '/api/fit-advisor/downloads/sse')
 			return route.fulfill({ status: 200, contentType: 'text/event-stream', body: '' });
+		if (url.pathname === '/api/ds4/reports')
+			return route.fulfill({
+				json: {
+					data: [],
+					quality_profiles: {
+						'artifact:qwen': {
+							artifact_id: 'artifact:qwen',
+							name: 'Qwen Local 14B',
+							variant: 'Q4_K_M',
+							score: 0.84,
+							pass: 34,
+							samples: 40,
+							packs: {
+								general: { score: 0.9, pass: 9, samples: 10 },
+								chat: { score: 0.8, pass: 8, samples: 10 },
+								reasoning: { score: 0.85, pass: 17, samples: 20 }
+							}
+						}
+					}
+				}
+			});
+		if (url.pathname === '/api/ds4/models')
+			return route.fulfill({
+				json: {
+					object: 'list',
+					data: [
+						{
+							id: 'ALL',
+							name: 'All configured models',
+							source: 'virtual',
+							evaluator_eligible: true,
+							status: { value: 'virtual', loaded: false, running: false }
+						},
+						{
+							id: 'qwen-runtime',
+							artifact_id: 'artifact:qwen',
+							name: 'Qwen Local 14B',
+							variant: 'Q4_K_M',
+							source: 'preset',
+							configured: true,
+							evaluator_eligible: true,
+							status: { value: 'loaded', loaded: true, running: true }
+						}
+					]
+				}
+			});
+		if (url.pathname === '/api/ds4/report')
+			return route.fulfill({ json: { active: false, matches: false, job: {} } });
 		if (url.pathname === '/api/router/decisions')
 			return route.fulfill({
 				json: {
@@ -180,7 +229,15 @@ test('guided flow exposes one qualified answer and three alternatives', async ({
 	if (await dismiss.count()) await dismiss.click();
 
 	await expect(page.getByRole('heading', { name: 'Local LLM Autopilot' })).toBeVisible();
-	for (const label of ['Library', 'Test Lab', 'Recommendations', 'Router', 'History', 'Doctor']) {
+	for (const label of [
+		'Library',
+		'Test Lab',
+		'Recommendations',
+		'Evaluator',
+		'Router',
+		'History',
+		'Doctor'
+	]) {
 		await expect(page.getByRole('button', { name: label, exact: true })).toBeVisible();
 	}
 	await expect(page.getByRole('button', { name: 'Home', exact: true })).toHaveCount(0);
@@ -188,8 +245,32 @@ test('guided flow exposes one qualified answer and three alternatives', async ({
 	await expect(page.getByText('Pick first 4')).toHaveCount(0);
 	await page.getByRole('button', { name: 'Test Lab', exact: true }).click();
 	await expect(page.getByLabel('Context target')).toHaveValue('32768');
+	await expect(page.getByRole('button', { name: /Use-case Evaluator/ })).toBeVisible();
+	const installedOnly = page.getByLabel('Use installed models first');
+	const loadWinner = page.getByLabel('Load winner immediately after FIT');
+	await expect(installedOnly).toBeChecked();
+	await expect(loadWinner).not.toBeChecked();
+	await loadWinner.check();
+	await expect(installedOnly).toBeChecked();
+	await expect(loadWinner).toBeChecked();
+	const checkboxSize = await installedOnly.evaluate((element) => ({
+		width: element.getBoundingClientRect().width,
+		height: element.getBoundingClientRect().height
+	}));
+	expect(checkboxSize.width).toBeLessThanOrEqual(20);
+	expect(checkboxSize.height).toBeLessThanOrEqual(20);
+	const firstChoice = page.locator('.compact-choice').first();
+	const choiceAlignment = await firstChoice.evaluate((element) => {
+		const strong = element.querySelector('strong')!.getBoundingClientRect();
+		const span = element.querySelector('span')!.getBoundingClientRect();
+		return Math.abs(strong.x - span.x);
+	});
+	expect(choiceAlignment).toBeLessThan(1);
 
 	await page.getByRole('button', { name: 'Recommendations', exact: true }).click();
+	await expect(page.getByRole('heading', { name: 'Use-case capability ranking' })).toBeVisible();
+	await expect(page.getByText('Qwen Local · 14B').first()).toBeVisible();
+	await expect(page.getByText('skill coverage')).toBeVisible();
 	await expect(page.getByText('Recommended on this hardware')).toBeVisible();
 	await expect(page.getByRole('heading', { name: 'Qwen Local · 14B' })).toBeVisible();
 	await expect(page.getByText(/quality 88%/).first()).toBeVisible();
@@ -205,6 +286,10 @@ test('guided flow exposes one qualified answer and three alternatives', async ({
 	expect((await throughput.boundingBox())!.y).toBeLessThan((await scatter.boundingBox())!.y);
 	await expect(page.getByText('Total request time (log scale)')).toBeVisible();
 	await expect(page.getByText('Metric glossary')).toBeVisible();
+	await page.getByRole('button', { name: 'Evaluator', exact: true }).click();
+	await expect(page.getByRole('heading', { name: 'Use-case Evaluator' })).toBeVisible();
+	await expect(page.getByText('DS4 evidence engine')).toBeVisible();
+	await expect(page.getByText('Qwen Local · 14B').first()).toBeVisible();
 	await page.getByRole('button', { name: 'Router', exact: true }).click();
 	await expect(page.getByText('Current winner')).toBeVisible();
 	await expect(page.getByText('Qualified resident model avoided a switch.')).toBeVisible();

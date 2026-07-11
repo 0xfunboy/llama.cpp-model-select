@@ -5,6 +5,7 @@
 		Activity,
 		CheckCircle2,
 		ChevronRight,
+		ClipboardCheck,
 		Cpu,
 		Download,
 		FileJson,
@@ -32,13 +33,27 @@
 		type FitAdvisorModel,
 		type FitAdvisorSystem
 	} from '$lib/services/fit-advisor.service';
+	import {
+		Ds4Service,
+		type Ds4QualityEvidence,
+		type Ds4QualityProfile
+	} from '$lib/services/ds4.service';
+	import { Ds4SuitePage } from '$lib/components/app/ds4';
 	import { RouterService, type LocalRouteEvent } from '$lib/services/router.service';
 	import { compactModelName, normalizeModelName } from '$lib/utils/model-display';
 
-	type TabId = 'library' | 'test-lab' | 'recommendations' | 'router' | 'history' | 'doctor';
+	type TabId =
+		| 'library'
+		| 'test-lab'
+		| 'recommendations'
+		| 'evaluator'
+		| 'router'
+		| 'history'
+		| 'doctor';
 	type UseCaseId = 'general' | 'chat' | 'coding' | 'reasoning' | 'rag' | 'tools' | 'long-context';
 	type ProfileId = 'overall' | 'speed' | 'efficiency' | 'safety';
-	type RunScope = 'quick' | 'standard' | 'deep';
+	type RunScope = 'quick' | 'standard' | 'deep' | 'evaluator';
+	type QualitySectorId = 'daily' | 'coding' | 'research' | 'reasoning' | 'agents' | 'long';
 	type ReportScope = 'latest' | 'all';
 	type ReportMetric = 'eval' | 'prompt' | 'memory' | 'latency' | 'vram';
 	type CaliberRow = Record<string, unknown>;
@@ -56,6 +71,7 @@
 		{ id: 'library', label: 'Library' },
 		{ id: 'test-lab', label: 'Test Lab' },
 		{ id: 'recommendations', label: 'Recommendations' },
+		{ id: 'evaluator', label: 'Evaluator' },
 		{ id: 'router', label: 'Router' },
 		{ id: 'history', label: 'History' },
 		{ id: 'doctor', label: 'Doctor' }
@@ -97,7 +113,7 @@
 	};
 	const scopeOptions: Record<
 		RunScope,
-		{ title: string; help: string; workload: 'baseline' | 'all' }
+		{ title: string; help: string; workload: 'baseline' | 'all'; evaluator?: boolean }
 	> = {
 		quick: {
 			title: 'Quick comparison',
@@ -113,6 +129,47 @@
 			title: 'Deep calibration',
 			help: 'Keeps the full sweep visible for diagnosis. Slower, but closer to the original Calibr flow.',
 			workload: 'all'
+		},
+		evaluator: {
+			title: 'Use-case Evaluator',
+			help: 'Runs DS4 plus product quality packs to discover where each selected model is strongest. This is a massive test and can take hours or several days.',
+			workload: 'all',
+			evaluator: true
+		}
+	};
+	const qualitySectors: Record<
+		QualitySectorId,
+		{ title: string; help: string; weights: Record<string, number> }
+	> = {
+		daily: {
+			title: 'Everyday assistant',
+			help: 'General knowledge reinforced by chat, reasoning, tools and grounded retrieval.',
+			weights: { general: 0.35, chat: 0.2, reasoning: 0.2, tools: 0.15, rag: 0.1 }
+		},
+		coding: {
+			title: 'Coding & engineering',
+			help: 'Programming accuracy reinforced by completion, tool use and problem solving.',
+			weights: { coding: 0.4, fim: 0.15, tools: 0.2, reasoning: 0.15, general: 0.1 }
+		},
+		research: {
+			title: 'Research & documents',
+			help: 'Retrieval and long-context evidence combined with reasoning and general knowledge.',
+			weights: { rag: 0.3, reasoning: 0.25, 'long-context': 0.2, general: 0.15, tools: 0.1 }
+		},
+		reasoning: {
+			title: 'Deep reasoning',
+			help: 'Logic and scientific problem solving, with supporting coding and knowledge evidence.',
+			weights: { reasoning: 0.6, general: 0.2, coding: 0.1, 'long-context': 0.1 }
+		},
+		agents: {
+			title: 'Agents & tools',
+			help: 'Structured tool use supported by coding, instruction following and reasoning.',
+			weights: { tools: 0.4, coding: 0.2, chat: 0.2, reasoning: 0.2 }
+		},
+		long: {
+			title: 'Long-context knowledge',
+			help: 'Needle retrieval and grounded documents supported by reasoning quality.',
+			weights: { 'long-context': 0.45, rag: 0.35, reasoning: 0.2 }
 		}
 	};
 	const workflow = [
@@ -199,6 +256,8 @@
 	let loadAfterConfigure = $state(false);
 	let routeEvents = $state<LocalRouteEvent[]>([]);
 	let doctorSystem = $state<Record<string, unknown> | null>(null);
+	let ds4QualityProfiles = $state<Record<string, Ds4QualityProfile>>({});
+	let qualitySector = $state<QualitySectorId>('daily');
 
 	let fitSystem = $state<FitAdvisorSystem | null>(null);
 	let catalogModels = $state<FitAdvisorModel[]>([]);
@@ -270,7 +329,20 @@
 	);
 	const planModels = $derived(uniqueStrings(plan.map((item) => item.model)).length);
 	const targetContext = $derived(contextOptions.find((item) => item.value === contextSize));
-	const readyToRun = $derived(pendingSelectedIds.length > 0 && !running);
+	const selectedDs4ModelIds = $derived.by(() =>
+		uniqueStrings(
+			selectedLocalIds.flatMap(
+				(id) => models.find((model) => model.id === id)?.configured_ids?.slice(0, 1) ?? []
+			)
+		)
+	);
+	const readyToRun = $derived(
+		!running &&
+			(runScope === 'evaluator' ? selectedDs4ModelIds.length > 0 : pendingSelectedIds.length > 0)
+	);
+	const qualityRankings = $derived.by(() =>
+		rankQualityProfiles(ds4QualityProfiles, qualitySectors[qualitySector].weights)
+	);
 	const nextAction = $derived(nextActionText());
 	const doctorData = $derived(asRecord(doctorSystem?.doctor));
 
@@ -319,6 +391,55 @@
 
 	function uniqueStrings(values: string[]): string[] {
 		return [...new Set(values.filter(Boolean))];
+	}
+
+	function qualitySectorForUseCase(value: UseCaseId): QualitySectorId {
+		if (value === 'coding') return 'coding';
+		if (value === 'reasoning') return 'reasoning';
+		if (value === 'rag') return 'research';
+		if (value === 'tools') return 'agents';
+		if (value === 'long-context') return 'long';
+		return 'daily';
+	}
+
+	function rankQualityProfiles(
+		profiles: Record<string, Ds4QualityProfile>,
+		weights: Record<string, number>
+	): Array<{
+		artifactId: string;
+		profile: Ds4QualityProfile;
+		score: number;
+		coverage: number;
+		samples: number;
+		mix: Array<{ pack: string; weight: number; evidence: Ds4QualityEvidence }>;
+	}> {
+		const totalWeight = Object.values(weights).reduce((sum, value) => sum + value, 0) || 1;
+		return Object.entries(profiles)
+			.map(([artifactId, profile]) => {
+				const mix = Object.entries(weights)
+					.map(([pack, weight]) => ({ pack, weight, evidence: profile.packs?.[pack] }))
+					.filter((row): row is { pack: string; weight: number; evidence: Ds4QualityEvidence } =>
+						Boolean(row.evidence?.samples)
+					);
+				const coveredWeight = mix.reduce((sum, row) => sum + row.weight, 0);
+				const weightedScore = mix.reduce((sum, row) => sum + row.evidence.score * row.weight, 0);
+				const samples = mix.reduce((sum, row) => sum + row.evidence.samples, 0);
+				const coverage = coveredWeight / totalWeight;
+				const evidenceScore = coveredWeight > 0 ? weightedScore / coveredWeight : 0;
+				const confidence = Math.min(1, samples / 12);
+				const score = evidenceScore * (0.75 + coverage * 0.25) * (0.85 + confidence * 0.15);
+				return { artifactId, profile, score, coverage, samples, mix };
+			})
+			.filter((row) => row.samples > 0)
+			.sort(
+				(a, b) =>
+					b.score - a.score ||
+					b.coverage - a.coverage ||
+					b.samples - a.samples ||
+					String(a.profile.name ?? a.artifactId).localeCompare(
+						String(b.profile.name ?? b.artifactId)
+					)
+			);
 	}
 
 	function rowNum(row: CaliberRow, keys: string[], fallback = 0): number {
@@ -856,6 +977,10 @@
 			return 'Benchmark is running on the server. You can close this page and come back to Reports.';
 		if (selectedLocalIds.length === 0)
 			return 'Choose at least one installed model, or download/configure a catalog model first.';
+		if (runScope === 'evaluator' && selectedDs4ModelIds.length === 0)
+			return 'The selected artifacts must be configured in Library before DS4 can load and evaluate them.';
+		if (runScope === 'evaluator')
+			return `Ready for ${selectedDs4ModelIds.length} model(s) x the complete DS4 and product quality suite. This can take hours or days.`;
 		if (pendingSelectedIds.length === 0)
 			return 'All selected models already have completed historical measurements. Open Reports to compare them without rerunning.';
 		if (plan.length === 0)
@@ -1017,16 +1142,19 @@
 		loading = true;
 		error = '';
 		try {
-			const [modelsResult, reportsResult, resultsResult, systemResult] = await Promise.all([
-				CaliberAdvisorService.models(),
-				CaliberAdvisorService.reports(),
-				CaliberAdvisorService.results(),
-				CaliberAdvisorService.system()
-			]);
+			const [modelsResult, reportsResult, resultsResult, systemResult, ds4Result] =
+				await Promise.all([
+					CaliberAdvisorService.models(),
+					CaliberAdvisorService.reports(),
+					CaliberAdvisorService.results(),
+					CaliberAdvisorService.system(),
+					Ds4Service.listReports()
+				]);
 			models = modelsResult.data;
 			reports = reportsResult.data.sort((a, b) => b.created_at.localeCompare(a.created_at));
 			results = resultsResult;
 			doctorSystem = systemResult;
+			ds4QualityProfiles = ds4Result.quality_profiles ?? {};
 			message = `${completedReports.length} completed benchmark reports, ${resultRows.length} measured rows`;
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
@@ -1036,6 +1164,16 @@
 	}
 
 	async function previewPlan() {
+		if (runScope === 'evaluator') {
+			if (selectedDs4ModelIds.length === 0) {
+				error =
+					'No evaluator-ready model selected. Configure downloaded artifacts in Library first.';
+				return;
+			}
+			plan = [];
+			message = `${selectedDs4ModelIds.length} model(s) will run through the complete DS4 and product quality suite. Expect a long server-side run that can be resumed.`;
+			return;
+		}
 		if (pendingSelectedIds.length === 0) {
 			message = 'No benchmark needed: selected models are already in the historical archive.';
 			activeTab = 'recommendations';
@@ -1057,6 +1195,25 @@
 
 	async function startSweep() {
 		if (!readyToRun) return;
+		if (runScope === 'evaluator') {
+			error = '';
+			try {
+				const started = await Ds4Service.runEval({
+					models: selectedDs4ModelIds,
+					model: selectedDs4ModelIds.join(', '),
+					use_case: useCase,
+					max_tokens: 16000,
+					thinking_budget_tokens: 16000,
+					thinking: true,
+					temperature: 0
+				});
+				message = `Use-case evaluation ${started.id} started for ${selectedDs4ModelIds.length} model(s).`;
+				activeTab = 'evaluator';
+			} catch (e) {
+				error = e instanceof Error ? e.message : String(e);
+			}
+			return;
+		}
 		running = true;
 		error = '';
 		eventLog = [];
@@ -1411,6 +1568,7 @@
 				{#if tab.id === 'test-lab'}<Gauge size={16} />{/if}
 				{#if tab.id === 'library'}<Download size={16} />{/if}
 				{#if tab.id === 'recommendations' || tab.id === 'history'}<FileJson size={16} />{/if}
+				{#if tab.id === 'evaluator'}<ClipboardCheck size={16} />{/if}
 				{#if tab.id === 'router'}<Route size={16} />{/if}
 				{#if tab.id === 'doctor'}<Wrench size={16} />{/if}
 				{tab.label}
@@ -1433,7 +1591,10 @@
 							type="button"
 							class="choice compact-choice"
 							class:active={useCase === item.id}
-							onclick={() => (useCase = item.id)}
+							onclick={() => {
+								useCase = item.id;
+								qualitySector = qualitySectorForUseCase(item.id);
+							}}
 						>
 							<strong>{item.label}</strong>
 							<span>{item.help}</span>
@@ -1467,7 +1628,7 @@
 			<div class="panel">
 				<div class="panel-head">
 					<div>
-						<h2>2. Pick benchmark scope</h2>
+						<h2>3. Pick benchmark scope</h2>
 						<p>Start small; use deeper sweeps only when the winner needs diagnosis.</p>
 					</div>
 				</div>
@@ -1491,7 +1652,7 @@
 			<div class="panel">
 				<div class="panel-head">
 					<div>
-						<h2>3. Select candidate models</h2>
+						<h2>4. Select candidate models</h2>
 						<p>
 							{selectedLocalIds.length} selected · {pendingSelectedIds.length} need benchmarking · {selectedLocalIds.length -
 								pendingSelectedIds.length} already archived.
@@ -1529,7 +1690,7 @@
 			<div class="panel">
 				<div class="panel-head">
 					<div>
-						<h2>4. Review and run</h2>
+						<h2>5. Review and run</h2>
 						<p>No command-line knowledge required. The report stores the technical details.</p>
 					</div>
 				</div>
@@ -1565,7 +1726,7 @@
 						</div>
 						<div>
 							<dt>Planned configs</dt>
-							<dd>{plan.length || '-'}</dd>
+							<dd>{runScope === 'evaluator' ? 'Full quality suite' : plan.length || '-'}</dd>
 						</div>
 					</dl>
 					<label>
@@ -1587,11 +1748,11 @@
 							disabled={selectedLocalIds.length === 0 || loading}
 						>
 							<Settings2 size={16} />
-							Review plan
+							{runScope === 'evaluator' ? 'Review evaluation' : 'Review plan'}
 						</button>
 						<button type="button" class="primary" onclick={startSweep} disabled={!readyToRun}>
 							<Play size={16} />
-							Start benchmark
+							{runScope === 'evaluator' ? 'Start use-case evaluation' : 'Start benchmark'}
 						</button>
 						{#if sweepIsLive(status)}
 							<button
@@ -1826,6 +1987,12 @@
 		</section>
 	{/if}
 
+	{#if activeTab === 'evaluator'}
+		<section class="panel evaluator-shell">
+			<Ds4SuitePage mode="eval" embedded initialModels={selectedDs4ModelIds} />
+		</section>
+	{/if}
+
 	{#if activeTab === 'recommendations' || activeTab === 'history'}
 		<section class="reports-layout">
 			{#if activeTab === 'history'}
@@ -1867,6 +2034,82 @@
 						{/each}
 					</div>
 				</div>
+			{/if}
+
+			{#if activeTab === 'recommendations'}
+				<section class="panel quality-ranking-panel">
+					<div class="panel-head">
+						<div>
+							<h2>Use-case capability ranking</h2>
+							<p>
+								DS4 evidence is combined across complementary skills. Coverage and sample count
+								prevent a narrow high score from looking like a complete recommendation.
+							</p>
+						</div>
+						<ClipboardCheck size={18} />
+					</div>
+					<div class="quality-sector-picker" aria-label="Use-case quality category">
+						{#each Object.entries(qualitySectors) as [id, sector] (id)}
+							<button
+								type="button"
+								class:active={qualitySector === id}
+								onclick={() => (qualitySector = id as QualitySectorId)}>{sector.title}</button
+							>
+						{/each}
+					</div>
+					<div class="quality-method">
+						<strong>{qualitySectors[qualitySector].title}</strong>
+						<span>{qualitySectors[qualitySector].help}</span>
+						<small>
+							Composite score = weighted measured packs, adjusted for evidence coverage and sample
+							confidence. It is not a vendor or parameter-count estimate.
+						</small>
+					</div>
+					{#if qualityRankings.length > 0}
+						<div class="quality-ranking-list">
+							{#each qualityRankings as row, index (row.artifactId)}
+								<article>
+									<b class="quality-rank">#{index + 1}</b>
+									<div class="quality-model">
+										<strong
+											title={modelFullName(
+												row.profile.name ?? row.profile.model_id ?? row.artifactId
+											)}
+											>{modelDisplayName(
+												row.profile.name ?? row.profile.model_id ?? row.artifactId
+											)}</strong
+										>
+										<span>{row.profile.variant || row.profile.artifact_id}</span>
+										<div class="tag-list">
+											{#each row.mix as item (item.pack)}
+												<b
+													>{item.pack}
+													{Math.round(item.evidence.score * 100)}% · {item.evidence.samples} cases</b
+												>
+											{/each}
+										</div>
+									</div>
+									<div class="quality-score">
+										<strong>{Math.round(row.score * 100)}%</strong>
+										<span>{Math.round(row.coverage * 100)}% skill coverage</span>
+										<small>{row.samples} measured cases</small>
+									</div>
+								</article>
+							{/each}
+						</div>
+					{:else}
+						<div class="quality-empty">
+							<div>
+								<strong>No DS4 evidence for this capability mix yet.</strong>
+								<span>Run the selected models through Use-case Evaluator to build the ranking.</span
+								>
+							</div>
+							<button type="button" class="primary" onclick={() => (activeTab = 'evaluator')}
+								>Open Evaluator</button
+							>
+						</div>
+					{/if}
+				</section>
 			{/if}
 
 			<div class="panel report-detail-panel">
@@ -2031,7 +2274,11 @@
 								<strong>No production winner yet</strong><span
 									>A winner needs a healthy artifact, streaming measurements, verified context and a
 									passing {useCase} quality pack. Run the missing quality evidence in
-									<a href="#/ds4-eval">DS4 expert evaluator</a>.</span
+									<button
+										type="button"
+										class="inline-link"
+										onclick={() => (activeTab = 'evaluator')}>Use-case Evaluator</button
+									>.</span
 								>
 							</div>
 						{/if}
@@ -2651,7 +2898,12 @@
 						</li>
 						<li>FIT is blocked until context, memory and the selected quality pack pass.</li>
 						<li>
-							Use the expert <a href="#/ds4-eval">quality evaluator</a> or
+							Use the expert <button
+								type="button"
+								class="inline-link"
+								onclick={() => (activeTab = 'evaluator')}>quality evaluator</button
+							>
+							or
 							<a href="#/ds4-bench">context bench</a> when Doctor reports missing evidence.
 						</li>
 					</ul>
@@ -2841,6 +3093,16 @@
 		gap: 8px;
 	}
 
+	.check input[type='checkbox'] {
+		flex: 0 0 18px;
+		width: 18px;
+		height: 18px;
+		min-height: 18px;
+		margin: 0;
+		padding: 0;
+		accent-color: var(--caliber-accent);
+	}
+
 	.tabs,
 	.controls {
 		align-items: center;
@@ -2876,12 +3138,27 @@
 
 	.choice {
 		display: grid;
+		width: 100%;
 		min-height: 98px;
+		align-items: start;
 		align-content: start;
+		justify-content: stretch;
 		justify-items: start;
 		gap: 8px;
 		padding: 12px;
 		text-align: left;
+	}
+
+	.choice > strong,
+	.choice > span {
+		width: 100%;
+		margin: 0;
+		padding: 0;
+		text-align: left;
+	}
+
+	.choice > span {
+		line-height: 1.35;
 	}
 
 	.compact-choice {
@@ -3210,6 +3487,80 @@
 		gap: 16px;
 	}
 
+	.evaluator-shell {
+		overflow: visible;
+		padding: 0 16px 16px;
+	}
+
+	.quality-sector-picker {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 8px;
+		padding: 12px 12px 0;
+	}
+
+	.quality-method {
+		display: grid;
+		gap: 4px;
+		margin: 12px;
+		border-left: 3px solid var(--caliber-accent);
+		background: color-mix(in oklch, var(--muted) 45%, transparent);
+		padding: 10px 12px;
+	}
+
+	.quality-ranking-list {
+		display: grid;
+		padding: 0 12px 12px;
+	}
+
+	.quality-ranking-list article {
+		display: grid;
+		grid-template-columns: 46px minmax(0, 1fr) 150px;
+		gap: 12px;
+		align-items: center;
+		border-top: 1px solid var(--border);
+		padding: 12px 0;
+	}
+
+	.quality-rank {
+		color: var(--caliber-accent);
+		font-size: 16px;
+	}
+
+	.quality-model,
+	.quality-score,
+	.quality-empty > div {
+		display: grid;
+		gap: 5px;
+		min-width: 0;
+	}
+
+	.quality-score {
+		text-align: right;
+	}
+
+	.quality-score strong {
+		font-size: 24px;
+	}
+
+	.quality-empty {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 16px;
+		padding: 16px;
+	}
+
+	.inline-link {
+		display: inline;
+		min-height: 0;
+		border: 0;
+		background: transparent;
+		padding: 0;
+		color: var(--primary);
+		text-decoration: underline;
+	}
+
 	.report-detail-panel {
 		overflow: visible;
 	}
@@ -3323,7 +3674,6 @@
 		color: #fde68a;
 	}
 
-	.methodology-warning a,
 	.router-hero a {
 		color: #c4b5fd;
 		text-decoration: underline;
@@ -3923,8 +4273,13 @@
 		.answer-metrics,
 		.evidence-badges,
 		.load-curves > div,
-		.route-row {
+		.route-row,
+		.quality-ranking-list article {
 			grid-template-columns: 1fr;
+		}
+
+		.quality-score {
+			text-align: left;
 		}
 
 		.table-head {
