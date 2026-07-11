@@ -181,6 +181,7 @@
 	let message = $state('');
 	let loadAfterConfigure = $state(false);
 	let routeEvents = $state<LocalRouteEvent[]>([]);
+	let doctorSystem = $state<Record<string, unknown> | null>(null);
 
 	let fitSystem = $state<FitAdvisorSystem | null>(null);
 	let catalogModels = $state<FitAdvisorModel[]>([]);
@@ -252,6 +253,7 @@
 	const targetContext = $derived(contextOptions.find((item) => item.value === contextSize));
 	const readyToRun = $derived(pendingSelectedIds.length > 0 && !running);
 	const nextAction = $derived(nextActionText());
+	const doctorData = $derived(asRecord(doctorSystem?.doctor));
 
 	onMount(() => {
 		void refreshAll();
@@ -823,14 +825,16 @@
 		loading = true;
 		error = '';
 		try {
-			const [modelsResult, reportsResult, resultsResult] = await Promise.all([
+			const [modelsResult, reportsResult, resultsResult, systemResult] = await Promise.all([
 				CaliberAdvisorService.models(),
 				CaliberAdvisorService.reports(),
-				CaliberAdvisorService.results()
+				CaliberAdvisorService.results(),
+				CaliberAdvisorService.system()
 			]);
 			models = modelsResult.data;
 			reports = reportsResult.data.sort((a, b) => b.created_at.localeCompare(a.created_at));
 			results = resultsResult;
+			doctorSystem = systemResult;
 			message = `${completedReports.length} completed benchmark reports, ${resultRows.length} measured rows`;
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
@@ -2258,6 +2262,36 @@
 	{/if}
 
 	{#if activeTab === 'doctor'}
+		<section class="doctor-grid">
+			<div class:doctor-pass={Boolean(doctorData?.state_writable)}>
+				<span>Local state</span><strong
+					>{doctorData?.state_writable ? 'Ready' : 'Needs attention'}</strong
+				>
+				<p>SQLite uses the XDG data directory, not the source tree.</p>
+			</div>
+			<div class:doctor-pass={Boolean(doctorData?.streaming_profiler_available)}>
+				<span>Streaming profiler</span><strong
+					>{doctorData?.streaming_profiler_available ? 'Available' : 'Missing binary'}</strong
+				>
+				<p>Required for final decision-grade evidence.</p>
+			</div>
+			<div class:doctor-warn={Number(doctorData?.unhealthy_artifacts ?? 0) > 0}>
+				<span>Model library</span><strong
+					>{String(doctorData?.ready_artifacts ?? 0)} ready · {String(
+						doctorData?.unhealthy_artifacts ?? 0
+					)} unhealthy</strong
+				>
+				<p>{String(doctorData?.duplicate_artifacts ?? 0)} duplicate artifacts detected.</p>
+			</div>
+			<div class:doctor-warn={Number(doctorData?.stale_reports ?? 0) > 0}>
+				<span>Benchmark freshness</span><strong
+					>{String(doctorData?.stale_reports ?? 0)} stale · {String(
+						doctorData?.legacy_reports ?? 0
+					)} legacy</strong
+				>
+				<p>Rerun after llama.cpp build or GPU-driver changes.</p>
+			</div>
+		</section>
 		<section class="grid">
 			<div class="panel">
 				<div class="panel-head">
@@ -3196,6 +3230,29 @@
 		color: var(--muted-foreground);
 	}
 
+	.doctor-grid {
+		display: grid;
+		grid-template-columns: repeat(4, minmax(0, 1fr));
+		gap: 10px;
+	}
+
+	.doctor-grid > div {
+		display: grid;
+		gap: 6px;
+		border: 1px solid var(--border);
+		border-top: 3px solid var(--muted-foreground);
+		border-radius: var(--radius);
+		background: var(--card);
+		padding: 13px;
+	}
+
+	.doctor-grid > div.doctor-pass {
+		border-top-color: #22c55e;
+	}
+	.doctor-grid > div.doctor-warn {
+		border-top-color: #f59e0b;
+	}
+
 	.report-section {
 		display: grid;
 		gap: 12px;
@@ -3442,6 +3499,7 @@
 		.alternative-grid,
 		.glossary,
 		.alias-grid,
+		.doctor-grid,
 		.analytics-cards,
 		.workflow {
 			display: flex;

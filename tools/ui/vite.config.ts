@@ -24,7 +24,7 @@ const browserBaseConfig: any = {
 			args: ['--no-sandbox']
 		}
 	}),
-	instances: [{ browser: 'chromium' }]
+	instances: [{ browser: 'chromium', headless: true }]
 };
 
 export default defineConfig({

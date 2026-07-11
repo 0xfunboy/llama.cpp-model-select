@@ -126,7 +126,13 @@ export interface FitAdvisorModel {
 	configured?: boolean;
 	downloaded?: boolean;
 	partial?: boolean;
-	download_status?: 'available' | 'downloading' | 'downloaded' | 'configured' | 'partial' | 'failed';
+	download_status?:
+		| 'available'
+		| 'downloading'
+		| 'downloaded'
+		| 'configured'
+		| 'partial'
+		| 'failed';
 	installed_model_id?: string;
 	local_path?: string | null;
 	target_dir?: string;
@@ -241,13 +247,16 @@ export class FitAdvisorService {
 	}
 
 	static download(model: FitAdvisorModel): Promise<FitAdvisorDownloadResponse> {
-		return apiPost<FitAdvisorDownloadResponse, Record<string, unknown>>('/api/fit-advisor/download', {
-			model_id: model.id,
-			hf_ref: model.download?.hf_ref,
-			repo: model.download?.repo,
-			quant: model.quant,
-			target_dir: model.download?.target_dir ?? model.target_dir
-		});
+		return apiPost<FitAdvisorDownloadResponse, Record<string, unknown>>(
+			'/api/fit-advisor/download',
+			{
+				model_id: model.id,
+				hf_ref: model.download?.hf_ref,
+				repo: model.download?.repo,
+				quant: model.quant,
+				target_dir: model.download?.target_dir ?? model.target_dir
+			}
+		);
 	}
 
 	static listDownloads(): Promise<FitAdvisorDownloadsResponse> {
@@ -268,7 +277,9 @@ export class FitAdvisorService {
 		);
 
 		if (!response.ok) {
-			throw new Error('Fit Advisor download stream failed: ' + response.status + ' ' + response.statusText);
+			throw new Error(
+				'Fit Advisor download stream failed: ' + response.status + ' ' + response.statusText
+			);
 		}
 		if (!response.body) {
 			throw new Error('Fit Advisor download stream is empty');
@@ -307,10 +318,7 @@ export class FitAdvisorService {
 		}
 	}
 
-	static configure(
-		model: FitAdvisorModel,
-		loadNow = false
-	): Promise<FitAdvisorConfigureResponse> {
+	static configure(model: FitAdvisorModel, loadNow = false): Promise<FitAdvisorConfigureResponse> {
 		return apiPost<FitAdvisorConfigureResponse, FitAdvisorConfigureRequest>(
 			'/api/fit-advisor/configure',
 			{

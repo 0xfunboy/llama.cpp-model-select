@@ -925,6 +925,14 @@ std::map<std::string, json> derive_memory_policies(const std::vector<json> & row
             const double total_peak = total_vram_peak_mib(row, baseline);
             const double pressure_ratio = std::isfinite(available_budget) && available_budget > 0 && std::isfinite(run_peak) ? run_peak / available_budget : std::numeric_limits<double>::quiet_NaN();
             const double headroom = std::isfinite(budget_mib) && std::isfinite(total_peak) ? budget_mib - total_peak : std::numeric_limits<double>::quiet_NaN();
+            const double host_peak = nullable_num(row, "process_working_set_peak_mib");
+            const double host_budget = options.system_ram_available_mib;
+            const bool host_only = (!std::isfinite(budget_mib) || budget_mib <= 0) &&
+                (!std::isfinite(total_peak) || total_peak <= 0) && std::isfinite(host_peak) && host_peak > 0;
+            const double host_headroom = host_only && std::isfinite(host_budget) && host_budget > 0
+                ? host_budget - host_peak : std::numeric_limits<double>::quiet_NaN();
+            const double effective_headroom = host_only ? host_headroom : headroom;
+            const double effective_budget = host_only ? host_budget : budget_mib;
             const double row_ctx = context_tokens(row);
             const double model_max_ctx = nullable_num(row, "gguf_context_length");
             double next_ctx = std::numeric_limits<double>::quiet_NaN();
@@ -938,18 +946,21 @@ std::map<std::string, json> derive_memory_policies(const std::vector<json> & row
             const bool at_model_max = std::isfinite(row_ctx) && std::isfinite(model_max_ctx) && row_ctx >= model_max_ctx;
             std::string next_risk;
             if (at_model_max) next_risk = "not-applicable";
-            else if (!std::isfinite(next_cost) || !std::isfinite(headroom)) next_risk = "unknown";
-            else next_risk = next_cost - headroom > shared_threshold ? "imminent" : "ok";
+            else if (!std::isfinite(next_cost) || !std::isfinite(effective_headroom)) next_risk = "unknown";
+            else next_risk = next_cost - effective_headroom > shared_threshold ? "imminent" : "ok";
             std::string next_reason;
             if (at_model_max) next_reason = "The run is already at the model's declared maximum context, so there is no next context step to predict.";
             else if (next_risk == "unknown") next_reason = "No comparable measured next context step is available for this profile.";
             else if (next_risk == "imminent") next_reason = "The measured context-growth slope predicts significant shared-memory pressure at the next context step.";
             else next_reason = "The measured context-growth slope does not predict significant shared-memory pressure at the next context step.";
 
-            std::string state = !memory_observed ? "unavailable" :
+            std::string state = !memory_observed ? "unavailable" : host_only ?
+                (std::isfinite(host_headroom) && host_headroom < headroom_thresholds(host_budget).loaded ? "host-saturated" : "host-memory") :
                 (std::isfinite(headroom) && headroom < headroom_thresholds(budget_mib).loaded ? "saturated" : "dedicated");
             std::string reason = !memory_observed
                 ? "Runtime memory telemetry was not collected for this benchmark row."
+                : host_only
+                ? "The CPU-only run was measured against available system RAM."
                 : state == "saturated"
                 ? "Dedicated VRAM is near capacity; no significant shared allocation was observed."
                 : "The measured allocation remained in dedicated VRAM.";
@@ -981,6 +992,11 @@ std::map<std::string, json> derive_memory_policies(const std::vector<json> & row
             } else if (is_memory_failure(row)) {
                 residency = "memory-failed";
                 residency_reason = "The configuration failed during load or execution with a memory-related error.";
+            } else if (host_only) {
+                residency = std::isfinite(host_headroom) && host_headroom < headroom_thresholds(host_budget).loaded ? "host-pressure" : "host-only";
+                residency_reason = residency == "host-pressure"
+                    ? "The CPU-only run leaves little measured system RAM headroom."
+                    : "The CPU-only run remains within measured system RAM headroom.";
             } else if (is_mixed_expected(row)) {
                 residency = shared > shared_threshold ? "mixed-pressure" : "mixed-expected";
                 residency_reason = residency == "mixed-pressure"
@@ -1008,7 +1024,7 @@ std::map<std::string, json> derive_memory_policies(const std::vector<json> & row
 
             const double cliff_pct = has_degradation ? std::round(degradation_it->second.pct * 1000.0) / 10.0 : std::numeric_limits<double>::quiet_NaN();
             std::string resource_fit = memory_observed ?
-                resource_fit_from_headroom(headroom, budget_mib, residency, shared, shared_threshold, shared_minor, shared_pressure) :
+                resource_fit_from_headroom(effective_headroom, effective_budget, residency, shared, shared_threshold, shared_minor, shared_pressure) :
                 "unknown";
             const std::string decode = usability_from_eval(row);
             const auto response = usability_from_response_latency(row);
@@ -1029,7 +1045,7 @@ std::map<std::string, json> derive_memory_policies(const std::vector<json> & row
                 {"context_growth_mib_per_1k", number_or_null(context_growth.slope_mib_per_1k, 1)},
                 {"context_growth_confidence", std::isfinite(context_growth.slope_mib_per_1k) ? "measured" : "unavailable"},
                 {"context_growth_source", context_growth.source.empty() ? json(nullptr) : json(context_growth.source)},
-                {"next_context_step_headroom_mib", number_or_null(headroom, 1)},
+                {"next_context_step_headroom_mib", number_or_null(effective_headroom, 1)},
                 {"next_context_step_cost_mib", number_or_null(next_cost, 1)},
                 {"next_context_step_risk", next_risk},
                 {"next_context_step_reason", next_reason},
@@ -1040,6 +1056,9 @@ std::map<std::string, json> derive_memory_policies(const std::vector<json> & row
                 {"vram_budget_source", vram_budget_source.empty() ? json(nullptr) : json(vram_budget_source)},
                 {"vram_run_headroom_mib", number_or_null(headroom, 1)},
                 {"vram_pressure_ratio", number_or_null(pressure_ratio, 3)},
+                {"host_memory_peak_mib", host_only ? number_or_null(host_peak, 1) : json(nullptr)},
+                {"host_memory_available_mib", host_only ? number_or_null(host_budget, 1) : json(nullptr)},
+                {"host_memory_headroom_mib", host_only ? number_or_null(host_headroom, 1) : json(nullptr)},
                 {"resource_fit", resource_fit},
                 {"decode_usability", decode},
                 {"response_usability", response.first},
@@ -1324,8 +1343,8 @@ json aggregate_bench_result(const json & item, const json & cfg, const std::vect
         {"e2e_ttft_ms", number_or_null(metric_median(runs, "e2e_ttft_ms"), 2)},
         {"total_request_ms", number_or_null(metric_median(runs, "total_request_ms"), 2)},
         {"latency_total_request_ms", number_or_null(metric_median(runs, "latency_total_request_ms"), 2)},
-        {"gpu_util_avg_pct", (int64_t) std::trunc(median(collect("gpu_util_avg_pct")))},
-        {"cpu_util_avg_pct", (int64_t) std::trunc(median(collect("cpu_util_avg_pct")))},
+        {"gpu_util_avg_pct", number_or_null(median(collect("gpu_util_avg_pct")), 0)},
+        {"cpu_util_avg_pct", number_or_null(median(collect("cpu_util_avg_pct")), 0)},
         {"gpu_power_peak_w", round_to(max_from_runs(runs, "gpu_power_peak_w"), 1)},
         {"gpu_temp_peak_c", (int64_t) std::trunc(max_from_runs(runs, "gpu_temp_peak_c"))},
         {"ram_baseline_mib", first.value("ram_baseline_mib", json(nullptr))},

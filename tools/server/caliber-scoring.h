@@ -67,6 +67,7 @@ struct memory_policy_options {
     double degradation_threshold = 0.20;
     double vram_budget_mib = -1.0;
     double vram_driver_usable_mib = -1.0;
+    double system_ram_available_mib = -1.0;
     std::string vram_budget_source;
 };
 

@@ -33,7 +33,9 @@
 	const models = $derived(response?.models ?? []);
 	const system = $derived(response?.system ?? null);
 	const catalog = $derived(response?.catalog ?? null);
-	const hasPendingDownload = $derived(downloadJobs.some((job) => isActiveDownloadStatus(job.status)));
+	const hasPendingDownload = $derived(
+		downloadJobs.some((job) => isActiveDownloadStatus(job.status))
+	);
 	const contextOptions = [
 		{ value: 4096, label: '4k' },
 		{ value: 8192, label: '8k' },
@@ -67,17 +69,28 @@
 	function upsertDownloadJob(job: FitAdvisorDownloadJob) {
 		downloadLastSeq = Math.max(downloadLastSeq, job.seq ?? 0);
 		const index = downloadJobs.findIndex((item) => item.id === job.id);
-		downloadJobs = index === -1
-			? [job, ...downloadJobs]
-			: downloadJobs.map((item, itemIndex) => itemIndex === index ? job : item);
+		downloadJobs =
+			index === -1
+				? [job, ...downloadJobs]
+				: downloadJobs.map((item, itemIndex) => (itemIndex === index ? job : item));
 
-		if (selectedModel && (job.model_id === selectedModel.id || job.hf_ref === selectedModel.download?.hf_ref)) {
+		if (
+			selectedModel &&
+			(job.model_id === selectedModel.id || job.hf_ref === selectedModel.download?.hf_ref)
+		) {
 			selectedModel = {
 				...selectedModel,
 				local_path: job.local_path ?? selectedModel.local_path,
 				target_dir: job.target_dir ?? selectedModel.target_dir,
 				download_progress: job,
-				download_status: job.status === 'downloaded' ? 'downloaded' : job.status === 'partial' ? 'partial' : job.status === 'failed' ? 'failed' : 'downloading',
+				download_status:
+					job.status === 'downloaded'
+						? 'downloaded'
+						: job.status === 'partial'
+							? 'partial'
+							: job.status === 'failed'
+								? 'failed'
+								: 'downloading',
 				downloaded: job.status === 'downloaded'
 			};
 		}
@@ -93,7 +106,11 @@
 		const run = async () => {
 			while (!controller.signal.aborted) {
 				try {
-					await FitAdvisorService.streamDownloads((event) => upsertDownloadJob(event.data), controller.signal, downloadLastSeq);
+					await FitAdvisorService.streamDownloads(
+						(event) => upsertDownloadJob(event.data),
+						controller.signal,
+						downloadLastSeq
+					);
 				} catch (e) {
 					if (controller.signal.aborted) break;
 					console.warn('Fit Advisor download stream disconnected', e);
@@ -122,7 +139,8 @@
 			});
 			response = next;
 			if (selectedModel) {
-				selectedModel = next.models.find((model) => model.id === selectedModel?.id) ?? next.models[0] ?? null;
+				selectedModel =
+					next.models.find((model) => model.id === selectedModel?.id) ?? next.models[0] ?? null;
 			} else {
 				selectedModel = next.models[0] ?? null;
 			}
@@ -235,7 +253,13 @@
 	}
 
 	function downloadJobFor(model: FitAdvisorModel): FitAdvisorDownloadJob | null {
-		return downloadJobs.find((job) => job.model_id === model.id || job.hf_ref === model.download?.hf_ref) ?? model.download_progress ?? null;
+		return (
+			downloadJobs.find(
+				(job) => job.model_id === model.id || job.hf_ref === model.download?.hf_ref
+			) ??
+			model.download_progress ??
+			null
+		);
 	}
 
 	function isActiveDownloadStatus(status: string): boolean {
@@ -257,14 +281,18 @@
 		if (status === 'configured') return 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30';
 		if (status === 'downloaded') return 'bg-cyan-500/15 text-cyan-300 border-cyan-500/30';
 		if (status === 'partial') return 'bg-amber-500/15 text-amber-300 border-amber-500/30';
-		if (status === 'downloading' || status === 'resolving' || status === 'queued') return 'bg-amber-500/15 text-amber-300 border-amber-500/30';
+		if (status === 'downloading' || status === 'resolving' || status === 'queued')
+			return 'bg-amber-500/15 text-amber-300 border-amber-500/30';
 		if (status === 'failed') return 'bg-red-500/15 text-red-300 border-red-500/30';
 		return 'bg-muted text-muted-foreground border-border';
 	}
 
 	function canDownload(model: FitAdvisorModel): boolean {
 		const status = statusFor(model);
-		return Boolean(model.download) && !['queued', 'resolving', 'downloading', 'downloaded', 'configured'].includes(status);
+		return (
+			Boolean(model.download) &&
+			!['queued', 'resolving', 'downloading', 'downloaded', 'configured'].includes(status)
+		);
 	}
 
 	function canFit(model: FitAdvisorModel): boolean {
@@ -275,7 +303,10 @@
 	function downloadButtonLabel(model: FitAdvisorModel): string {
 		const job = downloadJobFor(model);
 		if (job && isActiveDownloadStatus(job.status)) {
-			const progress = typeof job.percent === 'number' && Number.isFinite(job.percent) ? ` ${Math.round(job.percent)}%` : '';
+			const progress =
+				typeof job.percent === 'number' && Number.isFinite(job.percent)
+					? ` ${Math.round(job.percent)}%`
+					: '';
 			if (job.status === 'queued') return 'Queued';
 			if (job.status === 'resolving') return 'Resolving';
 			return `Downloading${progress}`;
@@ -299,7 +330,8 @@
 				</div>
 				<h1 class="mt-1 text-2xl font-semibold tracking-normal">Fit Advisor</h1>
 				<p class="mt-1 max-w-3xl text-sm text-muted-foreground">
-					Rank GGUF models against this machine, estimate memory and throughput, then download or write a router preset.
+					Rank GGUF models against this machine, estimate memory and throughput, then download or
+					write a router preset.
 				</p>
 			</div>
 			<div class="flex flex-wrap gap-2">
@@ -333,12 +365,18 @@
 				</div>
 				<div class="rounded-lg border bg-card p-3">
 					<div class="text-xs text-muted-foreground">RAM</div>
-					<div class="mt-1 text-sm font-medium">{fmtGb(system.fit_ram_capacity_gb ?? system.total_ram_gb)} total</div>
-					<div class="mt-1 text-xs text-muted-foreground">{fmtGb(system.available_ram_gb)} currently free</div>
+					<div class="mt-1 text-sm font-medium">
+						{fmtGb(system.fit_ram_capacity_gb ?? system.total_ram_gb)} total
+					</div>
+					<div class="mt-1 text-xs text-muted-foreground">
+						{fmtGb(system.available_ram_gb)} currently free
+					</div>
 				</div>
 				<div class="rounded-lg border bg-card p-3">
 					<div class="text-xs text-muted-foreground">GPU</div>
-					<div class="mt-1 truncate text-sm font-medium">{system.gpu_name || 'No GPU detected'}</div>
+					<div class="mt-1 truncate text-sm font-medium">
+						{system.gpu_name || 'No GPU detected'}
+					</div>
 					<div class="mt-1 text-xs text-muted-foreground">{system.backend}</div>
 				</div>
 				<div class="rounded-lg border bg-card p-3">
@@ -358,7 +396,10 @@
 			<div class="grid gap-3 md:grid-cols-2 xl:grid-cols-7">
 				<label class="text-sm">
 					<span class="text-xs text-muted-foreground">Use Case</span>
-					<select class="mt-1 h-10 w-full rounded-md border bg-background px-2" bind:value={useCase}>
+					<select
+						class="mt-1 h-10 w-full rounded-md border bg-background px-2"
+						bind:value={useCase}
+					>
 						<option value="all">All</option>
 						<option value="coding">Coding</option>
 						<option value="reasoning">Reasoning</option>
@@ -378,65 +419,96 @@
 				</label>
 				<label class="text-sm">
 					<span class="text-xs text-muted-foreground">Quant</span>
-					<input class="mt-1 h-10 w-full rounded-md border bg-background px-2" placeholder="Q4, Q8, IQ..." bind:value={quant} />
+					<input
+						class="mt-1 h-10 w-full rounded-md border bg-background px-2"
+						placeholder="Q4, Q8, IQ..."
+						bind:value={quant}
+					/>
 				</label>
 				<label class="text-sm">
 					<span class="text-xs text-muted-foreground">Search</span>
-					<input class="mt-1 h-10 w-full rounded-md border bg-background px-2" placeholder="qwen, coder..." bind:value={search} />
+					<input
+						class="mt-1 h-10 w-full rounded-md border bg-background px-2"
+						placeholder="qwen, coder..."
+						bind:value={search}
+					/>
 				</label>
 				<label class="text-sm">
 					<span class="text-xs text-muted-foreground">Context</span>
-					<select class="mt-1 h-10 w-full rounded-md border bg-background px-2" bind:value={context}>
-						{#each contextOptions as option}
+					<select
+						class="mt-1 h-10 w-full rounded-md border bg-background px-2"
+						bind:value={context}
+					>
+						{#each contextOptions as option (option.value)}
 							<option value={option.value}>{option.label}</option>
 						{/each}
 					</select>
 				</label>
 				<label class="text-sm">
 					<span class="text-xs text-muted-foreground">Limit</span>
-					<input class="mt-1 h-10 w-full rounded-md border bg-background px-2" type="number" min="10" max="2000" step="10" bind:value={limit} />
+					<input
+						class="mt-1 h-10 w-full rounded-md border bg-background px-2"
+						type="number"
+						min="10"
+						max="2000"
+						step="10"
+						bind:value={limit}
+					/>
 				</label>
 				<label class="flex items-end gap-2 pb-2 text-sm">
 					<input type="checkbox" class="h-4 w-4" bind:checked={includeTooTight} />
 					<span>Show too tight</span>
 				</label>
 			</div>
-				<div class="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
+			<div
+				class="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground"
+			>
 				<div class="flex flex-wrap gap-2">
 					<button
 						type="button"
-						class={strategy === 'balanced' ? 'h-9 rounded-md bg-primary px-3 text-xs text-primary-foreground' : 'h-9 rounded-md border px-3 text-xs hover:bg-muted'}
+						class={strategy === 'balanced'
+							? 'h-9 rounded-md bg-primary px-3 text-xs text-primary-foreground'
+							: 'h-9 rounded-md border px-3 text-xs hover:bg-muted'}
 						onclick={() => (strategy = 'balanced')}
 					>
 						Balanced
 					</button>
 					<button
 						type="button"
-						class={strategy === 'multi_gpu' ? 'h-9 rounded-md bg-primary px-3 text-xs text-primary-foreground' : 'h-9 rounded-md border px-3 text-xs hover:bg-muted'}
+						class={strategy === 'multi_gpu'
+							? 'h-9 rounded-md bg-primary px-3 text-xs text-primary-foreground'
+							: 'h-9 rounded-md border px-3 text-xs hover:bg-muted'}
 						onclick={() => (strategy = 'multi_gpu')}
 					>
 						MultiGPU
 					</button>
 					<button
 						type="button"
-						class={strategy === 'moe_offload' ? 'h-9 rounded-md bg-primary px-3 text-xs text-primary-foreground' : 'h-9 rounded-md border px-3 text-xs hover:bg-muted'}
+						class={strategy === 'moe_offload'
+							? 'h-9 rounded-md bg-primary px-3 text-xs text-primary-foreground'
+							: 'h-9 rounded-md border px-3 text-xs hover:bg-muted'}
 						onclick={() => (strategy = 'moe_offload')}
 					>
 						MoE offload
 					</button>
 					<button
 						type="button"
-						class={strategy === 'hybrid_offload' ? 'h-9 rounded-md bg-primary px-3 text-xs text-primary-foreground' : 'h-9 rounded-md border px-3 text-xs hover:bg-muted'}
+						class={strategy === 'hybrid_offload'
+							? 'h-9 rounded-md bg-primary px-3 text-xs text-primary-foreground'
+							: 'h-9 rounded-md border px-3 text-xs hover:bg-muted'}
 						onclick={() => (strategy = 'hybrid_offload')}
 					>
 						Hybrid offload
 					</button>
 				</div>
 			</div>
-			<div class="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
+			<div
+				class="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground"
+			>
 				<div>
 					{#if catalog}
-						Catalog: {catalog.from_cache ? 'cache' : 'fresh'} · {catalog.updated_at || 'not updated yet'} · {catalog.cache_path}
+						Catalog: {catalog.from_cache ? 'cache' : 'fresh'} · {catalog.updated_at ||
+							'not updated yet'} · {catalog.cache_path}
 					{/if}
 				</div>
 				<label class="flex items-center gap-2">
@@ -447,7 +519,9 @@
 		</section>
 
 		{#if error}
-			<div class="rounded-md border border-red-500/30 bg-red-500/10 p-3 text-sm text-red-200">{error}</div>
+			<div class="rounded-md border border-red-500/30 bg-red-500/10 p-3 text-sm text-red-200">
+				{error}
+			</div>
 		{:else if message}
 			<div class="rounded-md border bg-muted/40 p-3 text-sm text-muted-foreground">{message}</div>
 		{/if}
@@ -456,7 +530,9 @@
 			<div class="overflow-hidden rounded-lg border bg-card">
 				<div class="flex items-center justify-between border-b px-3 py-2">
 					<div class="text-sm font-medium">Recommendations</div>
-					<div class="text-xs text-muted-foreground">{isLoading ? 'Loading...' : `${models.length} visible`}</div>
+					<div class="text-xs text-muted-foreground">
+						{isLoading ? 'Loading...' : `${models.length} visible`}
+					</div>
 				</div>
 				<div class="max-h-[70vh] overflow-auto">
 					<table class="w-full text-left text-sm">
@@ -477,11 +553,17 @@
 								{@const status = statusFor(model)}
 								{@const job = downloadJobFor(model)}
 								<tr
-									class="cursor-pointer border-b transition-colors hover:bg-muted/50 {selectedModel?.id === model.id ? 'bg-muted' : ''}"
+									class="cursor-pointer border-b transition-colors hover:bg-muted/50 {selectedModel?.id ===
+									model.id
+										? 'bg-muted'
+										: ''}"
 									onclick={() => (selectedModel = model)}
 								>
 									<td class="px-3 py-2">
-										<span class="rounded-full border px-2 py-0.5 text-xs {fitClass(model.fit_level)}">{model.fit_level}</span>
+										<span
+											class="rounded-full border px-2 py-0.5 text-xs {fitClass(model.fit_level)}"
+											>{model.fit_level}</span
+										>
 									</td>
 									<td class="px-3 py-2 font-medium">{fmtNum(model.score)}</td>
 									<td class="px-3 py-2">
@@ -494,10 +576,16 @@
 									<td class="px-3 py-2">{model.effective_context_length.toLocaleString()}</td>
 									<td class="px-3 py-2">
 										<div class="flex min-w-32 flex-col gap-1">
-											<span class="w-fit rounded-full border px-2 py-0.5 text-xs {statusClass(status)}">{status}</span>
+											<span
+												class="w-fit rounded-full border px-2 py-0.5 text-xs {statusClass(status)}"
+												>{status}</span
+											>
 											{#if job && (status === 'queued' || status === 'resolving' || status === 'downloading')}
 												<div class="h-1.5 w-28 overflow-hidden rounded-full bg-muted">
-													<div class="h-full bg-amber-400" style={`width: ${Math.max(1, Math.min(100, job.percent || 0))}%`}></div>
+													<div
+														class="h-full bg-amber-400"
+														style={`width: ${Math.max(1, Math.min(100, job.percent || 0))}%`}
+													></div>
 												</div>
 											{/if}
 										</div>
@@ -507,7 +595,9 @@
 						</tbody>
 					</table>
 					{#if !isLoading && models.length === 0}
-						<div class="p-8 text-center text-sm text-muted-foreground">No model matches the current filters.</div>
+						<div class="p-8 text-center text-sm text-muted-foreground">
+							No model matches the current filters.
+						</div>
 					{/if}
 				</div>
 			</div>
@@ -515,7 +605,9 @@
 			<aside class="rounded-lg border bg-card">
 				<div class="border-b px-4 py-3">
 					<div class="text-sm font-medium">Plan Details</div>
-					<div class="text-xs text-muted-foreground">Memory estimates are advisory, not a replacement for a real bench.</div>
+					<div class="text-xs text-muted-foreground">
+						Memory estimates are advisory, not a replacement for a real bench.
+					</div>
 				</div>
 				{#if selectedModel}
 					{@const selectedJob = downloadJobFor(selectedModel)}
@@ -578,7 +670,11 @@
 							{/if}
 							<div class="rounded-md border p-2">
 								<div class="text-xs text-muted-foreground">Quality / Speed</div>
-								<div class="mt-1 font-medium">{fmtNum(selectedModel.score_components.quality)} / {fmtNum(selectedModel.score_components.speed)}</div>
+								<div class="mt-1 font-medium">
+									{fmtNum(selectedModel.score_components.quality)} / {fmtNum(
+										selectedModel.score_components.speed
+									)}
+								</div>
 							</div>
 							<div class="rounded-md border p-2">
 								<div class="text-xs text-muted-foreground">Fit Score</div>
@@ -590,13 +686,20 @@
 							</div>
 							<div class="rounded-md border p-2">
 								<div class="text-xs text-muted-foreground">Target</div>
-								<div class="mt-1 truncate font-medium">{selectedModel.target_dir || selectedModel.download?.target_dir || selectedJob?.target_dir || 'n/a'}</div>
+								<div class="mt-1 truncate font-medium">
+									{selectedModel.target_dir ||
+										selectedModel.download?.target_dir ||
+										selectedJob?.target_dir ||
+										'n/a'}
+								</div>
 							</div>
 						</div>
 
 						{#if selectedJob}
 							<div class="rounded-md border p-3">
-								<div class="mb-2 flex items-center justify-between gap-3 text-xs text-muted-foreground">
+								<div
+									class="mb-2 flex items-center justify-between gap-3 text-xs text-muted-foreground"
+								>
 									<span>Download Progress</span>
 									<span>{fmtSpeed(selectedJob.speed_bps)}</span>
 								</div>
@@ -606,15 +709,27 @@
 										style={`width: ${Math.max(selectedJob.percent > 0 ? 1 : 0, Math.min(100, selectedJob.percent || 0))}%`}
 									></div>
 								</div>
-								<div class="mt-2 flex flex-wrap justify-between gap-2 text-xs text-muted-foreground">
-									<span>{fmtBytes(selectedJob.downloaded_bytes)} / {fmtBytes(selectedJob.total_bytes)}</span>
+								<div
+									class="mt-2 flex flex-wrap justify-between gap-2 text-xs text-muted-foreground"
+								>
+									<span
+										>{fmtBytes(selectedJob.downloaded_bytes)} / {fmtBytes(
+											selectedJob.total_bytes
+										)}</span
+									>
 									<span>{fmtNum(selectedJob.percent, 1)}%</span>
 								</div>
 								{#if selectedJob.local_path}
-									<div class="mt-2 break-all text-xs text-muted-foreground">{selectedJob.local_path}</div>
+									<div class="mt-2 break-all text-xs text-muted-foreground">
+										{selectedJob.local_path}
+									</div>
 								{/if}
 								{#if selectedJob.error}
-									<div class="mt-2 rounded border border-red-500/30 bg-red-500/10 p-2 text-xs text-red-200">{selectedJob.error}</div>
+									<div
+										class="mt-2 rounded border border-red-500/30 bg-red-500/10 p-2 text-xs text-red-200"
+									>
+										{selectedJob.error}
+									</div>
 								{/if}
 							</div>
 						{/if}
@@ -622,15 +737,20 @@
 						<div>
 							<div class="mb-2 text-xs font-medium uppercase text-muted-foreground">Notes</div>
 							<ul class="space-y-1 text-sm text-muted-foreground">
-								{#each selectedModel.notes as note}
+								{#each selectedModel.notes as note, index (`${index}-${note}`)}
 									<li>{note}</li>
 								{/each}
 							</ul>
 						</div>
 
 						<div>
-							<div class="mb-2 text-xs font-medium uppercase text-muted-foreground">Recommended Command Args</div>
-							<pre class="max-h-48 overflow-auto rounded-md bg-muted p-3 text-xs leading-relaxed whitespace-pre-wrap">{argsText(selectedModel)}</pre>
+							<div class="mb-2 text-xs font-medium uppercase text-muted-foreground">
+								Recommended Command Args
+							</div>
+							<pre
+								class="max-h-48 overflow-auto rounded-md bg-muted p-3 text-xs leading-relaxed whitespace-pre-wrap">{argsText(
+									selectedModel
+								)}</pre>
 						</div>
 
 						<div class="flex flex-wrap gap-2">
@@ -655,7 +775,9 @@
 						</div>
 					</div>
 				{:else}
-					<div class="p-8 text-sm text-muted-foreground">Select a recommendation to inspect the launch plan.</div>
+					<div class="p-8 text-sm text-muted-foreground">
+						Select a recommendation to inspect the launch plan.
+					</div>
 				{/if}
 			</aside>
 		</section>

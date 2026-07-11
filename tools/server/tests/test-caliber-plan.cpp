@@ -1,6 +1,7 @@
 #include "caliber-plan.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 
@@ -181,7 +182,9 @@ void test_adaptive_production_plan() {
 }
 
 void test_real_gguf_reader() {
-    const std::string path = "/home/cooper/models/deepseek-coder-33b-base/deepseek-coder-33b-base.Q4_K_M.gguf";
+    const char * fixture = std::getenv("LLAMA_TEST_GGUF");
+    if (fixture == nullptr || fixture[0] == '\0') return;
+    const std::string path = fixture;
     if (!std::filesystem::exists(path)) return;
     const json meta = caliber::read_gguf_plan_meta(path);
     require_eq(meta.at("path"), path, "real GGUF path");

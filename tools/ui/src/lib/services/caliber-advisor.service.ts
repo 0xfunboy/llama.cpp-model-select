@@ -120,11 +120,17 @@ export class CaliberAdvisorService {
 	}
 
 	static plan(payload: Record<string, unknown>): Promise<CaliberPlanResponse> {
-		return apiPost<CaliberPlanResponse, Record<string, unknown>>('/api/caliber-advisor/plan', payload);
+		return apiPost<CaliberPlanResponse, Record<string, unknown>>(
+			'/api/caliber-advisor/plan',
+			payload
+		);
 	}
 
 	static sweep(payload: Record<string, unknown>): Promise<CaliberSweepResponse> {
-		return apiPost<CaliberSweepResponse, Record<string, unknown>>('/api/caliber-advisor/sweep', payload);
+		return apiPost<CaliberSweepResponse, Record<string, unknown>>(
+			'/api/caliber-advisor/sweep',
+			payload
+		);
 	}
 
 	static sweepStatus(jobId?: string): Promise<CaliberSweepStatus> {

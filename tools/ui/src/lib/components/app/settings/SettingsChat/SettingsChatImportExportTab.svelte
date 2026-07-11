@@ -284,7 +284,9 @@
 					const archive = JSON.parse(await file.text()) as Record<string, unknown>;
 					const result = await ArchiveService.importArchive(archive);
 					await refreshArchiveStatus();
-					toast.success(`Archive imported: ${result.reports} reports, ${result.downloads} downloads`);
+					toast.success(
+						`Archive imported: ${result.reports} reports, ${result.downloads} downloads`
+					);
 				} catch (err) {
 					console.error('Failed to import server archive:', err);
 					toast.error(err instanceof Error ? err.message : 'Failed to import server archive');
@@ -359,10 +361,13 @@
 				<div class="grid gap-2">
 					<h4 class="m-0 text-sm font-medium">Server archive</h4>
 					<p class="m-0 text-sm text-muted-foreground">
-						Back up Fit Advisor recommendations, download states, FIT configurations, Caliber reports, and DS4 Eval results.
+						Back up Fit Advisor recommendations, download states, FIT configurations, Caliber
+						reports, and DS4 Eval results.
 					</p>
 					{#if archiveStatus}
-						<div class="grid gap-2 rounded-md border border-border/50 bg-muted/30 p-3 text-xs text-muted-foreground">
+						<div
+							class="grid gap-2 rounded-md border border-border/50 bg-muted/30 p-3 text-xs text-muted-foreground"
+						>
 							<div class="break-all">DB: {archiveStatus.database_path}</div>
 							<div class="flex flex-wrap gap-x-4 gap-y-1">
 								<span>{archiveStatus.reports} reports</span>
@@ -377,15 +382,27 @@
 				</div>
 			</div>
 			<div class="flex flex-wrap gap-2">
-				<button class="inline-flex h-10 items-center gap-2 rounded-md border px-3 text-sm hover:bg-muted disabled:opacity-50" disabled={archiveBusy} onclick={handleArchiveExport}>
+				<button
+					class="inline-flex h-10 items-center gap-2 rounded-md border px-3 text-sm hover:bg-muted disabled:opacity-50"
+					disabled={archiveBusy}
+					onclick={handleArchiveExport}
+				>
 					<Download class="h-4 w-4" />
 					Export archive
 				</button>
-				<button class="inline-flex h-10 items-center gap-2 rounded-md border px-3 text-sm hover:bg-muted disabled:opacity-50" disabled={archiveBusy} onclick={handleArchiveImport}>
+				<button
+					class="inline-flex h-10 items-center gap-2 rounded-md border px-3 text-sm hover:bg-muted disabled:opacity-50"
+					disabled={archiveBusy}
+					onclick={handleArchiveImport}
+				>
 					<Upload class="h-4 w-4" />
 					Import archive
 				</button>
-				<button class="inline-flex h-10 items-center gap-2 rounded-md border px-3 text-sm hover:bg-muted disabled:opacity-50" disabled={archiveBusy} onclick={refreshArchiveStatus}>
+				<button
+					class="inline-flex h-10 items-center gap-2 rounded-md border px-3 text-sm hover:bg-muted disabled:opacity-50"
+					disabled={archiveBusy}
+					onclick={refreshArchiveStatus}
+				>
 					<Database class="h-4 w-4" />
 					Refresh status
 				</button>

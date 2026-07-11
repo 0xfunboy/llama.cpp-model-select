@@ -150,6 +150,7 @@ function parseSseBlock(block: string): Ds4Event | null {
 
 export class Ds4Service {
 	static listModels(_reload = false): Promise<Ds4ModelsResponse> {
+		void _reload;
 		return apiFetch<Ds4ModelsResponse>('/api/ds4/models', {
 			authOnly: true
 		});

@@ -415,7 +415,7 @@ static void load_json_options(
         const json & object,
         const std::string & origin) {
     static const std::set<std::string> skipped = {
-        "id", "name", "version", "description", "display_name", "display-name", "comment", "args", "options"
+        "id", "name", "version", "description", "display_name", "display-name", "comment", "caliber_evidence", "caliber-evidence", "args", "options"
     };
 
     if (!object.is_object()) {

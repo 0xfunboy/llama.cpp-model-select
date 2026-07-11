@@ -80,6 +80,20 @@ async function mockProductApi(page: Page) {
 			});
 		if (url.pathname === '/api/caliber-advisor/sweep/status')
 			return route.fulfill({ json: { status: 'idle', finished: true } });
+		if (url.pathname === '/api/caliber-advisor/system')
+			return route.fulfill({
+				json: {
+					doctor: {
+						state_writable: true,
+						streaming_profiler_available: true,
+						ready_artifacts: 1,
+						unhealthy_artifacts: 0,
+						duplicate_artifacts: 0,
+						stale_reports: 0,
+						legacy_reports: 0
+					}
+				}
+			});
 		if (url.pathname === '/api/fit-advisor/system')
 			return route.fulfill({
 				json: {
@@ -155,6 +169,8 @@ test('guided flow exposes one qualified answer and three alternatives', async ({
 	await expect(page.getByText('Metric glossary')).toBeVisible();
 	await page.getByRole('button', { name: 'Router', exact: true }).click();
 	await expect(page.getByText('Qualified resident model avoided a switch.')).toBeVisible();
+	await page.getByRole('button', { name: 'Doctor', exact: true }).click();
+	await expect(page.getByText('1 ready · 0 unhealthy')).toBeVisible();
 });
 
 test('mobile product navigation wraps without horizontal overflow', async ({ page }) => {

@@ -252,6 +252,20 @@ void test_memory_policy() {
     require_eq(policies.at("p").at("residency"), "vram-pressure", "canonical budget pressure row");
     require_eq(policies.at("p").at("resource_fit"), "max-usage", "canonical budget pressure fit");
     require_eq(policies.at("p").at("vram_available_for_run_mib"), 6782, "budget minus baseline");
+
+    caliber::memory_policy_options cpu_opts;
+    cpu_opts.vram_budget_mib = 0;
+    cpu_opts.vram_driver_usable_mib = 0;
+    cpu_opts.system_ram_available_mib = 64000;
+    policies = caliber::derive_memory_policies({
+        {{"id", "cpu"}, {"model", "CPU"}, {"variant", "21B"}, {"sweep", "offload"},
+         {"workload_kind", "baseline"}, {"ok", true}, {"memory_measurement_kind", "process-observed"},
+         {"vram_peak_mib", 0}, {"shared_peak_mib", 0}, {"process_working_set_peak_mib", 21000}},
+    }, 0, cpu_opts);
+    require_eq(policies.at("cpu").at("memory_state"), "host-memory", "CPU row uses host memory policy");
+    require_eq(policies.at("cpu").at("residency"), "host-only", "CPU row does not claim VRAM residency");
+    require_eq(policies.at("cpu").at("host_memory_headroom_mib"), 43000.0, "CPU row records RAM headroom");
+    require_eq(policies.at("cpu").at("resource_fit"), "light-fit", "CPU row uses available RAM for fit");
 }
 
 void test_recommendations() {

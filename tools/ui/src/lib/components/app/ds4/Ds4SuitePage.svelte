@@ -1,6 +1,17 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
-	import { Activity, BarChart3, ClipboardCheck, RefreshCw, Square, SquareCheck, Trash2, Trophy, X } from '@lucide/svelte';
+	import { SvelteMap, SvelteSet } from 'svelte/reactivity';
+	import {
+		Activity,
+		BarChart3,
+		ClipboardCheck,
+		RefreshCw,
+		Square,
+		SquareCheck,
+		Trash2,
+		Trophy,
+		X
+	} from '@lucide/svelte';
 	import {
 		Ds4Service,
 		type Ds4Event,
@@ -132,11 +143,21 @@
 	const reportModels = $derived.by(() => uniqueModels(comparisonEvalRows));
 	const modelReportRows = $derived.by(() => buildModelSummaries(comparisonEvalRows));
 	const sectorReportRows = $derived.by(() => buildSectorSummaries(comparisonEvalRows));
-	const singleModelSummary = $derived.by(() => modelReportRows.find((row) => row.model === singleReportModel));
-	const singleSectorRows = $derived.by(() => sectorReportRows.filter((row) => row.model === singleReportModel));
-	const raceModelSummaryA = $derived.by(() => modelReportRows.find((row) => row.model === raceModelA));
-	const raceModelSummaryB = $derived.by(() => modelReportRows.find((row) => row.model === raceModelB));
-	const raceSectorRows = $derived.by(() => buildRaceSectorRows(sectorReportRows, raceModelA, raceModelB));
+	const singleModelSummary = $derived.by(() =>
+		modelReportRows.find((row) => row.model === singleReportModel)
+	);
+	const singleSectorRows = $derived.by(() =>
+		sectorReportRows.filter((row) => row.model === singleReportModel)
+	);
+	const raceModelSummaryA = $derived.by(() =>
+		modelReportRows.find((row) => row.model === raceModelA)
+	);
+	const raceModelSummaryB = $derived.by(() =>
+		modelReportRows.find((row) => row.model === raceModelB)
+	);
+	const raceSectorRows = $derived.by(() =>
+		buildRaceSectorRows(sectorReportRows, raceModelA, raceModelB)
+	);
 	const evalPass = $derived.by(() => {
 		if (activeReport?.kind === 'eval') return summaryNumber('pass');
 		return evalRows.filter((row) => row.pass).length;
@@ -229,7 +250,7 @@
 	function ansiToHtml(text: string): string {
 		let output = '';
 		let open = false;
-		const pattern = /\x1b\[([0-9;]*)m/g;
+		const pattern = new RegExp(`${String.fromCharCode(27)}\\[([0-9;]*)m`, 'g');
 		let lastIndex = 0;
 		let match: RegExpExecArray | null;
 
@@ -269,7 +290,7 @@
 	}
 
 	function uniqueModels(rows: EvalRow[]): string[] {
-		const seen = new Set<string>();
+		const seen = new SvelteSet<string>();
 		for (const row of rows) {
 			const model = String(row.model || '').trim();
 			if (model) seen.add(model);
@@ -278,7 +299,9 @@
 	}
 
 	function sectorsForRow(row: EvalRow): string[] {
-		const source = String(row.source || '').trim().toLowerCase();
+		const source = String(row.source || '')
+			.trim()
+			.toLowerCase();
 		if (source === 'compsec') return ['Cybersecurity'];
 
 		const raw = String(row.domain || '').trim();
@@ -290,7 +313,14 @@
 		return sectors.length > 0 ? sectors : ['General'];
 	}
 
-	function addSummary(map: Map<string, EvalSectorSummary>, key: string, model: string, pass: boolean, tokensPerSecond: number, sector = '') {
+	function addSummary(
+		map: Map<string, EvalSectorSummary>,
+		key: string,
+		model: string,
+		pass: boolean,
+		tokensPerSecond: number,
+		sector = ''
+	) {
 		const row =
 			map.get(key) ??
 			({
@@ -333,7 +363,14 @@
 			const model = String(row.model || '').trim();
 			if (!model) continue;
 			for (const sector of sectorsForRow(row)) {
-				addSummary(bySector, model + '\t' + sector, model, row.pass === true, num(row.tokens_per_second), sector);
+				addSummary(
+					bySector,
+					model + '\t' + sector,
+					model,
+					row.pass === true,
+					num(row.tokens_per_second),
+					sector
+				);
 			}
 		}
 		return [...bySector.values()]
@@ -341,9 +378,13 @@
 			.sort((a, b) => a.sector.localeCompare(b.sector) || a.model.localeCompare(b.model));
 	}
 
-	function buildRaceSectorRows(rows: EvalSectorSummary[], leftModel: string, rightModel: string): EvalRaceSectorSummary[] {
+	function buildRaceSectorRows(
+		rows: EvalSectorSummary[],
+		leftModel: string,
+		rightModel: string
+	): EvalRaceSectorSummary[] {
 		if (!leftModel || !rightModel || leftModel === rightModel) return [];
-		const sectors = new Set<string>();
+		const sectors = new SvelteSet<string>();
 		for (const row of rows) {
 			if (row.model === leftModel || row.model === rightModel) sectors.add(row.sector);
 		}
@@ -362,11 +403,15 @@
 	}
 
 	function bestEvalRowsFromReports(completedReports: Ds4Report[]): EvalRow[] {
-		const bestByModel = new Map<string, { score: number; total: number; updated: string; rows: EvalRow[] }>();
+		const bestByModel = new SvelteMap<
+			string,
+			{ score: number; total: number; updated: string; rows: EvalRow[] }
+		>();
 
 		for (const report of completedReports) {
-			if (report.kind !== 'eval' || report.status !== 'completed' || !Array.isArray(report.results)) continue;
-			const rowsByModel = new Map<string, EvalRow[]>();
+			if (report.kind !== 'eval' || report.status !== 'completed' || !Array.isArray(report.results))
+				continue;
+			const rowsByModel = new SvelteMap<string, EvalRow[]>();
 			for (const row of report.results as EvalRow[]) {
 				const model = String(row.model || '').trim();
 				if (!model) continue;
@@ -409,11 +454,14 @@
 	}
 
 	function reportLabel(report: Ds4ReportSummary): string {
-		const status = report.resumable || report.status === 'paused'
-			? '[resume] '
-			: report.status === 'completed'
-				? '[archive] '
-				: report.status ? '[' + report.status + '] ' : '';
+		const status =
+			report.resumable || report.status === 'paused'
+				? '[resume] '
+				: report.status === 'completed'
+					? '[archive] '
+					: report.status
+						? '[' + report.status + '] '
+						: '';
 		return status + report.created_at + ' · ' + report.model_selector;
 	}
 
@@ -501,7 +549,10 @@
 			archiveEvalReportCount = 0;
 			return;
 		}
-		const completed = reports.filter((report) => report.kind === 'eval' && report.status === 'completed' && report.resumable !== true);
+		const completed = reports.filter(
+			(report) =>
+				report.kind === 'eval' && report.status === 'completed' && report.resumable !== true
+		);
 		const loaded = await Promise.all(
 			completed.map(async (report) => {
 				try {
@@ -666,7 +717,9 @@
 			const snapshot = await Ds4Service.stopJob(jobId || undefined);
 			setSnapshot(snapshot);
 			await refreshReports();
-			appendTerminal('\nStop requested. Partial report saved; waiting for the server to pause safely...\n');
+			appendTerminal(
+				'\nStop requested. Partial report saved; waiting for the server to pause safely...\n'
+			);
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
 		} finally {
@@ -751,30 +804,50 @@
 	</header>
 
 	{#if error}
-		<div class="rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+		<div
+			class="rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+		>
 			{error}
 		</div>
 	{/if}
 
 	{#if otherActiveJob}
-		<div class="rounded-md border border-yellow-500/40 bg-yellow-500/10 px-3 py-2 text-sm text-yellow-700 dark:text-yellow-300">
-			A {otherActiveJob.kind} job is already running: {otherActiveJob.id}. Open the matching DS4 page to monitor it.
+		<div
+			class="rounded-md border border-yellow-500/40 bg-yellow-500/10 px-3 py-2 text-sm text-yellow-700 dark:text-yellow-300"
+		>
+			A {otherActiveJob.kind} job is already running: {otherActiveJob.id}. Open the matching DS4
+			page to monitor it.
 		</div>
 	{/if}
 
 	<section class="grid gap-4 lg:grid-cols-[26rem_minmax(0,1fr)]">
-		<form class="space-y-4 rounded-lg border bg-background p-4" onsubmit={(event) => event.preventDefault()}>
+		<form
+			class="space-y-4 rounded-lg border bg-background p-4"
+			onsubmit={(event) => event.preventDefault()}
+		>
 			<div class="space-y-2">
 				<div class="flex items-center justify-between gap-3">
 					<div class="text-sm font-medium">Models</div>
 					<div class="flex items-center gap-2 text-xs">
-						<button type="button" class="text-muted-foreground hover:text-foreground" onclick={selectAllModels} disabled={isRunning}>ALL</button>
-						<button type="button" class="text-muted-foreground hover:text-foreground" onclick={clearModelSelection} disabled={isRunning}>Clear</button>
+						<button
+							type="button"
+							class="text-muted-foreground hover:text-foreground"
+							onclick={selectAllModels}
+							disabled={isRunning}>ALL</button
+						>
+						<button
+							type="button"
+							class="text-muted-foreground hover:text-foreground"
+							onclick={clearModelSelection}
+							disabled={isRunning}>Clear</button
+						>
 					</div>
 				</div>
 				<div class="max-h-72 space-y-1 overflow-auto rounded-md border p-2">
 					{#each models as model (model.id)}
-						<label class="flex cursor-pointer items-start gap-2 rounded-md px-2 py-2 text-sm hover:bg-muted">
+						<label
+							class="flex cursor-pointer items-start gap-2 rounded-md px-2 py-2 text-sm hover:bg-muted"
+						>
 							<input
 								class="mt-1"
 								type="checkbox"
@@ -783,8 +856,11 @@
 								onchange={() => toggleModel(model.id)}
 							/>
 							<span class="min-w-0 flex-1">
-								<span class="block truncate font-medium">{model.id === 'ALL' ? 'ALL' : model.id}</span>
-								<span class="block truncate text-xs text-muted-foreground">{modelLabel(model)}</span>
+								<span class="block truncate font-medium"
+									>{model.id === 'ALL' ? 'ALL' : model.id}</span
+								>
+								<span class="block truncate text-xs text-muted-foreground">{modelLabel(model)}</span
+								>
 							</span>
 							{#if isModelSelected(model.id)}
 								<SquareCheck class="mt-0.5 h-4 w-4 text-primary" />
@@ -795,7 +871,10 @@
 					{/each}
 				</div>
 				<div class="text-xs text-muted-foreground">
-					Selected: {selectedModelLabel || 'none'} ({selectedModelCount} model{selectedModelCount === 1 ? '' : 's'})
+					Selected: {selectedModelLabel || 'none'} ({selectedModelCount} model{selectedModelCount ===
+					1
+						? ''
+						: 's'})
 				</div>
 			</div>
 
@@ -803,19 +882,44 @@
 				<div class="grid grid-cols-2 gap-3">
 					<label class="space-y-2 text-sm">
 						<span class="font-medium">Max tokens</span>
-						<input class="h-10 w-full rounded-md border bg-background px-3" type="number" min="1" bind:value={maxTokens} disabled={isRunning} />
+						<input
+							class="h-10 w-full rounded-md border bg-background px-3"
+							type="number"
+							min="1"
+							bind:value={maxTokens}
+							disabled={isRunning}
+						/>
 					</label>
 					<label class="space-y-2 text-sm">
 						<span class="font-medium">Think budget</span>
-						<input class="h-10 w-full rounded-md border bg-background px-3" type="number" min="1" bind:value={thinkingBudget} disabled={isRunning} />
+						<input
+							class="h-10 w-full rounded-md border bg-background px-3"
+							type="number"
+							min="1"
+							bind:value={thinkingBudget}
+							disabled={isRunning}
+						/>
 					</label>
 					<label class="space-y-2 text-sm">
 						<span class="font-medium">Limit</span>
-						<input class="h-10 w-full rounded-md border bg-background px-3" type="number" min="0" bind:value={evalLimit} disabled={isRunning} />
+						<input
+							class="h-10 w-full rounded-md border bg-background px-3"
+							type="number"
+							min="0"
+							bind:value={evalLimit}
+							disabled={isRunning}
+						/>
 					</label>
 					<label class="space-y-2 text-sm">
 						<span class="font-medium">Temperature</span>
-						<input class="h-10 w-full rounded-md border bg-background px-3" type="number" step="0.05" min="0" bind:value={temperature} disabled={isRunning} />
+						<input
+							class="h-10 w-full rounded-md border bg-background px-3"
+							type="number"
+							step="0.05"
+							min="0"
+							bind:value={temperature}
+							disabled={isRunning}
+						/>
 					</label>
 				</div>
 				<label class="flex items-center gap-2 text-sm">
@@ -826,19 +930,43 @@
 				<div class="grid grid-cols-2 gap-3">
 					<label class="space-y-2 text-sm">
 						<span class="font-medium">Ctx start</span>
-						<input class="h-10 w-full rounded-md border bg-background px-3" type="number" min="128" bind:value={ctxStart} disabled={isRunning} />
+						<input
+							class="h-10 w-full rounded-md border bg-background px-3"
+							type="number"
+							min="128"
+							bind:value={ctxStart}
+							disabled={isRunning}
+						/>
 					</label>
 					<label class="space-y-2 text-sm">
 						<span class="font-medium">Ctx max</span>
-						<input class="h-10 w-full rounded-md border bg-background px-3" type="number" min="128" bind:value={ctxMax} disabled={isRunning} />
+						<input
+							class="h-10 w-full rounded-md border bg-background px-3"
+							type="number"
+							min="128"
+							bind:value={ctxMax}
+							disabled={isRunning}
+						/>
 					</label>
 					<label class="space-y-2 text-sm">
 						<span class="font-medium">Ctx step</span>
-						<input class="h-10 w-full rounded-md border bg-background px-3" type="number" min="128" bind:value={ctxStep} disabled={isRunning} />
+						<input
+							class="h-10 w-full rounded-md border bg-background px-3"
+							type="number"
+							min="128"
+							bind:value={ctxStep}
+							disabled={isRunning}
+						/>
 					</label>
 					<label class="space-y-2 text-sm">
 						<span class="font-medium">Gen tokens</span>
-						<input class="h-10 w-full rounded-md border bg-background px-3" type="number" min="1" bind:value={genTokens} disabled={isRunning} />
+						<input
+							class="h-10 w-full rounded-md border bg-background px-3"
+							type="number"
+							min="1"
+							bind:value={genTokens}
+							disabled={isRunning}
+						/>
 					</label>
 				</div>
 			{/if}
@@ -869,7 +997,10 @@
 					<span>{jobCurrent}/{jobTotal}</span>
 				</div>
 				<div class="h-2 overflow-hidden rounded-full bg-muted">
-					<div class="h-full rounded-full bg-primary transition-[width]" style={'width: ' + progressPercent + '%'}></div>
+					<div
+						class="h-full rounded-full bg-primary transition-[width]"
+						style={'width: ' + progressPercent + '%'}
+					></div>
 				</div>
 			</div>
 		</form>
@@ -881,7 +1012,10 @@
 				</div>
 				<div class="text-xs text-white/45">{progressPercent}% · seq {lastSeq}</div>
 			</div>
-			<div bind:this={terminalRef} class="h-[34rem] overflow-auto p-3 font-mono text-xs leading-relaxed whitespace-pre-wrap text-white">
+			<div
+				bind:this={terminalRef}
+				class="h-[34rem] overflow-auto p-3 font-mono text-xs leading-relaxed whitespace-pre-wrap text-white"
+			>
 				{@html terminalHtml || 'Ready.\n'}
 			</div>
 		</section>
@@ -894,13 +1028,21 @@
 				<div>
 					<h2 class="text-sm font-semibold">Current Report</h2>
 					<p class="text-xs text-muted-foreground">
-						{activeReport ? 'Showing saved report ' + activeReport.id : isRunning ? 'Live run, restored from server-side job state.' : 'Live results or selected history report.'}
+						{activeReport
+							? 'Showing saved report ' + activeReport.id
+							: isRunning
+								? 'Live run, restored from server-side job state.'
+								: 'Live results or selected history report.'}
 					</p>
 				</div>
 			</div>
 
 			<div class="flex flex-col gap-2 sm:flex-row sm:items-center">
-				<select bind:value={selectedReportId} onchange={() => loadReport(selectedReportId)} class="h-10 min-w-72 rounded-md border bg-background px-3 text-sm">
+				<select
+					bind:value={selectedReportId}
+					onchange={() => loadReport(selectedReportId)}
+					class="h-10 min-w-72 rounded-md border bg-background px-3 text-sm"
+				>
 					<option value="">Live / no saved report</option>
 					{#each reports as report (report.id)}
 						<option value={report.id}>{reportLabel(report)}</option>
@@ -923,7 +1065,11 @@
 					<Trash2 class="h-4 w-4" />
 					Delete pending
 				</button>
-				<button type="button" class="h-10 rounded-md border px-3 text-sm hover:bg-muted" onclick={refreshReports}>Refresh history</button>
+				<button
+					type="button"
+					class="h-10 rounded-md border px-3 text-sm hover:bg-muted"
+					onclick={refreshReports}>Refresh history</button
+				>
 			</div>
 		</div>
 
@@ -965,11 +1111,14 @@
 						</tr>
 					</thead>
 					<tbody>
-						{#each displayEvalRows as row, index}
+						{#each displayEvalRows as row, index (`${row.model}-${row.id}-${index}`)}
 							<tr class="border-t align-top">
 								<td class="px-3 py-2">
 									<div class="font-medium">{row.title || row.id || 'case ' + (index + 1)}</div>
-									<div class="text-muted-foreground">#{row.case_index ?? index + 1} · {row.source || 'DS4'} · {row.domain || 'reasoning'} · {row.id}</div>
+									<div class="text-muted-foreground">
+										#{row.case_index ?? index + 1} · {row.source || 'DS4'} · {row.domain ||
+											'reasoning'} · {row.id}
+									</div>
 								</td>
 								<td class="px-3 py-2">{row.model}</td>
 								<td class="px-3 py-2">{row.expected}</td>
@@ -977,11 +1126,16 @@
 								<td class="px-3 py-2">{num(row.reasoning_tokens)}</td>
 								<td class="px-3 py-2">{num(row.content_tokens)}</td>
 								<td class="px-3 py-2">{num(row.tokens_per_second).toFixed(1)}</td>
-								<td class={row.pass ? 'px-3 py-2 font-medium text-emerald-500' : 'px-3 py-2 font-medium text-red-500'}>{row.pass ? 'PASS' : 'FAIL'}</td>
+								<td
+									class={row.pass
+										? 'px-3 py-2 font-medium text-emerald-500'
+										: 'px-3 py-2 font-medium text-red-500'}>{row.pass ? 'PASS' : 'FAIL'}</td
+								>
 							</tr>
 						{/each}
 						{#if displayEvalRows.length === 0}
-							<tr><td class="px-3 py-6 text-muted-foreground" colspan="8">No eval rows yet.</td></tr>
+							<tr><td class="px-3 py-6 text-muted-foreground" colspan="8">No eval rows yet.</td></tr
+							>
 						{/if}
 					</tbody>
 				</table>
@@ -994,23 +1148,32 @@
 						<div>
 							<h3 class="text-sm font-semibold">Model Report</h3>
 							<p class="text-xs text-muted-foreground">
-								Completed archive only · {archiveEvalReportCount} report{archiveEvalReportCount === 1 ? '' : 's'} · best run per model.
+								Completed archive only · {archiveEvalReportCount} report{archiveEvalReportCount ===
+								1
+									? ''
+									: 's'} · best run per model.
 							</p>
 						</div>
 					</div>
 
 					<div class="flex flex-col gap-2 sm:flex-row sm:items-center">
-						<div class="inline-grid h-10 grid-cols-2 overflow-hidden rounded-md border bg-background text-sm">
+						<div
+							class="inline-grid h-10 grid-cols-2 overflow-hidden rounded-md border bg-background text-sm"
+						>
 							<button
 								type="button"
-								class={reportMode === 'single' ? 'bg-primary px-3 text-primary-foreground' : 'px-3 hover:bg-muted'}
+								class={reportMode === 'single'
+									? 'bg-primary px-3 text-primary-foreground'
+									: 'px-3 hover:bg-muted'}
 								onclick={() => (reportMode = 'single')}
 							>
 								Single
 							</button>
 							<button
 								type="button"
-								class={reportMode === 'race' ? 'bg-primary px-3 text-primary-foreground disabled:opacity-50' : 'px-3 hover:bg-muted disabled:opacity-50'}
+								class={reportMode === 'race'
+									? 'bg-primary px-3 text-primary-foreground disabled:opacity-50'
+									: 'px-3 hover:bg-muted disabled:opacity-50'}
 								disabled={reportModels.length < 2}
 								onclick={() => (reportMode = 'race')}
 							>
@@ -1019,19 +1182,29 @@
 						</div>
 
 						{#if reportMode === 'single'}
-							<select bind:value={singleReportModel} class="h-10 min-w-64 rounded-md border bg-background px-3 text-sm" disabled={reportModels.length === 0}>
-								{#each reportModels as model}
+							<select
+								bind:value={singleReportModel}
+								class="h-10 min-w-64 rounded-md border bg-background px-3 text-sm"
+								disabled={reportModels.length === 0}
+							>
+								{#each reportModels as model (model)}
 									<option value={model}>{model}</option>
 								{/each}
 							</select>
 						{:else}
-							<select bind:value={raceModelA} class="h-10 min-w-56 rounded-md border bg-background px-3 text-sm">
-								{#each reportModels as model}
+							<select
+								bind:value={raceModelA}
+								class="h-10 min-w-56 rounded-md border bg-background px-3 text-sm"
+							>
+								{#each reportModels as model (model)}
 									<option value={model} disabled={model === raceModelB}>{model}</option>
 								{/each}
 							</select>
-							<select bind:value={raceModelB} class="h-10 min-w-56 rounded-md border bg-background px-3 text-sm">
-								{#each reportModels as model}
+							<select
+								bind:value={raceModelB}
+								class="h-10 min-w-56 rounded-md border bg-background px-3 text-sm"
+							>
+								{#each reportModels as model (model)}
 									<option value={model} disabled={model === raceModelA}>{model}</option>
 								{/each}
 							</select>
@@ -1040,7 +1213,9 @@
 				</div>
 
 				{#if reportModels.length === 0}
-					<div class="mt-4 rounded-md border bg-background px-3 py-6 text-sm text-muted-foreground">No model report yet.</div>
+					<div class="mt-4 rounded-md border bg-background px-3 py-6 text-sm text-muted-foreground">
+						No model report yet.
+					</div>
 				{:else if reportMode === 'single'}
 					<div class="mt-4 grid gap-3 md:grid-cols-4">
 						<div class="rounded-md border bg-background p-3">
@@ -1053,11 +1228,15 @@
 						</div>
 						<div class="rounded-md border bg-background p-3">
 							<div class="text-xs text-muted-foreground">Pass / total</div>
-							<div class="mt-1 text-2xl font-semibold">{singleModelSummary?.pass ?? 0}/{singleModelSummary?.total ?? 0}</div>
+							<div class="mt-1 text-2xl font-semibold">
+								{singleModelSummary?.pass ?? 0}/{singleModelSummary?.total ?? 0}
+							</div>
 						</div>
 						<div class="rounded-md border bg-background p-3">
 							<div class="text-xs text-muted-foreground">Avg tok/s</div>
-							<div class="mt-1 text-2xl font-semibold">{num(singleModelSummary?.avg_tokens_per_second).toFixed(1)}</div>
+							<div class="mt-1 text-2xl font-semibold">
+								{num(singleModelSummary?.avg_tokens_per_second).toFixed(1)}
+							</div>
 						</div>
 					</div>
 
@@ -1074,13 +1253,16 @@
 								</tr>
 							</thead>
 							<tbody>
-								{#each singleSectorRows as row}
+								{#each singleSectorRows as row (`${row.model}-${row.sector}`)}
 									<tr class="border-t">
 										<td class="px-3 py-2 font-medium">{row.sector}</td>
 										<td class="px-3 py-2">
 											<div class="flex items-center gap-2">
 												<div class="h-2 w-28 overflow-hidden rounded-full bg-red-500/20">
-													<div class="h-full bg-emerald-500" style={'width: ' + row.score + '%'}></div>
+													<div
+														class="h-full bg-emerald-500"
+														style={'width: ' + row.score + '%'}
+													></div>
 												</div>
 												<span>{row.score}%</span>
 											</div>
@@ -1099,7 +1281,9 @@
 						<div class="rounded-md border bg-background p-3">
 							<div class="text-xs text-muted-foreground">{raceModelA}</div>
 							<div class="mt-1 text-2xl font-semibold">{raceModelSummaryA?.score ?? 0}%</div>
-							<div class="text-xs text-muted-foreground">{raceModelSummaryA?.pass ?? 0}/{raceModelSummaryA?.total ?? 0} pass</div>
+							<div class="text-xs text-muted-foreground">
+								{raceModelSummaryA?.pass ?? 0}/{raceModelSummaryA?.total ?? 0} pass
+							</div>
 						</div>
 						<div class="rounded-md border bg-background p-3">
 							<div class="text-xs text-muted-foreground">Leader</div>
@@ -1113,13 +1297,17 @@
 								{/if}
 							</div>
 							<div class="text-xs text-muted-foreground">
-								Delta {formatDelta((raceModelSummaryA?.score ?? 0) - (raceModelSummaryB?.score ?? 0))}
+								Delta {formatDelta(
+									(raceModelSummaryA?.score ?? 0) - (raceModelSummaryB?.score ?? 0)
+								)}
 							</div>
 						</div>
 						<div class="rounded-md border bg-background p-3">
 							<div class="text-xs text-muted-foreground">{raceModelB}</div>
 							<div class="mt-1 text-2xl font-semibold">{raceModelSummaryB?.score ?? 0}%</div>
-							<div class="text-xs text-muted-foreground">{raceModelSummaryB?.pass ?? 0}/{raceModelSummaryB?.total ?? 0} pass</div>
+							<div class="text-xs text-muted-foreground">
+								{raceModelSummaryB?.pass ?? 0}/{raceModelSummaryB?.total ?? 0} pass
+							</div>
 						</div>
 					</div>
 
@@ -1135,12 +1323,20 @@
 								</tr>
 							</thead>
 							<tbody>
-								{#each raceSectorRows as row}
+								{#each raceSectorRows as row (row.sector)}
 									<tr class="border-t">
 										<td class="px-3 py-2 font-medium">{row.sector}</td>
-										<td class="px-3 py-2">{row.left?.score ?? 0}% · {row.left?.pass ?? 0}/{row.left?.total ?? 0}</td>
-										<td class="px-3 py-2">{row.right?.score ?? 0}% · {row.right?.pass ?? 0}/{row.right?.total ?? 0}</td>
-										<td class={row.delta >= 0 ? 'px-3 py-2 font-medium text-emerald-500' : 'px-3 py-2 font-medium text-red-500'}>{formatDelta(row.delta)}</td>
+										<td class="px-3 py-2"
+											>{row.left?.score ?? 0}% · {row.left?.pass ?? 0}/{row.left?.total ?? 0}</td
+										>
+										<td class="px-3 py-2"
+											>{row.right?.score ?? 0}% · {row.right?.pass ?? 0}/{row.right?.total ?? 0}</td
+										>
+										<td
+											class={row.delta >= 0
+												? 'px-3 py-2 font-medium text-emerald-500'
+												: 'px-3 py-2 font-medium text-red-500'}>{formatDelta(row.delta)}</td
+										>
 										<td class="px-3 py-2">{row.left?.total ?? 0} / {row.right?.total ?? 0}</td>
 									</tr>
 								{/each}
@@ -1179,7 +1375,7 @@
 						</tr>
 					</thead>
 					<tbody>
-						{#each displayBenchRows as row}
+						{#each displayBenchRows as row (`${row.model}-${row.ctx}`)}
 							<tr class="border-t">
 								<td class="px-3 py-2">{row.ctx}</td>
 								<td class="px-3 py-2">{row.model}</td>
@@ -1191,7 +1387,9 @@
 							</tr>
 						{/each}
 						{#if displayBenchRows.length === 0}
-							<tr><td class="px-3 py-6 text-muted-foreground" colspan="7">No bench rows yet.</td></tr>
+							<tr
+								><td class="px-3 py-6 text-muted-foreground" colspan="7">No bench rows yet.</td></tr
+							>
 						{/if}
 					</tbody>
 				</table>

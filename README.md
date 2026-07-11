@@ -1,26 +1,55 @@
-# llama.cpp
+# Local LLM Autopilot for llama.cpp
 
-## Fork Overview: `0xfunboy/llama.cpp-model-select`
+## Which local model should I run?
 
-This fork tracks upstream `ggml-org/llama.cpp` and layers a local LLM operations
-console on top of native `llama-server` router mode. It is designed for machines
-that keep many GGUF models on disk but run a controlled number of model instances
-at a time.
+This fork answers that question on the hardware in front of you. Point it at one
+or more GGUF directories and open **Local LLM Autopilot** in the embedded UI. It
+discovers complete artifacts, detects broken shards and duplicates, plans safe
+runtime settings, races candidates, measures finalists through real streaming
+`llama-server` requests, applies a task-quality floor, and presents one answer
+with inspectable alternatives.
+
+The answer includes the exact context, KV cache, GPU offload/split, MoE, batch and
+thread preset that was proved on this machine. Estimates, synthetic benchmarks,
+streaming measurements and quality results are labelled separately; only a
+context-verified, memory-observed, streaming-measured and quality-qualified row
+can be applied automatically.
+
+The product navigation is deliberately small:
+
+- **Home** — choose use case, normal context, objective, installed-only preference
+  and allowed test time.
+- **Library** — directory discovery, health, downloads, duplicates and initial fit.
+- **Test Lab** — adaptive synthetic racing, streaming profiling and quality packs.
+- **Recommendations** — one qualified winner, three alternatives and full evidence.
+- **Router** — stable `local-*` virtual models and inspectable route decisions.
+- **History** — immutable campaigns, comparison and portable archive.
+- **Doctor** — first-run readiness plus stale build/driver evidence detection.
+
+Everything is offline-first. Runtime state lives under the platform XDG data and
+state directories; sanitized JSON is an import/export format, not a second store.
+See [the operator and migration guide](docs/local-llm-autopilot.md).
+
+This fork tracks upstream `ggml-org/llama.cpp` and keeps inference on native
+`llama-server` router mode. The upstream README continues below this overview.
 
 The upstream README continues below this fork overview.
 
-### Added Modules
+### Product capabilities
 
 - **Native model selector UI** backed by router presets in `models.json`.
 - **Admin router control API** for lifecycle-safe model switching:
   - `GET /admin/models`
   - `POST /admin/switch`
-- **Fit Advisor dashboard** at `/fit-advisor`, backed by a native C++ advisor
+- **Unified Local LLM Autopilot dashboard** at `/caliber-advisor`; Fit and DS4
+  remain progressively disclosed expert tools rather than separate novice flows.
+- **Fit engine**, backed by a native C++ advisor
   inspired by [`AlexsJones/llmfit`](https://github.com/AlexsJones/llmfit).
-- **Caliber Advisor dashboard** at `/caliber-advisor`, a Svelte/native-router
+- **Caliber engine**, a Svelte/native-router
   port of core planning, scoring, guided-run, benchmark and reporting ideas from
   [`SpeederX/calibr`](https://github.com/SpeederX/calibr).
-- **DS4-Eval dashboard** for resumable DwarfStar-style quality evaluation runs,
+- **Quality evaluator** for resumable DwarfStar-style quality runs plus built-in
+  general, chat, coding, reasoning, FIM, RAG, tools and long-context packs,
   inspired by [`antirez/ds4`](https://github.com/antirez/ds4).
 - **Model report and comparison views** with sector summaries, winner selection,
   per-model drilldowns, and historical comparison across completed runs.
@@ -29,6 +58,8 @@ The upstream README continues below this fork overview.
   the active `--models-preset` JSON file.
 - **Local SQLite archive** for benchmark reports, download state, Fit Advisor
   recommendations and configured presets, with import/export from Settings.
+- **Least-cost virtual models**: `local-auto`, `local-fast`, `local-best`,
+  `local-code`, `local-long`, and `local-vision`.
 
 ### Credits And Imported Work
 
@@ -84,8 +115,8 @@ local-model operations ideas from several focused projects:
 - Pulls and caches the llmfit Hugging Face GGUF catalog.
 - Filters by use case, minimum fit, quantization, search text, result limit, and
   selectable context preset.
-- Context selection is a dropdown with common tiers from `4k` through `1M`, with
-  `131k` as the default advisor target.
+- Context selection is a dropdown with common tiers; the guided product defaults
+  to a realistic `32k` and requires explicit selection for extreme contexts.
 - Score output is decomposed into quality, speed, fit, context, and capacity
   components so ranking decisions are inspectable.
 - High-capacity hosts weight long-context, larger coding/reasoning models more
@@ -110,8 +141,8 @@ local-model operations ideas from several focused projects:
 - Plans benchmark sweeps from GGUF metadata, target context, KV-cache settings,
   offload mode and host hardware.
 - Runs campaigns server-side, preserving progress if the browser is closed.
-- Stores completed benchmark reports under `tools/ui/static/reports/caliber`
-  and mirrors them into the local SQLite archive.
+- Stores canonical reports in SQLite under the XDG data directory and writes JSON
+  only as a derived view/export. Legacy static reports are imported once.
 - Aggregates all completed reports into a historical comparison view; later runs
   remain comparable with earlier runs without repeating benchmarks for the same
   model.
@@ -146,8 +177,9 @@ local-model operations ideas from several focused projects:
 
 ### Archive And Backup Features
 
-- Stores operational data in `data/llm-model-select.sqlite`; the database is
-  runtime state and is intentionally ignored by Git.
+- Stores operational data in
+  `$XDG_DATA_HOME/llama.cpp-model-select/platform.sqlite` (normally
+  `~/.local/share/llama.cpp-model-select/platform.sqlite`).
 - Provides Settings import/export for portable backups of:
   - Fit Advisor recommendations
   - download states

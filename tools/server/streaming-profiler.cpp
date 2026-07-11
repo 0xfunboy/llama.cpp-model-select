@@ -456,7 +456,8 @@ json profile(const json & item, const json & cfg, const std::filesystem::path & 
     const auto logical = split_args(item.value("extra_args", std::string()));
     const int requested_context = std::max(0, arg_int(logical, {"--ctx-size", "-c"}, 0));
     const std::string workload = item.value("workload_kind", std::string("baseline"));
-    int prompt_tokens = 512;
+    const json bench = cfg.value("bench", json::object());
+    int prompt_tokens = std::max(1, bench.value("prompt_tokens", 512));
     if (workload == "prefill") prompt_tokens = std::max(1, item.value("prefill_target_tokens", 2048));
     if (workload == "kv-fill") prompt_tokens = std::max(1, item.value("kv_fill_target_tokens", 2048));
     const int max_tokens = std::max(1, cfg.value("bench", json::object()).value("n_predict", 128));
@@ -576,7 +577,6 @@ json profile(const json & item, const json & cfg, const std::filesystem::path & 
         {"process_read_peak_mib", process_read_peak_mib}, {"process_write_peak_mib", process_write_peak_mib}};
 
     std::vector<int> concurrency_profiles;
-    const json bench = cfg.value("bench", json::object());
     if (bench.contains("concurrency_profiles") && bench["concurrency_profiles"].is_array()) {
         for (const auto & value : bench["concurrency_profiles"]) if (value.is_number_integer() && value.get<int>() > 0) concurrency_profiles.push_back(value.get<int>());
     }

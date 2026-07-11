@@ -7,6 +7,7 @@
 #include "server-persistence.h"
 #include "streaming-profiler.h"
 #include "quality-evidence.h"
+#include "build-info.h"
 
 #include <sheredom/subprocess.h>
 
@@ -146,6 +147,41 @@ static json parse_first_json_array(const std::string & output) {
         throw std::runtime_error("benchmark did not return JSON output");
     }
     return json::parse(output.substr(begin, end - begin + 1));
+}
+
+static std::string trim_text(std::string value) {
+    while (!value.empty() && std::isspace((unsigned char) value.back())) value.pop_back();
+    size_t start = 0;
+    while (start < value.size() && std::isspace((unsigned char) value[start])) ++start;
+    return value.substr(start);
+}
+
+static std::filesystem::path executable_in_path(const std::string & name) {
+    if (const char * raw = std::getenv("PATH"); raw && raw[0] != '\0') {
+        std::istringstream paths(raw);
+        std::string directory;
+        while (std::getline(paths, directory, ':')) {
+            const auto candidate = std::filesystem::path(directory) / name;
+            std::error_code ec;
+            if (std::filesystem::is_regular_file(candidate, ec)) return candidate;
+        }
+    }
+    return name;
+}
+
+static json current_runtime_profile() {
+    std::string driver;
+    try {
+        int exit_code = 0;
+        driver = trim_text(run_command_capture(executable_in_path("nvidia-smi"), {"--query-gpu=driver_version", "--format=csv,noheader"}, exit_code));
+        const size_t newline = driver.find('\n');
+        if (newline != std::string::npos) driver.resize(newline);
+        if (exit_code != 0) driver.clear();
+    } catch (...) {}
+    return {
+        {"build", {{"commit", llama_commit()}, {"number", llama_build_number()}, {"target", llama_build_target()}, {"compiler", llama_compiler()}}},
+        {"gpu_driver", driver.empty() ? json(nullptr) : json(driver)},
+    };
 }
 
 static json detected_build_capabilities() {
@@ -551,7 +587,7 @@ static json default_plan_cfg() {
             {"kv_rescue", {{"enabled", true}, {"min_context_tokens", 65536}, {"kv_k", "q4_0"}, {"kv_v", "q4_0"}}},
             {"workload_sweeps", {{"context_reserve_tokens", 512}, {"kv_fill_ratios", {0.25, 0.5, 0.75, 0.9}}, {"prefill_micro_tokens", {2048}}, {"prefill_ratios", {0.25, 0.9}}}},
         }},
-        {"bench", {{"backend", "auto"}, {"n_predict", 128}, {"repetitions", 3}, {"warmup", true}}},
+        {"bench", {{"backend", "auto"}, {"prompt_tokens", 512}, {"n_predict", 128}, {"repetitions", 3}, {"warmup", true}}},
         {"quality", {{"required", true}, {"pack", "overall"}, {"min_score", 0.5}, {"min_samples", 1}}},
         {"context_candidates", {{{"ctx", 8192}, {"kv", "q8_0"}}, {{"ctx", 32768}, {"kv", "q8_0"}}, {{"ctx", 131072}, {"kv", "q8_0"}}}},
         {"max_context_cap", 262144},
@@ -725,14 +761,26 @@ struct server_caliber_advisor_routes::impl {
             if (!artifact.value("loadable", false)) continue;
             const std::string artifact_id = json_value(artifact, "artifact_id", std::string());
             bool configured_match = false;
+            std::string configured_id;
             if (artifact.contains("configured_ids") && artifact["configured_ids"].is_array()) {
                 for (const auto & id : artifact["configured_ids"]) {
-                    if (id.is_string() && (id.get<std::string>() == requested || requested_models.count(id.get<std::string>()))) configured_match = true;
+                    if (!id.is_string()) continue;
+                    const std::string candidate = id.get<std::string>();
+                    if (configured_id.empty()) configured_id = candidate;
+                    if (candidate == requested || requested_models.count(candidate)) {
+                        configured_match = true;
+                        configured_id = candidate;
+                    }
                 }
             }
             if (!requested.empty() && requested != artifact_id && !configured_match) continue;
             if (!requested_models.empty() && !requested_models.count(artifact_id) && !configured_match) continue;
             json meta = json_value(artifact, "metadata", json::object());
+            if (!configured_id.empty()) {
+                meta["display_name"] = json_value(meta, "model", json_value(artifact, "name", configured_id));
+                meta["model"] = configured_id;
+                meta["configured_id"] = configured_id;
+            }
             meta["path"] = json_value(artifact, "primary_path", std::string());
             meta["artifact_id"] = artifact_id;
             meta["model_id"] = json_value(artifact, "model_id", std::string());
@@ -756,7 +804,36 @@ struct server_caliber_advisor_routes::impl {
 
     server_http_res_ptr handle_system(const server_http_req &) {
         auto res = std::make_unique<server_http_res>();
-        res_ok(res, {{"module", "caliber-advisor"}, {"reports_dir", reports_dir().string()}, {"default_cfg", default_plan_cfg()}});
+        const json runtime = current_runtime_profile();
+        const json registry = router.scan_model_registry(false);
+        int ready = 0, unhealthy = 0, duplicates = 0;
+        if (registry.contains("artifacts") && registry["artifacts"].is_array()) for (const auto & artifact : registry["artifacts"]) {
+            if (artifact.value("loadable", false)) ++ready; else ++unhealthy;
+            if (artifact.contains("duplicate_of") && !artifact["duplicate_of"].is_null()) ++duplicates;
+        }
+        int stale_reports = 0, legacy_reports = 0;
+        json stale = json::array();
+        for (const auto & report : server_persistence::load_reports("caliber-advisor")) {
+            const json recorded = report.value("runtime_profile", json::object());
+            if (recorded.empty()) { ++legacy_reports; continue; }
+            const std::string recorded_commit = recorded.value("build", json::object()).value("commit", std::string());
+            const std::string current_commit = runtime.value("build", json::object()).value("commit", std::string());
+            const std::string recorded_driver = json_value(recorded, "gpu_driver", std::string());
+            const std::string current_driver = json_value(runtime, "gpu_driver", std::string());
+            json reasons = json::array();
+            if (!recorded_commit.empty() && recorded_commit != current_commit) reasons.push_back("llama.cpp build changed");
+            if (!recorded_driver.empty() && !current_driver.empty() && recorded_driver != current_driver) reasons.push_back("GPU driver changed");
+            if (!reasons.empty()) { ++stale_reports; stale.push_back({{"report_id", report.value("id", std::string())}, {"reasons", reasons}}); }
+        }
+        const bool state_writable = std::filesystem::exists(server_persistence::database_path()) && access(server_persistence::database_path().c_str(), W_OK) == 0;
+        res_ok(res, {{"module", "caliber-advisor"}, {"reports_dir", reports_dir().string()}, {"default_cfg", default_plan_cfg()},
+            {"runtime_profile", runtime}, {"doctor", {
+                {"ready_artifacts", ready}, {"unhealthy_artifacts", unhealthy}, {"duplicate_artifacts", duplicates},
+                {"stale_reports", stale_reports}, {"legacy_reports", legacy_reports}, {"stale", stale},
+                {"state_database", server_persistence::database_path().string()}, {"state_writable", state_writable},
+                {"streaming_profiler_available", std::filesystem::exists(current_executable_dir() / "llama-server")},
+                {"synthetic_runner_available", std::filesystem::exists(current_executable_dir() / "llama-bench")},
+            }}});
         return res;
     }
 
@@ -914,6 +991,7 @@ struct server_caliber_advisor_routes::impl {
                 caliber::memory_policy_options memory_options;
                 memory_options.vram_budget_mib = json_value(hardware, "vram_budget_mib", -1.0);
                 memory_options.vram_driver_usable_mib = json_value(hardware, "vram_driver_usable_mib", -1.0);
+                memory_options.system_ram_available_mib = json_value(hardware, "system_ram_available_mib", -1.0);
                 winner_rows = caliber::build_report_rows(winner_rows, vram_total_mib, memory_options);
                 std::vector<json> ds4_reports;
                 for (const auto & report : server_persistence::load_reports("ds4-eval")) ds4_reports.push_back(report);
@@ -943,6 +1021,7 @@ struct server_caliber_advisor_routes::impl {
                     {"automatic_fit_allowed", has_streaming && has_quality_winner},
                     {"quality_policy", quality_policy},
                     {"quality_profiles", quality_profiles},
+                    {"runtime_profile", current_runtime_profile()},
                     {"cfg", payload["cfg"]},
                     {"models", payload["models"]},
                     {"plan", plan},
