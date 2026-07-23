@@ -184,7 +184,21 @@ async function mockProductApi(page: Page) {
 							source: 'preset',
 							configured: true,
 							evaluator_eligible: true,
+							evaluated: true,
+							evaluation_cases: 40,
 							status: { value: 'loaded', loaded: true, running: true }
+						},
+						{
+							id: 'mistral-new-runtime',
+							artifact_id: 'artifact:mistral-new',
+							name: 'Mistral New 12B',
+							variant: 'Q4_K_M',
+							source: 'preset',
+							configured: true,
+							evaluator_eligible: true,
+							evaluated: false,
+							evaluation_cases: 0,
+							status: { value: 'unloaded', loaded: false, running: false }
 						}
 					]
 				}
@@ -290,6 +304,17 @@ test('guided flow exposes one qualified answer and three alternatives', async ({
 	await expect(page.getByRole('heading', { name: 'Use-case Evaluator' })).toBeVisible();
 	await expect(page.getByText('DS4 evidence engine')).toBeVisible();
 	await expect(page.getByText('Qwen Local · 14B').first()).toBeVisible();
+	await page.getByRole('button', { name: 'All new', exact: true }).click();
+	await expect(page.getByText('Mistral New · 12B').first()).toBeVisible();
+	await expect(
+		page.locator('label').filter({ hasText: 'Qwen Local · 14B' }).getByRole('checkbox')
+	).not.toBeChecked();
+	await expect(
+		page.locator('label').filter({ hasText: 'Mistral New · 12B' }).getByRole('checkbox')
+	).toBeChecked();
+	await expect(page.getByText(/All new selects configured models/)).toBeVisible();
+	await expect(page.getByText(/evaluated: select manually to retest/)).toBeVisible();
+	await expect(page.getByText(/not evaluated yet/)).toBeVisible();
 	await page.getByRole('button', { name: 'Router', exact: true }).click();
 	await expect(page.getByText('Current winner')).toBeVisible();
 	await expect(page.getByText('Qualified resident model avoided a switch.')).toBeVisible();

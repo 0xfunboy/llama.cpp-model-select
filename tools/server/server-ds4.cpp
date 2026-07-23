@@ -1,6 +1,7 @@
 #include "server-ds4.h"
 
 #include "common.h"
+#include "ds4-output-guard.h"
 #include "server-common.h"
 #include "server-models.h"
 #include "server-persistence.h"
@@ -36,6 +37,10 @@ namespace {
 static constexpr const char * DS4_CHILD_HOST = "127.0.0.1";
 static constexpr int DS4_HTTP_TIMEOUT_SEC = 600;
 static constexpr size_t DS4_MAX_EVENTS = 20000;
+static constexpr int DS4_DEFAULT_MAX_TOKENS = 2048;
+static constexpr int DS4_DEFAULT_THINK_BUDGET = 1024;
+static constexpr int DS4_MAX_CASE_TOKENS = 4096;
+static constexpr int64_t DS4_MAX_CASE_MS = 15 * 60 * 1000;
 
 struct ds4_case {
     std::string source;
@@ -92,6 +97,7 @@ struct stream_chat_result {
     json usage = json::object();
     json timings = json::object();
     std::string error;
+    std::string stop_reason;
 };
 
 static void ds4_res_ok(std::unique_ptr<server_http_res> & res, const json & response_data) {
@@ -881,6 +887,8 @@ static stream_chat_result stream_child_chat(
     std::string raw_error_body;
     std::string sse_buffer;
     bool done = false;
+    bool guard_stopped = false;
+    ds4_output_guard guard(DS4_MAX_CASE_MS);
 
     req.response_handler = [&out](const httplib::Response & response) {
         out.status = response.status;
@@ -921,15 +929,23 @@ static stream_chat_result stream_child_chat(
             if (!reasoning.empty()) {
                 out.reasoning += reasoning;
                 on_delta("reasoning", reasoning);
+                if (guard.inspect(reasoning, out.stop_reason)) guard_stopped = true;
             }
             if (!content.empty()) {
                 out.content += content;
                 on_delta("content", content);
+                if (guard.inspect(content, out.stop_reason)) guard_stopped = true;
             }
             if (choice.contains("timings")) {
                 out.timings = choice["timings"];
             }
         }, done);
+        if (guard_stopped) {
+            out.error = out.stop_reason == "repetitive_output"
+                ? "repetitive output detected"
+                : "per-case safety limit reached";
+            return false;
+        }
         return true;
     };
 
@@ -938,8 +954,11 @@ static stream_chat_result stream_child_chat(
         out.error = "cancelled";
         return out;
     }
+    if (guard_stopped) {
+        return out;
+    }
     if (result.error() != httplib::Error::Success) {
-        out.error = httplib::to_string(result.error());
+        if (out.error.empty()) out.error = httplib::to_string(result.error());
         return out;
     }
     if (out.status != 200) {
@@ -1375,6 +1394,7 @@ struct server_ds4_routes::impl {
     void update_eval_summary(json & report) {
         int total_pass = 0;
         int total_fail = 0;
+        int total_guarded = 0;
         if (report.contains("results") && report["results"].is_array()) {
             for (const auto & row : report["results"]) {
                 if (json_value(row, "pass", false)) {
@@ -1382,12 +1402,16 @@ struct server_ds4_routes::impl {
                 } else {
                     total_fail++;
                 }
+                if (json_value(row, "generation_status", std::string()) == "guarded") total_guarded++;
             }
         }
         report["summary"] = {
             {"pass", total_pass},
             {"fail", total_fail},
             {"total", total_pass + total_fail},
+            {"guarded", total_guarded},
+            {"model_errors", report.contains("model_errors") && report["model_errors"].is_array()
+                ? report["model_errors"].size() : 0},
             {"score", (total_pass + total_fail) ? (double) total_pass / (double) (total_pass + total_fail) : 0.0},
         };
     }
@@ -1416,10 +1440,12 @@ struct server_ds4_routes::impl {
             }
             const json resume_report = load_resume_report(request, "eval");
             const bool is_resume = resume_report.is_object() && !resume_report.empty();
-            const int max_tokens = std::max(1, json_value(request, "max_tokens",
-                    is_resume ? json_value(resume_report, "max_tokens", 16000) : 16000));
-            const int think_budget = std::max(1, json_value(request, "thinking_budget_tokens",
-                    is_resume ? json_value(resume_report, "thinking_budget_tokens", max_tokens) : max_tokens));
+            const int requested_max_tokens = json_value(request, "max_tokens",
+                    is_resume ? json_value(resume_report, "max_tokens", DS4_DEFAULT_MAX_TOKENS) : DS4_DEFAULT_MAX_TOKENS);
+            const int max_tokens = std::clamp(requested_max_tokens, 64, DS4_MAX_CASE_TOKENS);
+            const int requested_think_budget = json_value(request, "thinking_budget_tokens",
+                    is_resume ? json_value(resume_report, "thinking_budget_tokens", DS4_DEFAULT_THINK_BUDGET) : DS4_DEFAULT_THINK_BUDGET);
+            const int think_budget = std::clamp(requested_think_budget, 1, max_tokens);
             const int timeout_tokens = max_tokens;
             const int limit = json_value(request, "limit", is_resume ? json_value(resume_report, "limit", 0) : 0);
             const bool thinking = json_value(request, "thinking", is_resume ? json_value(resume_report, "thinking", true) : true);
@@ -1441,7 +1467,10 @@ struct server_ds4_routes::impl {
                 {"model_selector", selector},
                 {"models", model_names},
                 {"max_tokens", max_tokens},
+                {"requested_max_tokens", requested_max_tokens},
                 {"thinking_budget_tokens", think_budget},
+                {"safety", {{"max_case_tokens", DS4_MAX_CASE_TOKENS}, {"max_case_ms", DS4_MAX_CASE_MS},
+                    {"repetition_guard", true}, {"continue_after_case_failure", true}}},
                 {"thinking", thinking},
                 {"temperature", temperature},
                 {"packs", request.value("packs", json::array())},
@@ -1451,6 +1480,7 @@ struct server_ds4_routes::impl {
                     {"thinking", thinking}, {"thinking_budget_tokens", think_budget}, {"max_tokens", max_tokens},
                     {"temperature", temperature}, {"top_p", 1.0}, {"top_k", 1}, {"seed", 42}}},
                 {"artifacts", json::object()},
+                {"model_errors", json::array()},
                 {"limit", limit},
                 {"results", json::array()},
                 {"summary", json::object()},
@@ -1491,11 +1521,56 @@ struct server_ds4_routes::impl {
                 json switch_details;
                 std::string switch_error;
                 if (!switch_model_for_job(model_name, resolved, switch_details, switch_error)) {
-                    throw std::runtime_error(switch_error);
+                    int skipped_cases = 0;
+                    for (const auto & tc : cases) {
+                        if (!completed.count(eval_row_key(model_name, tc.id))) skipped_cases++;
+                    }
+                    json model_error = {
+                        {"model", model_name},
+                        {"stage", "load"},
+                        {"error", switch_error},
+                        {"skipped_cases", skipped_cases},
+                        {"ts", isoish_timestamp()},
+                    };
+                    report["model_errors"].push_back(model_error);
+                    update_eval_summary(report);
+                    store_report(job, report);
+                    save_report(job);
+                    {
+                        std::lock_guard<std::mutex> lock(job->mutex);
+                        job->current += skipped_cases;
+                    }
+                    publish(job, "model-error", model_error);
+                    log(job, string_format("\033[1;33mSkipping %s: %s\033[0m\n",
+                            model_name.c_str(), switch_error.c_str()), "stderr");
+                    continue;
                 }
                 auto meta = router.models.get_meta(resolved);
                 if (!meta.has_value()) {
-                    throw std::runtime_error("model disappeared after switch");
+                    const std::string error = "model disappeared after switch";
+                    int skipped_cases = 0;
+                    for (const auto & tc : cases) {
+                        if (!completed.count(eval_row_key(model_name, tc.id))) skipped_cases++;
+                    }
+                    json model_error = {
+                        {"model", model_name},
+                        {"stage", "load"},
+                        {"error", error},
+                        {"skipped_cases", skipped_cases},
+                        {"ts", isoish_timestamp()},
+                    };
+                    report["model_errors"].push_back(model_error);
+                    update_eval_summary(report);
+                    store_report(job, report);
+                    save_report(job);
+                    {
+                        std::lock_guard<std::mutex> lock(job->mutex);
+                        job->current += skipped_cases;
+                    }
+                    publish(job, "model-error", model_error);
+                    log(job, string_format("\033[1;33mSkipping %s: %s\033[0m\n",
+                            model_name.c_str(), error.c_str()), "stderr");
+                    continue;
                 }
                 const int port = meta->port;
                 std::string model_path;
@@ -1512,10 +1587,6 @@ struct server_ds4_routes::impl {
                     case_index++;
                     if (completed.count(eval_row_key(resolved, tc.id))) {
                         continue;
-                    }
-                    {
-                        std::lock_guard<std::mutex> lock(job->mutex);
-                        job->current++;
                     }
                     log(job, string_format("\n\033[1m[%s] case %d/%zu %s / %s\033[0m\n",
                             resolved.c_str(), case_index, cases.size(), tc.source.c_str(), tc.id.c_str()));
@@ -1565,17 +1636,12 @@ struct server_ds4_routes::impl {
                     if (think_open) {
                         log(job, "\n\033[2m</think>\033[0m\n", "token");
                     }
-                    if (!generated.ok) {
-                        throw std::runtime_error(string_format("generation failed for %s: %s",
-                                tc.id.c_str(), generated.error.c_str()));
-                    }
-
                     const int64_t elapsed_ms = std::max<int64_t>(1, ggml_time_ms() - start_ms);
                     const std::string combined = generated.reasoning.empty()
                         ? generated.content
                         : "<think>" + generated.reasoning + "</think>" + generated.content;
                     const std::string got = find_case_answer(tc, combined);
-                    const bool pass = answer_matches(tc, got);
+                    const bool pass = generated.ok && answer_matches(tc, got);
                     const int think_tokens = tokenize_count(router.params, port, generated.reasoning);
                     const int content_tokens = tokenize_count(router.params, port, generated.content);
                     const double toks_per_sec = (think_tokens + content_tokens) > 0
@@ -1604,6 +1670,9 @@ struct server_ds4_routes::impl {
                         {"expected", tc.answer},
                         {"got", got},
                         {"pass", pass},
+                        {"generation_status", generated.ok ? "completed" : (generated.stop_reason.empty() ? "failed" : "guarded")},
+                        {"generation_error", generated.error.empty() ? json(nullptr) : json(generated.error)},
+                        {"stop_reason", generated.stop_reason.empty() ? json(nullptr) : json(generated.stop_reason)},
                         {"elapsed_ms", elapsed_ms},
                         {"reasoning_tokens", think_tokens},
                         {"content_tokens", content_tokens},
@@ -1619,7 +1688,15 @@ struct server_ds4_routes::impl {
                     report["resumable"] = true;
                     store_report(job, report);
                     save_report(job);
+                    {
+                        std::lock_guard<std::mutex> lock(job->mutex);
+                        job->current++;
+                    }
                     publish(job, "case", row);
+                    if (!generated.ok) {
+                        log(job, string_format("\n\033[1;33mCASE SKIPPED: %s; continuing with the next case\033[0m\n",
+                                generated.error.c_str()), "stderr");
+                    }
                     log(job, string_format("\n\033[%sm%s expected=%s got=%s elapsed=%.2fs tps=%.2f\033[0m\n",
                             pass ? "1;32" : "1;31",
                             pass ? "PASS" : "FAIL",
@@ -2149,6 +2226,15 @@ void server_ds4_routes::init_routes() {
             {"configured", true},
             {"evaluator_eligible", true},
         });
+        std::map<std::string, int> evaluated_models;
+        for (const auto & report : server_persistence::load_reports("ds4-eval")) {
+            if (!report.is_object() || json_value(report, "status", std::string()) != "completed") continue;
+            if (!report.contains("results") || !report["results"].is_array()) continue;
+            for (const auto & row : report["results"]) {
+                const std::string model = json_value(row, "model", std::string());
+                if (!model.empty()) evaluated_models[model]++;
+            }
+        }
         const json registry = p->router.scan_model_registry(reload);
         std::set<std::string> represented_artifacts;
         for (const auto & meta : p->router.models.get_all_meta()) {
@@ -2165,7 +2251,11 @@ void server_ds4_routes::init_routes() {
                 }
             }
             if (!artifact_id.empty()) represented_artifacts.insert(artifact_id);
-            models.push_back(model_meta_to_ds4_json(meta, artifact));
+            json model = model_meta_to_ds4_json(meta, artifact);
+            const int evaluation_cases = evaluated_models[meta.name];
+            model["evaluated"] = evaluation_cases > 0;
+            model["evaluation_cases"] = evaluation_cases;
+            models.push_back(std::move(model));
         }
         if (registry.contains("artifacts") && registry["artifacts"].is_array()) {
             for (const auto & artifact : registry["artifacts"]) {
@@ -2183,6 +2273,9 @@ void server_ds4_routes::init_routes() {
                     {"loadable", artifact.value("loadable", false)},
                     {"configured", false},
                     {"evaluator_eligible", false},
+                    {"eligibility_reason", "Downloaded GGUF has no runtime preset. Configure it in Library before evaluation."},
+                    {"evaluated", false},
+                    {"evaluation_cases", 0},
                     {"source", "registry"},
                     {"status", {{"value", artifact.value("health", std::string("discovered"))}, {"loaded", false}, {"running", false}}},
                 });

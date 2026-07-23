@@ -42,6 +42,7 @@ add_library(${TARGET}
     caliber-plan.h
     caliber-scoring.cpp
     caliber-scoring.h
+    ds4-output-guard.h
     model-registry.cpp
     model-registry.h
     model-operations.cpp
@@ -151,6 +152,11 @@ if(LLAMA_BUILD_TESTS)
     target_compile_features(test-quality-evidence PRIVATE cxx_std_17)
     target_include_directories(test-quality-evidence PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/vendor)
     add_test(NAME quality-evidence COMMAND test-quality-evidence)
+
+    add_executable(test-ds4-output-guard tests/test-ds4-output-guard.cpp)
+    target_compile_features(test-ds4-output-guard PRIVATE cxx_std_17)
+    target_include_directories(test-ds4-output-guard PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME ds4-output-guard COMMAND test-ds4-output-guard)
 
     add_executable(test-least-cost-router tests/test-least-cost-router.cpp least-cost-router.cpp)
     target_compile_features(test-least-cost-router PRIVATE cxx_std_17)

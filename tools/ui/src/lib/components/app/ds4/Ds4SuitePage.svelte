@@ -38,6 +38,9 @@
 		expected?: string;
 		got?: string;
 		pass?: boolean;
+		generation_status?: string;
+		generation_error?: string | null;
+		stop_reason?: string | null;
 		reasoning_tokens?: number;
 		content_tokens?: number;
 		tokens_per_second?: number;
@@ -52,6 +55,13 @@
 		prompt_seconds?: number;
 		decode_seconds?: number;
 		gen_tokens?: number;
+	}
+
+	interface EvalModelError {
+		model?: string;
+		stage?: string;
+		error?: string;
+		skipped_cases?: number;
 	}
 
 	interface EvalModelSummary {
@@ -112,8 +122,8 @@
 	let raceModelA = $state('');
 	let raceModelB = $state('');
 
-	let maxTokens = $state(16000);
-	let thinkingBudget = $state(16000);
+	let maxTokens = $state(2048);
+	let thinkingBudget = $state(1024);
 	let evalLimit = $state(0);
 	let thinking = $state(true);
 	let temperature = $state(0);
@@ -130,6 +140,14 @@
 	const concreteModelCount = $derived(
 		models.filter((model) => model.id !== 'ALL' && model.evaluator_eligible !== false).length
 	);
+	const unevaluatedModelIds = $derived(
+		models
+			.filter(
+				(model) =>
+					model.id !== 'ALL' && model.evaluator_eligible !== false && model.evaluated !== true
+			)
+			.map((model) => model.id)
+	);
 	const selectedModelCount = $derived(isAllSelected ? concreteModelCount : selectedModels.length);
 	const canStart = $derived(!isRunning && selectedModels.length > 0 && !otherActiveJob);
 	const displayEvalRows = $derived.by(() => {
@@ -144,6 +162,11 @@
 		}
 		return benchRows;
 	});
+	const evalModelErrors = $derived.by(() =>
+		activeReport?.kind === 'eval' && Array.isArray(activeReport.model_errors)
+			? (activeReport.model_errors as EvalModelError[])
+			: []
+	);
 	const comparisonEvalRows = $derived.by(() => archiveEvalRows);
 	const reportModels = $derived.by(() => uniqueModels(comparisonEvalRows));
 	const modelReportRows = $derived.by(() => buildModelSummaries(comparisonEvalRows));
@@ -170,6 +193,10 @@
 	const evalFail = $derived.by(() => {
 		if (activeReport?.kind === 'eval') return summaryNumber('fail');
 		return evalRows.filter((row) => row.pass === false).length;
+	});
+	const evalGuarded = $derived.by(() => {
+		if (activeReport?.kind === 'eval') return summaryNumber('guarded');
+		return evalRows.filter((row) => row.generation_status === 'guarded').length;
 	});
 	const evalTotal = $derived(Math.max(1, evalPass + evalFail));
 	const bestPromptTps = $derived.by(() => {
@@ -458,7 +485,8 @@
 		const details = uniqueModelTags([
 			model.variant,
 			...(model.tags ?? []),
-			model.configured === false ? 'configure in Library first' : ''
+			model.configured === false ? 'not selectable: configure in Library first' : '',
+			model.evaluated ? 'evaluated: select manually to retest' : 'not evaluated yet'
 		]);
 		return [normalizeModelName(model.name || model.model_id || model.id), file, ...details]
 			.filter(Boolean)
@@ -524,7 +552,7 @@
 	}
 
 	function selectAllModels() {
-		if (!isRunning) selectedModels = ['ALL'];
+		if (!isRunning) selectedModels = [...unevaluatedModelIds];
 	}
 
 	function clearModelSelection() {
@@ -540,7 +568,12 @@
 				models.filter((model) => model.evaluator_eligible !== false).map((model) => model.id)
 			);
 			if (selectedModels.includes('ALL')) {
-				selectedModels = ['ALL'];
+				selectedModels = models
+					.filter(
+						(model) =>
+							model.id !== 'ALL' && model.evaluator_eligible !== false && model.evaluated !== true
+					)
+					.map((model) => model.id);
 			} else {
 				selectedModels = selectedModels.filter((id) => available.has(id));
 				if (selectedModels.length === 0 && available.has('ALL')) selectedModels = ['ALL'];
@@ -872,7 +905,7 @@
 							type="button"
 							class="text-muted-foreground hover:text-foreground"
 							onclick={selectAllModels}
-							disabled={isRunning}>ALL</button
+							disabled={isRunning}>All new</button
 						>
 						<button
 							type="button"
@@ -883,7 +916,7 @@
 					</div>
 				</div>
 				<div class="max-h-72 space-y-1 overflow-auto rounded-md border p-2">
-					{#each models as model (model.id)}
+					{#each models.filter((model) => model.id !== 'ALL') as model (model.id)}
 						<label
 							class="flex items-start gap-2 rounded-md px-2 py-2 text-sm hover:bg-muted"
 							class:cursor-pointer={model.evaluator_eligible !== false}
@@ -900,12 +933,15 @@
 								<span
 									class="block truncate font-medium"
 									title={normalizeModelName(model.name || model.id)}
-									>{model.id === 'ALL'
-										? 'All configured models'
-										: compactModelName(model.name || model.model_id || model.id)}</span
+									>{compactModelName(model.name || model.model_id || model.id)}</span
 								>
 								<span class="block truncate text-xs text-muted-foreground">{modelLabel(model)}</span
 								>
+								{#if model.eligibility_reason}
+									<span class="block text-xs text-amber-600 dark:text-amber-300"
+										>{model.eligibility_reason}</span
+									>
+								{/if}
 							</span>
 							{#if isModelSelected(model.id)}
 								<SquareCheck class="mt-0.5 h-4 w-4 text-primary" />
@@ -921,6 +957,12 @@
 						? ''
 						: 's'})
 				</div>
+				{#if isEval}
+					<div class="text-xs text-muted-foreground">
+						All new selects configured models without a completed DS4 score. Evaluated models remain
+						available for an intentional manual retest.
+					</div>
+				{/if}
 			</div>
 
 			{#if isEval}
@@ -931,6 +973,7 @@
 							class="h-10 w-full rounded-md border bg-background px-3"
 							type="number"
 							min="1"
+							max="4096"
 							bind:value={maxTokens}
 							disabled={isRunning}
 						/>
@@ -941,6 +984,7 @@
 							class="h-10 w-full rounded-md border bg-background px-3"
 							type="number"
 							min="1"
+							max="4096"
 							bind:value={thinkingBudget}
 							disabled={isRunning}
 						/>
@@ -971,6 +1015,10 @@
 					<input type="checkbox" bind:checked={thinking} disabled={isRunning} />
 					<span>Enable thinking/reasoning template controls</span>
 				</label>
+				<p class="text-xs text-muted-foreground">
+					Per-case guardrails stop repetitive output, cap generation at 4,096 tokens and record the
+					case as guarded before continuing the campaign.
+				</p>
 			{:else}
 				<div class="grid grid-cols-2 gap-3">
 					<label class="space-y-2 text-sm">
@@ -1119,7 +1167,21 @@
 		</div>
 
 		{#if isEval}
-			<div class="grid gap-3 md:grid-cols-4">
+			{#if evalModelErrors.length > 0}
+				<div class="mb-4 rounded-md border border-amber-500/40 bg-amber-500/10 p-3">
+					<div class="text-sm font-medium text-amber-700 dark:text-amber-300">
+						{evalModelErrors.length} model load error{evalModelErrors.length === 1 ? '' : 's'}; the
+						campaign continued.
+					</div>
+					{#each evalModelErrors as failure (`${failure.model}-${failure.stage}`)}
+						<div class="mt-1 text-xs text-muted-foreground">
+							{modelDisplayName(failure.model || 'unknown')} - {failure.error || 'load failed'} -
+							{failure.skipped_cases || 0} cases skipped
+						</div>
+					{/each}
+				</div>
+			{/if}
+			<div class="grid gap-3 md:grid-cols-5">
 				<div class="rounded-md border p-3">
 					<div class="text-xs text-muted-foreground">Pass</div>
 					<div class="mt-1 text-2xl font-semibold text-emerald-500">{evalPass}</div>
@@ -1127,6 +1189,10 @@
 				<div class="rounded-md border p-3">
 					<div class="text-xs text-muted-foreground">Fail</div>
 					<div class="mt-1 text-2xl font-semibold text-red-500">{evalFail}</div>
+				</div>
+				<div class="rounded-md border p-3">
+					<div class="text-xs text-muted-foreground">Guarded</div>
+					<div class="mt-1 text-2xl font-semibold text-amber-500">{evalGuarded}</div>
 				</div>
 				<div class="rounded-md border p-3">
 					<div class="text-xs text-muted-foreground">Score</div>
@@ -1174,9 +1240,17 @@
 								<td class="px-3 py-2">{num(row.content_tokens)}</td>
 								<td class="px-3 py-2">{num(row.tokens_per_second).toFixed(1)}</td>
 								<td
+									title={row.generation_error || ''}
 									class={row.pass
 										? 'px-3 py-2 font-medium text-emerald-500'
-										: 'px-3 py-2 font-medium text-red-500'}>{row.pass ? 'PASS' : 'FAIL'}</td
+										: row.generation_status === 'guarded'
+											? 'px-3 py-2 font-medium text-amber-500'
+											: 'px-3 py-2 font-medium text-red-500'}
+									>{row.pass
+										? 'PASS'
+										: row.generation_status === 'guarded'
+											? 'GUARDED - ' + (row.stop_reason || 'safety')
+											: 'FAIL'}</td
 								>
 							</tr>
 						{/each}

@@ -13,6 +13,9 @@ export interface Ds4Model {
 	loadable?: boolean;
 	configured?: boolean;
 	evaluator_eligible?: boolean;
+	eligibility_reason?: string;
+	evaluated?: boolean;
+	evaluation_cases?: number;
 	status: {
 		value: string;
 		loaded: boolean;

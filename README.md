@@ -175,8 +175,17 @@ local-model operations ideas from several focused projects:
 - Covers multiple subject sectors and product packs, including general,
   chat, coding, reasoning, FIM, RAG, tools and long context where present in the
   suite.
-- Supports model subsets, configured `ALL` selection and direct launch from the
-  Test Lab `Use-case Evaluator` scope.
+- Supports model subsets and an `All new` action that selects configured models
+  without a completed DS4 score. Previously evaluated models require deliberate
+  manual selection for a retest.
+- Uses bounded per-case generation budgets, a repetition detector and a
+  per-case safety limit. Degenerate output is recorded as failed evidence and
+  the campaign advances instead of stalling or discarding prior work.
+- Continues after an isolated generation failure while preserving the error and
+  stop reason in the report for diagnosis.
+- Skips a model that cannot load, records the load error and continues with the
+  remaining selection instead of aborting a multi-model campaign.
+- Supports direct launch from the Test Lab `Use-case Evaluator` scope.
 - Streams long-running job progress to the UI.
 - Keeps job state visible after page changes or browser reconnects.
 - Saves partial reports on stop and supports resuming compatible reports.
