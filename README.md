@@ -10,6 +10,10 @@ races candidates, measures finalists through real streaming `llama-server`
 requests, applies use-case quality evidence, and presents one answer with
 inspectable alternatives.
 
+The same control plane supports hardware-specific workers and presets. It keeps
+NVIDIA CUDA planning intact and adds an AMD Strix Halo profile for full Vulkan
+offload through unified memory.
+
 The answer includes the exact context, KV cache, GPU offload/split, MoE, batch and
 thread preset that was proved on this machine. Estimates, synthetic benchmarks,
 streaming measurements and quality results are labelled separately; only a
@@ -66,6 +70,10 @@ overview.
   recommendations and configured presets, with import/export from Settings.
 - **Least-cost virtual models**: `local-auto`, `local-fast`, `local-best`,
   `local-code`, `local-long`, and `local-vision`.
+- **External worker dispatch** through `LLAMA_SERVER_WORKER`, allowing a control
+  plane build to launch a separate CUDA or Vulkan `llama-server` runtime.
+- **Per-model runtime selection** through trusted preset `worker` paths, with the
+  resolved runtime and worker shown in the model selector and router API.
 
 ### Credits And Imported Work
 
@@ -103,8 +111,10 @@ local-model operations ideas from several focused projects:
   and aggregate multi-GPU VRAM.
 - Uses total RAM capacity for fit planning while still displaying currently free
   RAM as an operational status value.
-- Detects NVIDIA VRAM from `nvidia-smi` and exposes both per-GPU and aggregate
-  VRAM estimates.
+- Detects AMD Vulkan UMA capacity from amdgpu sysfs and NVIDIA VRAM from
+  `nvidia-smi`, exposing both per-GPU and aggregate memory estimates.
+- Treats Strix Halo GTT as one shared CPU/GPU memory pool, avoiding double-counted
+  capacity and inappropriate CPU-offload recommendations.
 - Supports strategy modes:
   - `Balanced`
   - `MultiGPU`
@@ -266,6 +276,12 @@ llama-server \
   --models-autoload \
   --admin-api-key-file /path/to/admin-api-key
 ```
+
+- On the Strix Halo host, use `/home/funboy/ai/bin/llama-strix-console`. Its
+  machine preset is `/home/funboy/ai/config/strix-halo-models.json`, and all
+  managed models remain rooted at `/home/funboy/models`.
+- The multi-node Thunderbolt architecture and qualification gates are documented
+  in [`docs/strix-halo-cluster.md`](docs/strix-halo-cluster.md).
 
 - `aria2c` is required for Fit Advisor managed downloads.
 - `models.json` in this fork is a local preset file and may contain machine-specific
