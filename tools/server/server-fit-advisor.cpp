@@ -626,6 +626,8 @@ static bool is_moe_model(const fit_json & model) {
     return model_bool(model, "is_moe") ||
            model_number(model, "active_parameters") > 0.0 ||
            model_number(model, "num_experts") > 0.0 ||
+           architecture == "qwen4_exp" ||
+           architecture == "qwen4exp" ||
            architecture.find("moe") != std::string::npos ||
            std::regex_search(name, std::regex(R"((^|[-_])a[0-9]+(?:\.[0-9]+)?b($|[-_]))", std::regex_constants::icase));
 }
@@ -771,7 +773,8 @@ static bool vulkan_catalog_candidate(const fit_json & model) {
         "deepseek_v2", "deepseek_v3", "exaone", "gemma2", "gemma3_text", "glm4_moe_lite",
         "gpt_oss", "granite", "granitemoe", "lfm2", "lfm2_moe", "llama", "llama4_text",
         "mistral", "mixtral", "nemotron_h", "olmo3", "olmoe", "phi3", "qwen2", "qwen3",
-        "qwen3_5", "qwen3_5_moe", "qwen3_5_text", "qwen3_moe", "qwen3_next", "smollm3"
+        "qwen3_5", "qwen3_5_moe", "qwen3_5_text", "qwen3_moe", "qwen3_next", "qwen4_exp",
+        "qwen4exp", "smollm3"
     };
     const std::string architecture = lower_copy(fit_json_value(model, "architecture", std::string()));
     if (architectures.count(architecture) == 0 ||
@@ -782,7 +785,7 @@ static bool vulkan_catalog_candidate(const fit_json & model) {
     static const std::set<std::string> trusted_providers = {
         "bartowski", "deepseek-ai", "ggml-org", "google", "lmstudio-community", "meta-llama",
         "maziyarpanahi", "microsoft", "mistralai", "mradermacher", "openai", "qwen",
-        "second-state", "thebloke", "unsloth"
+        "orcarouter", "second-state", "thebloke", "unsloth"
     };
     const std::string provider = lower_copy(fit_json_value(model, "provider", std::string()));
     return trusted_providers.count(provider) > 0;
@@ -1731,7 +1734,14 @@ static fit_json local_catalog_models(const fit_json & installed) {
         }
         const std::string lower_id = lower_copy(id);
         std::string architecture = "unknown";
-        if (lower_id.find("qwen3.8") != std::string::npos || lower_id.find("qwen3.5") != std::string::npos) {
+        const bool is_qwen4exp = lower_id.find("qwen4exp") != std::string::npos ||
+                                lower_id.find("qwen4_exp") != std::string::npos ||
+                                (lower_id.find("qwen3.8") != std::string::npos &&
+                                 lower_id.find("flash") != std::string::npos &&
+                                 lower_id.find("next") != std::string::npos);
+        if (is_qwen4exp) {
+            architecture = "qwen4_exp";
+        } else if (lower_id.find("qwen3.8") != std::string::npos || lower_id.find("qwen3.5") != std::string::npos) {
             architecture = "qwen3_5";
         } else if (lower_id.find("qwen3") != std::string::npos) {
             architecture = "qwen3";
@@ -1751,7 +1761,7 @@ static fit_json local_catalog_models(const fit_json & installed) {
             {"use_case", "General purpose text generation"},
             {"pipeline_tag", "text-generation"},
             {"architecture", architecture},
-            {"is_moe", lower_id.find("moe") != std::string::npos},
+            {"is_moe", is_qwen4exp || lower_id.find("moe") != std::string::npos},
             {"_local_configured", true},
             {"local_size_bytes", fit_json_value(item, "model_size_bytes", 0.0)},
             {"local_draft_size_bytes", fit_json_value(item, "draft_size_bytes", 0.0)},
