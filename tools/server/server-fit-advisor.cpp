@@ -53,6 +53,10 @@ static constexpr const char * FIT_CATALOG_URL =
     "https://raw.githubusercontent.com/AlexsJones/llmfit/main/llmfit-core/data/hf_models.json";
 static constexpr size_t FIT_MAX_DOWNLOAD_EVENTS = 2000;
 
+#ifndef LLAMA_DS4_REPORTS_DIR
+#define LLAMA_DS4_REPORTS_DIR "tools/ui/static/reports"
+#endif
+
 struct fit_download_file {
     std::string filename;
     std::string url;
@@ -367,6 +371,26 @@ static std::optional<double> linux_meminfo_gib(const std::string & key) {
     return std::nullopt;
 }
 
+static std::optional<uint64_t> read_u64_file(const std::filesystem::path & path) {
+    try {
+        const std::string value = trim_copy(read_text_file(path));
+        size_t parsed = 0;
+        const uint64_t result = std::stoull(value, &parsed, 0);
+        if (parsed == value.size()) {
+            return result;
+        }
+    } catch (...) {
+    }
+    return std::nullopt;
+}
+
+static std::string amd_gpu_name(const std::string & device_id) {
+    if (lower_copy(device_id) == "0x1586") {
+        return "AMD Radeon Graphics (Strix Halo)";
+    }
+    return "AMD Radeon Graphics";
+}
+
 static fit_json detect_system_json() {
     double total_ram_gb = 0.0;
     double available_ram_gb = 0.0;
@@ -390,8 +414,69 @@ static fit_json detect_system_json() {
     const double fit_ram_capacity_gb = total_ram_gb;
 
     fit_json gpus = fit_json::array();
-    std::vector<double> vram_gb;
-    std::string primary_gpu;
+    std::vector<double> cuda_vram_gb;
+    std::vector<double> vulkan_vram_gb;
+    std::vector<bool> vulkan_vram_is_unified;
+    std::string primary_cuda_gpu;
+    std::string primary_vulkan_gpu;
+    bool has_vulkan_gpu = false;
+    bool has_cuda_gpu = false;
+    bool vulkan_unified_memory = false;
+    bool strix_halo_available = false;
+#if defined(__linux__)
+    std::error_code drm_ec;
+    const std::filesystem::path drm_root("/sys/class/drm");
+    for (std::filesystem::directory_iterator it(drm_root, std::filesystem::directory_options::skip_permission_denied, drm_ec), end;
+         !drm_ec && it != end; it.increment(drm_ec)) {
+        const std::string card = it->path().filename().string();
+        if (card.rfind("card", 0) != 0 || card.find('-') != std::string::npos) {
+            continue;
+        }
+        const std::filesystem::path device = it->path() / "device";
+        std::string vendor;
+        std::string device_id;
+        try {
+            vendor = lower_copy(trim_copy(read_text_file(device / "vendor")));
+            device_id = trim_copy(read_text_file(device / "device"));
+        } catch (...) {
+            continue;
+        }
+        if (vendor != "0x1002") {
+            continue;
+        }
+
+        const double local_gb = bytes_to_gib((double) read_u64_file(device / "mem_info_vram_total").value_or(0));
+        const double gtt_gb = bytes_to_gib((double) read_u64_file(device / "mem_info_gtt_total").value_or(0));
+        const double gtt_used_gb = bytes_to_gib((double) read_u64_file(device / "mem_info_gtt_used").value_or(0));
+        const bool is_unified = gtt_gb >= 8.0 && gtt_gb > local_gb * 2.0;
+        const double capacity_gb = is_unified ? std::min(gtt_gb, total_ram_gb) : local_gb;
+        const double available_gb = is_unified
+            ? std::min(std::max(0.0, gtt_gb - gtt_used_gb), available_ram_gb)
+            : std::max(0.0, local_gb);
+        if (capacity_gb <= 0.0) {
+            continue;
+        }
+
+        const std::string name = amd_gpu_name(device_id);
+        if (primary_vulkan_gpu.empty()) {
+            primary_vulkan_gpu = name;
+        }
+        vulkan_vram_gb.push_back(capacity_gb);
+        vulkan_vram_is_unified.push_back(is_unified);
+        has_vulkan_gpu = true;
+        vulkan_unified_memory = vulkan_unified_memory || is_unified;
+        strix_halo_available = strix_halo_available || contains_ci(name, "Strix Halo") || contains_ci(name, "8060S");
+        gpus.push_back({
+            {"name", name},
+            {"vram_gb", capacity_gb},
+            {"available_vram_gb", available_gb},
+            {"local_vram_gb", local_gb},
+            {"gtt_gb", gtt_gb},
+            {"backend", "Vulkan"},
+            {"unified_memory", is_unified},
+        });
+    }
+#endif
     for (const auto & line : process_lines({"nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"})) {
         auto pos = line.rfind(',');
         if (pos == std::string::npos) {
@@ -408,10 +493,11 @@ static fit_json detect_system_json() {
         if (name.empty()) {
             name = "NVIDIA GPU";
         }
-        if (primary_gpu.empty()) {
-            primary_gpu = name;
+        if (primary_cuda_gpu.empty()) {
+            primary_cuda_gpu = name;
         }
-        vram_gb.push_back(gb);
+        cuda_vram_gb.push_back(gb);
+        has_cuda_gpu = true;
         gpus.push_back({
             {"name", name},
             {"vram_gb", gb},
@@ -420,12 +506,44 @@ static fit_json detect_system_json() {
         });
     }
 
-    double total_gpu_vram_gb = 0.0;
-    double max_gpu_vram_gb = 0.0;
-    for (double gb : vram_gb) {
-        total_gpu_vram_gb += gb;
-        max_gpu_vram_gb = std::max(max_gpu_vram_gb, gb);
+    double total_vulkan_vram_gb = 0.0;
+    double max_vulkan_vram_gb = 0.0;
+    double unified_capacity_gb = 0.0;
+    for (size_t i = 0; i < vulkan_vram_gb.size(); ++i) {
+        const double gb = vulkan_vram_gb[i];
+        if (i < vulkan_vram_is_unified.size() && vulkan_vram_is_unified[i]) {
+            unified_capacity_gb = std::max(unified_capacity_gb, gb);
+        } else {
+            total_vulkan_vram_gb += gb;
+        }
+        max_vulkan_vram_gb = std::max(max_vulkan_vram_gb, gb);
     }
+    if (vulkan_unified_memory) {
+        total_vulkan_vram_gb += unified_capacity_gb;
+    }
+
+    double total_cuda_vram_gb = 0.0;
+    double max_cuda_vram_gb = 0.0;
+    for (double gb : cuda_vram_gb) {
+        total_cuda_vram_gb += gb;
+        max_cuda_vram_gb = std::max(max_cuda_vram_gb, gb);
+    }
+
+    const std::string requested_profile = lower_copy(common_get_env("LLAMA_FIT_ADVISOR_PROFILE"));
+    const bool request_vulkan = requested_profile == "vulkan" || requested_profile == "strix_halo_vulkan";
+    const bool request_cuda = requested_profile == "cuda" || requested_profile == "nvidia_cuda";
+    const bool use_cuda = has_cuda_gpu && (request_cuda || (!request_vulkan && !strix_halo_available));
+    const bool use_strix_halo = !use_cuda && strix_halo_available && vulkan_unified_memory;
+    const bool unified_memory = use_strix_halo;
+    const std::string backend = use_cuda ? "CUDA" : (has_vulkan_gpu ? "Vulkan" : "CPU");
+    const std::string advisor_profile = use_cuda ? "nvidia_cuda" : (use_strix_halo ? "strix_halo_vulkan" : (has_vulkan_gpu ? "generic_vulkan" : "cpu"));
+    const std::string primary_gpu = use_cuda ? primary_cuda_gpu : primary_vulkan_gpu;
+    const int gpu_count = use_cuda ? (int) cuda_vram_gb.size() : (int) vulkan_vram_gb.size();
+    const double max_gpu_vram_gb = use_cuda ? max_cuda_vram_gb : max_vulkan_vram_gb;
+    const double total_gpu_vram_gb = use_cuda ? total_cuda_vram_gb : total_vulkan_vram_gb;
+    fit_json available_backends = fit_json::array();
+    if (has_vulkan_gpu) available_backends.push_back("Vulkan");
+    if (has_cuda_gpu) available_backends.push_back("CUDA");
 
     return {
         {"cpu_name", detect_cpu_name()},
@@ -433,13 +551,18 @@ static fit_json detect_system_json() {
         {"total_ram_gb", total_ram_gb},
         {"available_ram_gb", available_ram_gb > 0.0 ? available_ram_gb : total_ram_gb},
         {"fit_ram_capacity_gb", fit_ram_capacity_gb},
-        {"has_gpu", !vram_gb.empty()},
+        {"has_gpu", has_vulkan_gpu || has_cuda_gpu},
         {"gpu_name", primary_gpu},
-        {"gpu_count", (int) vram_gb.size()},
+        {"gpu_count", gpu_count},
         {"gpu_vram_gb", max_gpu_vram_gb},
         {"total_gpu_vram_gb", total_gpu_vram_gb},
-        {"backend", vram_gb.empty() ? "CPU" : "CUDA"},
-        {"unified_memory", false},
+        {"backend", backend},
+        {"available_backends", available_backends},
+        {"unified_memory", unified_memory},
+        {"advisor_profile", advisor_profile},
+        {"vulkan_optimal_only", use_strix_halo},
+        {"memory_bandwidth_gbps", use_strix_halo ? 256.0 : 0.0},
+        {"calibrated_decode_bandwidth_gbps", use_strix_halo ? 215.0 : 0.0},
         {"gpus", gpus},
     };
 }
@@ -449,10 +572,11 @@ static double quant_bpp(const std::string & quant) {
     std::transform(q.begin(), q.end(), q.begin(), [](unsigned char c) { return (char) std::toupper(c); });
     if (q == "F32") return 4.0;
     if (q == "F16" || q == "BF16") return 2.0;
-    if (q == "Q8_0" || q.find("Q8") != std::string::npos) return 1.05;
-    if (q == "Q6_K" || q.find("Q6") != std::string::npos) return 0.80;
-    if (q == "Q5_K_M" || q.find("Q5") != std::string::npos) return 0.68;
-    if (q == "Q4_K_M" || q == "Q4_0" || q.find("Q4") != std::string::npos) return 0.58;
+    if (q == "Q8_0" || q.find("Q8") != std::string::npos) return 1.0625;
+    if (q == "Q6_K" || q.find("Q6") != std::string::npos) return 0.82;
+    if (q.find("Q5_K_XL") != std::string::npos) return 0.764;
+    if (q == "Q5_K_M" || q.find("Q5") != std::string::npos) return 0.711;
+    if (q == "Q4_K_M" || q == "Q4_0" || q.find("Q4") != std::string::npos) return 0.605;
     if (q == "Q3_K_M" || q.find("Q3") != std::string::npos) return 0.48;
     if (q == "Q2_K" || q.find("Q2") != std::string::npos) return 0.37;
     if (q.find("4BIT") != std::string::npos) return 0.50;
@@ -497,10 +621,13 @@ static double model_number(const fit_json & model, const char * key, double fall
 }
 
 static bool is_moe_model(const fit_json & model) {
+    const std::string architecture = lower_copy(fit_json_value(model, "architecture", std::string()));
+    const std::string name = lower_copy(fit_json_value(model, "name", std::string()));
     return model_bool(model, "is_moe") ||
            model_number(model, "active_parameters") > 0.0 ||
            model_number(model, "num_experts") > 0.0 ||
-           model_number(model, "moe_intermediate_size") > 0.0;
+           architecture.find("moe") != std::string::npos ||
+           std::regex_search(name, std::regex(R"((^|[-_])a[0-9]+(?:\.[0-9]+)?b($|[-_]))", std::regex_constants::icase));
 }
 
 static bool is_creative_uncensored_tune(const std::string & name) {
@@ -542,7 +669,44 @@ static double kv_bytes_per_element(const std::string & kv_quant) {
     return 2.0;
 }
 
+static double named_total_params_b(const fit_json & model) {
+    const std::string name = std::filesystem::path(fit_json_value(model, "name", std::string())).filename().string();
+    std::smatch match;
+    static const std::regex experts_re(
+        R"((?:^|[-_])([0-9]+(?:\.[0-9]+)?)x([0-9]+(?:\.[0-9]+)?)b(?:$|[-_]))",
+        std::regex_constants::icase);
+    if (std::regex_search(name, match, experts_re)) {
+        return std::stod(match[1].str()) * std::stod(match[2].str());
+    }
+    static const std::regex total_re(
+        R"((?:^|[-_])([0-9]+(?:\.[0-9]+)?)b(?:$|[-_]))",
+        std::regex_constants::icase);
+    if (std::regex_search(name, match, total_re)) {
+        return std::stod(match[1].str());
+    }
+    return 0.0;
+}
+
+static double named_active_params_b(const fit_json & model) {
+    const std::string name = std::filesystem::path(fit_json_value(model, "name", std::string())).filename().string();
+    std::smatch match;
+    static const std::regex active_re(
+        R"((?:^|[-_])a([0-9]+(?:\.[0-9]+)?)b(?:$|[-_]))",
+        std::regex_constants::icase);
+    if (std::regex_search(name, match, active_re)) {
+        return std::stod(match[1].str());
+    }
+    const std::string lower_name = lower_copy(name);
+    if (lower_name.find("gpt-oss-20b") != std::string::npos) return 3.6;
+    if (lower_name.find("gpt-oss-120b") != std::string::npos) return 5.1;
+    return 0.0;
+}
+
 static double params_b_from_json(const fit_json & model) {
+    const double named = named_total_params_b(model);
+    if (named > 0.0) {
+        return named;
+    }
     if (model.contains("parameters_raw") && model["parameters_raw"].is_number()) {
         return model["parameters_raw"].get<double>() / 1000000000.0;
     }
@@ -558,6 +722,70 @@ static double params_b_from_json(const fit_json & model) {
     } catch (...) {
         return 7.0;
     }
+}
+
+static double active_params_b_from_json(const fit_json & model) {
+    const double named = named_active_params_b(model);
+    if (named > 0.0) {
+        return named;
+    }
+    const double raw = model_number(model, "active_parameters");
+    return raw > 0.0 ? raw / 1000000000.0 : 0.0;
+}
+
+static bool vulkan_optimal_quant(const std::string & quant) {
+    const std::string q = lower_copy(quant);
+    return q.find("q4_k_m") != std::string::npos ||
+           q.find("q5_k_m") != std::string::npos ||
+           q.find("q5_k_xl") != std::string::npos ||
+           q.find("q6_k") != std::string::npos ||
+           q.find("q8_0") != std::string::npos ||
+           q.find("iq4_xs") != std::string::npos ||
+           q.find("iq4_nl") != std::string::npos;
+}
+
+static bool vulkan_catalog_candidate(const fit_json & model) {
+    if (model_bool(model, "_local_configured")) {
+        return vulkan_optimal_quant(fit_json_value(model, "quantization", std::string()));
+    }
+    if (lower_copy(fit_json_value(model, "format", std::string())) != "gguf") {
+        return false;
+    }
+    const std::string pipeline = lower_copy(fit_json_value(model, "pipeline_tag", std::string()));
+    if (pipeline != "text-generation") {
+        return false;
+    }
+    const std::string name = lower_copy(fit_json_value(model, "name", std::string()));
+    if (name.find("gguf") == std::string::npos) {
+        return false;
+    }
+    static const std::vector<std::string> incompatible_markers = {
+        "autoround", "awq", "bnb-4bit", "exl2", "exl3", "gptq", "mlx", "nvfp4", "w4a16"
+    };
+    for (const auto & marker : incompatible_markers) {
+        if (name.find(marker) != std::string::npos) {
+            return false;
+        }
+    }
+    static const std::set<std::string> architectures = {
+        "deepseek_v2", "deepseek_v3", "exaone", "gemma2", "gemma3_text", "glm4_moe_lite",
+        "gpt_oss", "granite", "granitemoe", "lfm2", "lfm2_moe", "llama", "llama4_text",
+        "mistral", "mixtral", "nemotron_h", "olmo3", "olmoe", "phi3", "qwen2", "qwen3",
+        "qwen3_5", "qwen3_5_moe", "qwen3_5_text", "qwen3_moe", "qwen3_next", "smollm3"
+    };
+    const std::string architecture = lower_copy(fit_json_value(model, "architecture", std::string()));
+    if (architectures.count(architecture) == 0 ||
+            named_total_params_b(model) <= 0.0 ||
+            !vulkan_optimal_quant(fit_json_value(model, "quantization", std::string("Q4_K_M")))) {
+        return false;
+    }
+    static const std::set<std::string> trusted_providers = {
+        "bartowski", "deepseek-ai", "ggml-org", "google", "lmstudio-community", "meta-llama",
+        "maziyarpanahi", "microsoft", "mistralai", "mradermacher", "openai", "qwen",
+        "second-state", "thebloke", "unsloth"
+    };
+    const std::string provider = lower_copy(fit_json_value(model, "provider", std::string()));
+    return trusted_providers.count(provider) > 0;
 }
 
 static double opt_u32(const fit_json & object, const char * key, double fallback = 0.0) {
@@ -634,8 +862,9 @@ static double context_score(int context_length, int target_context, const std::s
 
 static double quality_score(const fit_json & model, double params_b, const std::string & quant, const std::string & use_case) {
     double quality_params = params_b;
-    if (model.contains("active_parameters") && model["active_parameters"].is_number()) {
-        quality_params = model["active_parameters"].get<double>() / 1000000000.0;
+    const double active_params_b = active_params_b_from_json(model);
+    if (is_moe_model(model) && active_params_b > 0.0) {
+        quality_params = std::max(active_params_b, std::sqrt(active_params_b * params_b) * 1.5);
     }
     double base = 30.0;
     if (quality_params >= 40.0) base = 95.0;
@@ -667,6 +896,7 @@ static double quality_score(const fit_json & model, double params_b, const std::
 
 static double gpu_bandwidth_gbps(const std::string & name) {
     const std::string n = lower_copy(name);
+    if (n.find("strix halo") != std::string::npos || n.find("8060s") != std::string::npos) return 256.0;
     if (n.find("rtx 5090") != std::string::npos) return 1792.0;
     if (n.find("rtx 4090") != std::string::npos) return 1008.0;
     if (n.find("rtx 3090") != std::string::npos) return 936.0;
@@ -1348,8 +1578,10 @@ static std::string tensor_split_from_system(const fit_json & system) {
     if (!system.contains("gpus") || !system["gpus"].is_array() || system["gpus"].empty()) {
         return "";
     }
+    const std::string backend = fit_json_value(system, "backend", std::string());
     std::string out;
     for (const auto & gpu : system["gpus"]) {
+        if (!backend.empty() && fit_json_value(gpu, "backend", std::string()) != backend) continue;
         if (!out.empty()) out += ",";
         int gb = std::max(1, (int) std::llround(fit_json_value(gpu, "vram_gb", 1.0)));
         out += std::to_string(gb);
@@ -1357,11 +1589,106 @@ static std::string tensor_split_from_system(const fit_json & system) {
     return out;
 }
 
+static std::string model_path_from_meta(const server_model_meta & meta) {
+    std::string path;
+    if (meta.preset.get_option("LLAMA_ARG_MODEL", path)) {
+        return path;
+    }
+    return "";
+}
+
+static std::string hf_repo_from_meta(const server_model_meta & meta) {
+    std::string repo;
+    if (meta.preset.get_option("LLAMA_ARG_HF_REPO", repo)) {
+        return repo;
+    }
+    return "";
+}
+
+static uint64_t regular_file_size(const std::string & path) {
+    if (path.empty()) return 0;
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(path, ec);
+    if (ec) return 0;
+
+    std::string prefix;
+    int shard_index = 0;
+    int shard_total = 0;
+    if (!parse_shard_filename(path, prefix, shard_index, shard_total) || shard_total <= 1) {
+        return size;
+    }
+
+    uint64_t total_size = 0;
+    const auto parent = std::filesystem::path(path).parent_path();
+    for (int index = 1; index <= shard_total; ++index) {
+        const auto shard = parent / string_format("%s-%05d-of-%05d.gguf", prefix.c_str(), index, shard_total);
+        const auto shard_size = std::filesystem::file_size(shard, ec);
+        if (ec) {
+            return size;
+        }
+        total_size += shard_size;
+    }
+    return total_size;
+}
+
+static std::string infer_gguf_quant(const std::string & path) {
+    const std::string name = lower_copy(std::filesystem::path(path).filename().string());
+    static const std::vector<std::pair<std::string, std::string>> quant_markers = {
+        {"q5_k_xl", "Q5_K_XL"}, {"q5_k_m", "Q5_K_M"}, {"q4_k_m", "Q4_K_M"},
+        {"iq4_xs", "IQ4_XS"}, {"iq4_nl", "IQ4_NL"}, {"q6_k", "Q6_K"}, {"q8_0", "Q8_0"},
+    };
+    for (const auto & [marker, quant] : quant_markers) {
+        if (name.find(marker) != std::string::npos) {
+            return quant;
+        }
+    }
+    return "Q4_K_M";
+}
+
 static fit_json router_installed_index(server_models_routes & router) {
     fit_json installed = fit_json::array();
-    const fit_json registry = router.scan_model_registry(false);
+    std::set<std::string> configured_paths;
+    for (const auto & meta : router.models.get_all_meta()) {
+        const std::string path = model_path_from_meta(meta);
+        const std::string repo = hf_repo_from_meta(meta);
+        const json loaded_meta = json_value(meta.loaded_info, "meta", json::object());
+        std::string ctx_size_text;
+        std::string draft_path;
+        std::string runtime_name;
+        meta.preset.get_option("LLAMA_ARG_CTX_SIZE", ctx_size_text);
+        meta.preset.get_option("LLAMA_ARG_SPEC_DRAFT_MODEL", draft_path);
+        meta.preset.get_option(COMMON_ARG_PRESET_RUNTIME, runtime_name);
+        int configured_ctx = 0;
+        try {
+            configured_ctx = ctx_size_text.empty() ? 0 : std::stoi(ctx_size_text);
+        } catch (...) {
+            configured_ctx = 0;
+        }
+        if (!path.empty()) configured_paths.insert(path);
+        installed.push_back({
+            {"id", meta.name},
+            {"path", path.empty() ? nullptr : fit_json(path)},
+            {"hf_repo", repo.empty() ? nullptr : fit_json(repo)},
+            {"source", server_model_source_to_string(meta.source)},
+            {"status", server_model_status_to_string(meta.status)},
+            {"tags", meta.tags},
+            {"runtime", runtime_name.empty() ? "llama.cpp" : runtime_name},
+            {"configured_context_length", configured_ctx},
+            {"context_length", json_value(loaded_meta, "n_ctx_train", configured_ctx)},
+            {"n_params", json_value(loaded_meta, "n_params", 0.0)},
+            {"model_size_bytes", json_value(loaded_meta, "size", (double) regular_file_size(path))},
+            {"quant", infer_gguf_quant(path)},
+            {"draft_path", draft_path.empty() ? nullptr : fit_json(draft_path)},
+            {"draft_size_bytes", (double) regular_file_size(draft_path)},
+            {"has_mtp", !draft_path.empty()},
+        });
+    }
+
+    const fit_json registry = fit_json::parse(router.scan_model_registry(false).dump());
     if (!registry.contains("artifacts") || !registry["artifacts"].is_array()) return installed;
     for (const auto & artifact : registry["artifacts"]) {
+        const std::string path = fit_json_value(artifact, "primary_path", std::string());
+        if (!path.empty() && configured_paths.count(path) > 0) continue;
         std::string id = fit_json_value(artifact, "model_id", std::string());
         if (artifact.contains("configured_ids") && artifact["configured_ids"].is_array() && !artifact["configured_ids"].empty()) {
             id = artifact["configured_ids"].front().get<std::string>();
@@ -1377,9 +1704,124 @@ static fit_json router_installed_index(server_models_routes & router) {
             {"status", fit_json_value(artifact, "health", std::string())},
             {"configured", artifact.value("configured", false)},
             {"loadable", artifact.value("loadable", false)},
+            {"model_size_bytes", artifact.value("total_size", 0.0)},
+            {"quant", infer_gguf_quant(path)},
         });
     }
     return installed;
+}
+
+static fit_json local_catalog_models(const fit_json & installed) {
+    fit_json models = fit_json::array();
+    std::set<std::string> seen_paths;
+    for (const auto & item : installed) {
+        const std::string path = fit_json_value(item, "path", std::string());
+        const std::string id = fit_json_value(item, "id", std::string());
+        if (path.empty() || id.empty() || !ends_with_ci(path, ".gguf") || seen_paths.count(path) > 0) {
+            continue;
+        }
+        seen_paths.insert(path);
+        double n_params = fit_json_value(item, "n_params", 0.0);
+        if (n_params <= 0.0) {
+            fit_json named = {{"name", id}};
+            n_params = named_total_params_b(named) * 1000000000.0;
+        }
+        if (n_params <= 0.0) {
+            continue;
+        }
+        const std::string lower_id = lower_copy(id);
+        std::string architecture = "unknown";
+        if (lower_id.find("qwen3.8") != std::string::npos || lower_id.find("qwen3.5") != std::string::npos) {
+            architecture = "qwen3_5";
+        } else if (lower_id.find("qwen3") != std::string::npos) {
+            architecture = "qwen3";
+        } else if (lower_id.find("llama") != std::string::npos) {
+            architecture = "llama";
+        } else if (lower_id.find("mistral") != std::string::npos) {
+            architecture = "mistral";
+        }
+        models.push_back({
+            {"name", id},
+            {"provider", "local"},
+            {"parameter_count", string_format("%.1fB", n_params / 1000000000.0)},
+            {"parameters_raw", n_params},
+            {"quantization", fit_json_value(item, "quant", std::string("Q4_K_M"))},
+            {"format", "gguf"},
+            {"context_length", std::max(4096, fit_json_value(item, "context_length", 32768))},
+            {"use_case", "General purpose text generation"},
+            {"pipeline_tag", "text-generation"},
+            {"architecture", architecture},
+            {"is_moe", lower_id.find("moe") != std::string::npos},
+            {"_local_configured", true},
+            {"local_size_bytes", fit_json_value(item, "model_size_bytes", 0.0)},
+            {"local_draft_size_bytes", fit_json_value(item, "draft_size_bytes", 0.0)},
+            {"has_mtp", fit_json_value(item, "has_mtp", false)},
+            {"runtime", fit_json_value(item, "runtime", std::string("llama.cpp"))},
+        });
+    }
+    return models;
+}
+
+struct fit_bench_calibration {
+    double selected_tps = 0.0;
+    double low_tps = 0.0;
+    double high_tps = 0.0;
+    int selected_ctx = 0;
+    std::string report_id;
+};
+
+static std::map<std::string, fit_bench_calibration> load_bench_calibrations(int target_ctx) {
+    std::map<std::string, fit_bench_calibration> out;
+    std::vector<std::filesystem::directory_entry> reports;
+    std::error_code ec;
+    const std::filesystem::path root(LLAMA_DS4_REPORTS_DIR);
+    if (!std::filesystem::exists(root, ec)) {
+        return out;
+    }
+    for (std::filesystem::directory_iterator it(root, std::filesystem::directory_options::skip_permission_denied, ec), end;
+         !ec && it != end; it.increment(ec)) {
+        if (it->is_regular_file(ec) && it->path().filename().string().rfind("ds4-bench-", 0) == 0 && it->path().extension() == ".json") {
+            reports.push_back(*it);
+        }
+    }
+    std::sort(reports.begin(), reports.end(), [](const auto & a, const auto & b) {
+        std::error_code aec, bec;
+        return a.last_write_time(aec) > b.last_write_time(bec);
+    });
+    for (const auto & entry : reports) {
+        try {
+            const json report = json::parse(read_text_file(entry.path()));
+            if (!report.contains("results") || !report["results"].is_array()) continue;
+            std::map<std::string, std::vector<json>> rows_by_model;
+            for (const auto & row : report["results"]) {
+                const std::string model = json_value(row, "model", std::string());
+                const double tps = json_value(row, "decode_tokens_per_second", 0.0);
+                if (!model.empty() && tps > 0.0) rows_by_model[model].push_back(row);
+            }
+            for (const auto & [model, rows] : rows_by_model) {
+                if (out.count(model) > 0 || rows.empty()) continue;
+                fit_bench_calibration calibration;
+                calibration.low_tps = std::numeric_limits<double>::max();
+                calibration.report_id = json_value(report, "id", entry.path().stem().string());
+                int best_distance = std::numeric_limits<int>::max();
+                for (const auto & row : rows) {
+                    const int ctx = json_value(row, "ctx", 0);
+                    const double tps = json_value(row, "decode_tokens_per_second", 0.0);
+                    calibration.low_tps = std::min(calibration.low_tps, tps);
+                    calibration.high_tps = std::max(calibration.high_tps, tps);
+                    const int distance = std::abs(ctx - target_ctx);
+                    if (distance < best_distance) {
+                        best_distance = distance;
+                        calibration.selected_ctx = ctx;
+                        calibration.selected_tps = tps;
+                    }
+                }
+                if (calibration.selected_tps > 0.0) out[model] = calibration;
+            }
+        } catch (...) {
+        }
+    }
+    return out;
 }
 
 static bool local_file_exists(const std::string & path) {
@@ -1412,7 +1854,7 @@ static fit_json typed_preset_fields(const fit_json & requested) {
         "id", "model", "hf_repo", "alias", "tags", "ctx_size", "n_gpu_layers", "n_cpu_moe",
         "parallel", "batch_size", "ubatch_size", "main_gpu", "cache_type_k", "cache_type_v",
         "flash_attn", "split_mode", "tensor_split", "threads", "reasoning", "reasoning_budget",
-        "load_on_startup",
+        "load_on_startup", "runtime", "worker",
     };
     fit_json out = fit_json::object();
     if (!requested.is_object()) return out;
@@ -1578,6 +2020,10 @@ static fit_json preset_from_plan(const fit_json & system, const std::string & ru
         {"ubatch_size", 512},
         {"load_on_startup", false},
     };
+    const std::string profile = fit_json_value(system, "advisor_profile", std::string("cpu"));
+    preset["runtime"] = profile == "strix_halo_vulkan"
+        ? "Strix Halo Vulkan"
+        : (profile == "nvidia_cuda" ? "NVIDIA CUDA" : "llama.cpp");
     if (preset_should_disable_reasoning(model_id)) {
         preset["reasoning"] = "off";
     } else if (is_reasoning_named(model_id)) {
@@ -1620,16 +2066,24 @@ static fit_json analyze_catalog_model(
         const fit_json & installed,
         const server_models_routes & router,
         int target_ctx,
-        const std::string & strategy) {
+        const std::string & strategy,
+        const std::map<std::string, fit_bench_calibration> & calibrations) {
     const std::string id = fit_json_value(model, "name", std::string());
     const std::string quant = fit_json_value(model, "quantization", std::string("Q4_K_M"));
     const double params_b = params_b_from_json(model);
+    const double active_params_b = active_params_b_from_json(model);
+    const bool model_is_moe = is_moe_model(model);
     const int native_ctx = std::max(512, fit_json_value(model, "context_length", 4096));
     const int ctx = std::max(512, std::min(target_ctx, native_ctx));
-    const double weights_gb = params_b * quant_bpp(quant);
+    const double local_size_bytes = fit_json_value(model, "local_size_bytes", 0.0);
+    const double local_draft_size_bytes = fit_json_value(model, "local_draft_size_bytes", 0.0);
+    const double weights_gb = local_size_bytes > 0.0
+        ? local_size_bytes / 1000000000.0
+        : params_b * quant_bpp(quant);
+    const double draft_weights_gb = local_draft_size_bytes / 1000000000.0;
     const double kv_gb = estimate_kv_cache_gb(model, params_b, ctx, "q8_0");
     const double overhead_gb = 0.70;
-    const double required_gb = weights_gb + kv_gb + overhead_gb;
+    const double required_gb = weights_gb + draft_weights_gb + kv_gb + overhead_gb;
     const auto moe_memory = moe_memory_for_quant(model, quant, kv_gb, overhead_gb);
 
     const double single_vram = fit_json_value(system, "gpu_vram_gb", 0.0);
@@ -1637,6 +2091,7 @@ static fit_json analyze_catalog_model(
     const double ram_capacity = fit_json_value(system, "fit_ram_capacity_gb", fit_json_value(system, "total_ram_gb", 0.0));
     const double ram_available_now = fit_json_value(system, "available_ram_gb", ram_capacity);
     const int gpu_count = fit_json_value(system, "gpu_count", 0);
+    const bool unified = fit_json_value(system, "unified_memory", false);
 
     std::string fit_level = "too_tight";
     std::string run_mode = "cpu_only";
@@ -1644,7 +2099,17 @@ static fit_json analyze_catalog_model(
     double effective_required_gb = required_gb;
     std::vector<std::string> notes;
     double moe_offloaded_gb = 0.0;
-    if (strategy == "moe_offload" && moe_memory && gpu_count > 0 &&
+    if (unified && gpu_count > 0 && required_gb <= single_vram * 0.90) {
+        fit_level = "perfect";
+        run_mode = "gpu_single";
+        available_gb = single_vram;
+        notes.push_back("Fits comfortably in the shared Vulkan UMA pool; full GPU offload is recommended.");
+    } else if (unified && gpu_count > 0 && required_gb <= single_vram) {
+        fit_level = "marginal";
+        run_mode = "gpu_single";
+        available_gb = single_vram;
+        notes.push_back("Fits the shared Vulkan UMA pool with limited headroom.");
+    } else if (!unified && strategy == "moe_offload" && moe_memory && gpu_count > 0 &&
             moe_memory->first <= total_vram * 0.92 && moe_memory->second <= ram_capacity) {
         fit_level = moe_memory->first <= total_vram * 0.75 ? "good" : "marginal";
         run_mode = "moe_offload";
@@ -1691,13 +2156,13 @@ static fit_json analyze_catalog_model(
         available_gb = gpu_count > 0 ? std::max(total_vram, single_vram) : ram_capacity;
         notes.push_back("Estimated memory exceeds total RAM/VRAM capacity.");
     }
-    if (strategy == "multi_gpu" && gpu_count > 1 && run_mode == "gpu_single" && required_gb <= total_vram * 0.90) {
+    if (!unified && strategy == "multi_gpu" && gpu_count > 1 && run_mode == "gpu_single" && required_gb <= total_vram * 0.90) {
         run_mode = "layer_split";
         available_gb = total_vram;
         fit_level = "good";
         notes.push_back("MultiGPU mode requested; using layer split even though the model also fits on one GPU.");
     }
-    if (strategy == "hybrid_offload" && gpu_count > 0 && run_mode != "cpu_only" && run_mode != "cpu_offload" && required_gb > single_vram * 0.90) {
+    if (!unified && strategy == "hybrid_offload" && gpu_count > 0 && run_mode != "cpu_only" && run_mode != "cpu_offload" && required_gb > single_vram * 0.90) {
         run_mode = "cpu_offload";
         available_gb = ram_capacity;
         fit_level = required_gb <= ram_capacity * 0.85 ? "good" : (required_gb <= ram_capacity ? "marginal" : "too_tight");
@@ -1708,13 +2173,49 @@ static fit_json analyze_catalog_model(
     }
 
     const std::string use_case = infer_use_case(model);
+    const bool strix_halo = fit_json_value(system, "advisor_profile", std::string()) == "strix_halo_vulkan";
     const double bandwidth = gpu_bandwidth_gbps(fit_json_value(system, "gpu_name", std::string()));
     double tps = 0.1;
-    if (bandwidth > 0.0 && run_mode != "cpu_only") {
+    double tps_low = 0.1;
+    double tps_high = 0.1;
+    int estimate_ctx = ctx;
+    bool measured = false;
+    std::string estimate_basis = "generic analytical estimate";
+    const auto calibration = calibrations.find(id);
+    if (calibration != calibrations.end()) {
+        tps = calibration->second.selected_tps;
+        tps_low = calibration->second.low_tps;
+        tps_high = calibration->second.high_tps;
+        estimate_ctx = calibration->second.selected_ctx;
+        measured = true;
+        estimate_basis = "DS4-Bench measured on this exact model and runtime";
+        notes.push_back(string_format(
+                "Decode speed is measured by %s at %d context tokens, not inferred from model size.",
+                calibration->second.report_id.c_str(), estimate_ctx));
+    } else if (strix_halo && run_mode == "gpu_single") {
+        const double effective_bandwidth = fit_json_value(system, "calibrated_decode_bandwidth_gbps", 215.0);
+        const double working_set_gb = model_is_moe && active_params_b > 0.0
+            ? active_params_b * quant_bpp(quant)
+            : weights_gb;
+        const double execution_factor = model_is_moe ? 0.75 : 1.0;
+        const double context_pressure = model_is_moe ? 0.75 : 0.18;
+        const double context_factor = 1.0 / (1.0 + context_pressure * (double) ctx / 32768.0);
+        tps = std::max(0.1, effective_bandwidth / std::max(0.1, working_set_gb) * execution_factor * context_factor);
+        tps_low = tps * 0.85;
+        tps_high = tps * 1.15;
+        estimate_basis = model_is_moe
+            ? "Strix Halo Vulkan model using active MoE weights and context pressure"
+            : "Strix Halo Vulkan model calibrated to 215 GB/s effective decode bandwidth";
+        notes.push_back("Decode estimate is calibrated for one Vulkan stream on this Strix Halo; it excludes prompt processing and speculative MTP gains.");
+    } else if (bandwidth > 0.0 && run_mode != "cpu_only") {
         double mode_factor = run_mode == "layer_split" ? 0.90 : (run_mode == "moe_offload" ? 0.80 : (run_mode == "cpu_offload" ? 0.50 : 1.0));
         tps = std::max(0.1, (bandwidth / std::max(0.1, params_b * quant_bpp(quant))) * 0.55 * mode_factor);
+        tps_low = tps * 0.75;
+        tps_high = tps * 1.25;
     } else {
         tps = std::max(0.1, (70.0 / std::max(0.1, params_b)) * quant_speed_multiplier(quant));
+        tps_low = tps * 0.70;
+        tps_high = tps * 1.30;
     }
 
     const double q = quality_score(model, params_b, quant, use_case);
@@ -1727,7 +2228,12 @@ static fit_json analyze_catalog_model(
     if (use_case == "chat")       { wq = 0.40; ws = 0.35; wf = 0.15; wc = 0.10; }
     if (use_case == "multimodal") { wq = 0.50; ws = 0.20; wf = 0.15; wc = 0.15; }
     const bool high_capacity_host = total_vram >= 40.0 || ram_capacity >= 96.0;
-    if (high_capacity_host && target_ctx >= 65536 && (use_case == "coding" || use_case == "reasoning")) {
+    if (strix_halo) {
+        wq = use_case == "reasoning" || use_case == "coding" ? 0.45 : 0.40;
+        ws = use_case == "reasoning" || use_case == "coding" ? 0.35 : 0.40;
+        wf = 0.15;
+        wc = 0.05;
+    } else if (high_capacity_host && target_ctx >= 65536 && (use_case == "coding" || use_case == "reasoning")) {
         wq = use_case == "reasoning" ? 0.64 : 0.62;
         ws = 0.08;
         wf = 0.12;
@@ -1738,12 +2244,13 @@ static fit_json analyze_catalog_model(
     if (strategy == "moe_offload" && run_mode == "moe_offload") strategy_bonus = 9.0;
     if (strategy == "hybrid_offload" && run_mode == "cpu_offload") strategy_bonus = 5.0;
     double capacity_bonus = 0.0;
-    if (high_capacity_host && (use_case == "coding" || use_case == "reasoning")) {
+    if (!strix_halo && high_capacity_host && (use_case == "coding" || use_case == "reasoning")) {
         if (params_b >= 40.0) capacity_bonus = 6.0;
         else if (params_b >= 20.0) capacity_bonus = 4.0;
         else if (params_b < 13.0 && target_ctx >= 65536) capacity_bonus = -3.0;
     }
-    const double score = std::round(std::clamp(q*wq + speed*ws + fit*wf + ctx_score*wc + strategy_bonus + capacity_bonus, 0.0, 100.0) * 10.0) / 10.0;
+    const double evidence_bonus = measured ? 8.0 : 0.0;
+    const double score = std::round(std::clamp(q*wq + speed*ws + fit*wf + ctx_score*wc + strategy_bonus + capacity_bonus + evidence_bonus, 0.0, 100.0) * 10.0) / 10.0;
 
     const fit_json source = first_gguf_source(model);
     const std::string repo = fit_json_value(source, "repo", std::string());
@@ -1814,8 +2321,10 @@ static fit_json analyze_catalog_model(
         {"provider", fit_json_value(model, "provider", std::string())},
         {"tags", tags},
         {"params_b", params_b},
+        {"active_params_b", active_params_b},
         {"parameter_count", fit_json_value(model, "parameter_count", std::string())},
-        {"is_moe", fit_json_value(model, "is_moe", false)},
+        {"is_moe", model_is_moe},
+        {"architecture", fit_json_value(model, "architecture", std::string())},
         {"quant", quant},
         {"format", fit_json_value(model, "format", std::string("gguf"))},
         {"context_length", native_ctx},
@@ -1824,21 +2333,27 @@ static fit_json analyze_catalog_model(
         {"use_case", use_case},
         {"fit_level", fit_level},
         {"score", score},
-        {"score_components", {{"quality", q}, {"speed", speed}, {"fit", fit}, {"context", ctx_score}, {"capacity", capacity_bonus}}},
+        {"score_components", {{"quality", q}, {"speed", speed}, {"fit", fit}, {"context", ctx_score}, {"capacity", capacity_bonus}, {"evidence", evidence_bonus}}},
         {"estimated_tps", tps},
+        {"estimated_tps_low", tps_low},
+        {"estimated_tps_high", tps_high},
+        {"estimate_context_length", estimate_ctx},
+        {"estimate_basis", estimate_basis},
+        {"throughput_measured", measured},
         {"memory_required_gb", effective_required_gb},
         {"full_memory_required_gb", required_gb},
         {"memory_available_gb", available_gb},
         {"ram_available_now_gb", ram_available_now},
         {"ram_capacity_gb", ram_capacity},
         {"weights_gb", weights_gb},
+        {"draft_weights_gb", draft_weights_gb},
         {"kv_cache_gb", kv_gb},
         {"overhead_gb", overhead_gb},
         {"moe_offloaded_gb", moe_offloaded_gb},
         {"utilization_pct", available_gb > 0.0 ? effective_required_gb / available_gb * 100.0 : 0.0},
         {"gpu_mode", run_mode},
         {"fit_strategy", strategy},
-        {"runtime", "llama.cpp"},
+        {"runtime", fit_json_value(model, "runtime", std::string("llama.cpp ") + fit_json_value(system, "backend", std::string("CPU")))},
         {"installed", configured},
         {"configured", configured},
         {"downloaded", downloaded},
@@ -1868,34 +2383,67 @@ static fit_json sorted_filtered_models(
         const fit_json & installed,
         const server_models_routes & router,
         const server_http_req & req) {
+    const bool strix_halo = fit_json_value(system, "advisor_profile", std::string()) == "strix_halo_vulkan";
     const bool include_too_tight = req.get_param("include_too_tight", "") == "true";
     const std::string use_case_filter = lower_copy(req.get_param("use_case", "all"));
-    const std::string fit_filter = lower_copy(req.get_param("min_fit", "marginal"));
+    const std::string fit_filter = lower_copy(req.get_param("min_fit", strix_halo ? "perfect" : "marginal"));
+    const std::string topology_filter = lower_copy(req.get_param("topology", "all"));
     const std::string quant_filter = req.get_param("quant", "");
     const std::string search = req.get_param("search", "");
-    const std::string strategy = lower_copy(req.get_param("strategy", "balanced"));
-    const int target_ctx = std::max(512, std::atoi(req.get_param("context", "131072").c_str()));
-    const int min_rank = include_too_tight ? 0 : fit_rank(fit_filter.empty() ? "marginal" : fit_filter);
-    int limit = std::atoi(req.get_param("limit", "300").c_str());
-    if (limit <= 0) limit = 300;
+    const std::string requested_strategy = lower_copy(req.get_param("strategy", "balanced"));
+    const std::string strategy = fit_json_value(system, "unified_memory", false)
+        ? "balanced"
+        : requested_strategy;
+    const int target_ctx = std::max(512, std::atoi(req.get_param("context", strix_halo ? "32768" : "131072").c_str()));
+    const double min_tps = std::max(0.0, std::atof(req.get_param("min_tps", strix_halo ? "10" : "0").c_str()));
+    const int min_rank = include_too_tight ? 0 : fit_rank(fit_filter.empty() ? (strix_halo ? "perfect" : "marginal") : fit_filter);
+    int limit = std::atoi(req.get_param("limit", strix_halo ? "100" : "300").c_str());
+    if (limit <= 0) limit = strix_halo ? 100 : 300;
     limit = std::min(limit, 2000);
 
     fit_json out = fit_json::array();
     if (!catalog.is_array()) {
         return out;
     }
+    const auto calibrations = load_bench_calibrations(target_ctx);
+    fit_json candidates = local_catalog_models(installed);
     for (const auto & model : catalog) {
+        candidates.push_back(model);
+    }
+    std::set<std::string> seen;
+    for (const auto & model : candidates) {
         if (!model.is_object()) continue;
         const std::string format = lower_copy(fit_json_value(model, "format", std::string("gguf")));
         if (format != "gguf") continue;
-        const fit_json row = analyze_catalog_model(model, system, installed, router, target_ctx, strategy);
+        if (strix_halo && !vulkan_catalog_candidate(model)) continue;
+        fit_json row;
+        try {
+            row = analyze_catalog_model(model, system, installed, router, target_ctx, strategy, calibrations);
+        } catch (const std::exception & e) {
+            throw std::runtime_error(string_format(
+                    "Fit Advisor failed to analyze '%s': %s",
+                    fit_json_value(model, "name", std::string("unknown")).c_str(),
+                    e.what()));
+        }
         const std::string row_use_case = fit_json_value(row, "use_case", std::string());
         const std::string row_fit = fit_json_value(row, "fit_level", std::string());
         const std::string row_quant = fit_json_value(row, "quant", std::string());
         const std::string row_id = fit_json_value(row, "id", std::string());
+        const bool row_is_moe = fit_json_value(row, "is_moe", false);
+        const double row_tps = fit_json_value(row, "estimated_tps", 0.0);
+        const double row_tps_low = fit_json_value(row, "estimated_tps_low", row_tps);
+        const int row_context = fit_json_value(row, "effective_context_length", 0);
+        const std::string unique_key = row_id + "\n" + row_quant;
+        if (seen.count(unique_key) > 0) continue;
+        seen.insert(unique_key);
         if (use_case_filter != "all" && use_case_filter != row_use_case) continue;
+        if (topology_filter == "dense" && row_is_moe) continue;
+        if (topology_filter == "moe" && !row_is_moe) continue;
         if (fit_rank(row_fit) < min_rank) continue;
+        if (row_tps_low + 0.0001 < min_tps) continue;
+        if (strix_halo && row_context < target_ctx) continue;
         const std::string row_mode = fit_json_value(row, "gpu_mode", std::string());
+        if (strix_halo && row_mode != "gpu_single") continue;
         if (strategy == "multi_gpu") {
             if (row_mode != "layer_split") continue;
             const double single_vram = fit_json_value(system, "gpu_vram_gb", 0.0);
@@ -2015,23 +2563,39 @@ struct server_fit_advisor_routes::impl {
         try {
             catalog = load_catalog(false);
         } catch (const std::exception & e) {
-            fit_res_err(res, format_error_response(e.what(), ERROR_TYPE_SERVER));
+            fit_res_err(res, format_error_response(std::string("Fit Advisor catalog load failed: ") + e.what(), ERROR_TYPE_SERVER));
             return res;
         }
         const fit_json system = detect_system_json();
-        const fit_json installed = router_installed_index(router);
-        const fit_json models = sorted_filtered_models(catalog, system, installed, router, req);
-        const fit_json response = {
-            {"object", "list"},
-            {"system", system},
-            {"catalog", catalog_status_json(from_cache)},
-            {"total_catalog_models", catalog.is_array() ? catalog.size() : 0},
-            {"returned_models", models.size()},
-            {"installed", installed},
-            {"models", models},
-        };
-        server_persistence::record_fit_recommendations(json::parse(response.dump()));
-        fit_res_ok(res, response);
+        fit_json installed;
+        fit_json models;
+        try {
+            installed = router_installed_index(router);
+        } catch (const std::exception & e) {
+            fit_res_err(res, format_error_response(std::string("Fit Advisor model index failed: ") + e.what(), ERROR_TYPE_SERVER));
+            return res;
+        }
+        try {
+            models = sorted_filtered_models(catalog, system, installed, router, req);
+        } catch (const std::exception & e) {
+            fit_res_err(res, format_error_response(std::string("Fit Advisor ranking failed: ") + e.what(), ERROR_TYPE_SERVER));
+            return res;
+        }
+        try {
+            const fit_json response = {
+                {"object", "list"},
+                {"system", system},
+                {"catalog", catalog_status_json(from_cache)},
+                {"total_catalog_models", catalog.is_array() ? catalog.size() : 0},
+                {"returned_models", models.size()},
+                {"installed", installed},
+                {"models", models},
+            };
+            server_persistence::record_fit_recommendations(json::parse(response.dump()));
+            fit_res_ok(res, response);
+        } catch (const std::exception & e) {
+            fit_res_err(res, format_error_response(std::string("Fit Advisor response failed: ") + e.what(), ERROR_TYPE_SERVER));
+        }
         return res;
     }
 
@@ -2282,7 +2846,7 @@ struct server_fit_advisor_routes::impl {
             return res;
         }
         if (!local_path.empty()) {
-            const fit_json registry = router.scan_model_registry(true);
+            const fit_json registry = fit_json::parse(router.scan_model_registry(true).dump());
             if (model_registry::artifact_id_for_path(registry, local_path).empty()) {
                 fit_res_err(res, format_error_response("model path is outside the registered model roots", ERROR_TYPE_INVALID_REQUEST));
                 return res;

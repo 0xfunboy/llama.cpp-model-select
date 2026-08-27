@@ -5,24 +5,32 @@ import { getAuthHeaders } from '$lib/utils/api-headers';
 export interface FitAdvisorGpu {
 	name: string;
 	vram_gb: number;
+	available_vram_gb?: number;
+	local_vram_gb?: number;
+	gtt_gb?: number;
 	backend: string;
 	unified_memory?: boolean;
 }
 
 export interface FitAdvisorSystem {
+	advisor_profile?: string;
+	available_backends?: string[];
+	backend: string;
+	calibrated_decode_bandwidth_gbps?: number;
 	cpu_name: string;
 	cpu_cores: number;
-	total_ram_gb: number;
 	available_ram_gb: number;
 	fit_ram_capacity_gb?: number;
-	has_gpu: boolean;
-	gpu_name: string;
 	gpu_count: number;
+	gpu_name: string;
 	gpu_vram_gb: number;
-	total_gpu_vram_gb: number;
-	backend: string;
-	unified_memory?: boolean;
 	gpus: FitAdvisorGpu[];
+	has_gpu: boolean;
+	memory_bandwidth_gbps?: number;
+	total_ram_gb: number;
+	total_gpu_vram_gb: number;
+	unified_memory?: boolean;
+	vulkan_optimal_only?: boolean;
 }
 
 export interface FitAdvisorCatalogStatus {
@@ -87,6 +95,8 @@ export interface FitAdvisorDownloadEvent {
 }
 
 export interface FitAdvisorModel {
+	active_params_b?: number;
+	architecture?: string;
 	id: string;
 	name: string;
 	provider: string;
@@ -102,19 +112,25 @@ export interface FitAdvisorModel {
 	fit_level: 'perfect' | 'good' | 'marginal' | 'too_tight';
 	score: number;
 	score_components: {
+		capacity?: number;
+		context: number;
+		evidence?: number;
+		fit: number;
 		quality: number;
 		speed: number;
-		fit: number;
-		context: number;
-		capacity?: number;
 	};
 	estimated_tps: number;
+	estimated_tps_high?: number;
+	estimated_tps_low?: number;
+	estimate_basis?: string;
+	estimate_context_length?: number;
 	memory_required_gb: number;
 	full_memory_required_gb?: number;
 	memory_available_gb: number;
 	ram_available_now_gb?: number;
 	ram_capacity_gb?: number;
 	weights_gb: number;
+	draft_weights_gb?: number;
 	kv_cache_gb: number;
 	overhead_gb: number;
 	moe_offloaded_gb?: number;
@@ -143,6 +159,7 @@ export interface FitAdvisorModel {
 	download?: FitAdvisorDownload | null;
 	recommended_args: string[];
 	preset: Record<string, unknown>;
+	throughput_measured?: boolean;
 }
 
 export interface FitAdvisorModelsResponse {
@@ -156,15 +173,17 @@ export interface FitAdvisorModelsResponse {
 }
 
 export interface FitAdvisorModelsQuery {
-	refresh?: boolean;
-	use_case?: string;
+	context?: number;
+	include_too_tight?: boolean;
+	limit?: number;
 	min_fit?: string;
+	min_tps?: number;
 	quant?: string;
+	refresh?: boolean;
 	search?: string;
 	strategy?: string;
-	context?: number;
-	limit?: number;
-	include_too_tight?: boolean;
+	topology?: string;
+	use_case?: string;
 }
 
 export interface FitAdvisorConfigureRequest {
