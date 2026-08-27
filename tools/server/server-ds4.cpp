@@ -1801,6 +1801,8 @@ struct server_ds4_routes::impl {
                     throw std::runtime_error("model disappeared after switch");
                 }
                 const int port = meta->port;
+                const json loaded_model_meta = json_value(meta->loaded_info, "meta", json::object());
+                const int model_n_ctx = std::max(0, json_value(loaded_model_meta, "n_ctx", 0));
 
                 log(job, "Tokenizing Promessi Sposi corpus...\n");
                 auto tok_resp = post_child_json(router.params, port, "/tokenize", {
@@ -1821,6 +1823,21 @@ struct server_ds4_routes::impl {
                 }
 
                 int last_ctx = std::min(ctx_max, (int) tokens.size());
+                if (model_n_ctx > 0) {
+                    const int safe_model_ctx = model_n_ctx - gen_tokens;
+                    if (safe_model_ctx < ctx_start) {
+                        throw std::runtime_error(string_format(
+                                "loaded model context (%d) is too small for ctx_start=%d plus %d generated tokens",
+                                model_n_ctx, ctx_start, gen_tokens));
+                    }
+                    last_ctx = std::min(last_ctx, safe_model_ctx);
+                    report["model_context_limits"][resolved] = model_n_ctx;
+                    if (ctx_max > last_ctx) {
+                        log(job, string_format(
+                                "Context capped at %d tokens by the loaded model (n_ctx=%d, generation reserve=%d).\n",
+                                last_ctx, model_n_ctx, gen_tokens));
+                    }
+                }
                 json model_rows = json::array();
                 for (int ctx = ctx_start; ctx <= last_ctx; ctx += ctx_step) {
                     ensure_not_cancelled(job);
