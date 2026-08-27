@@ -22,17 +22,22 @@
 	let error = $state('');
 	let message = $state('');
 	let useCase = $state('all');
-	let minFit = $state('marginal');
+	let minFit = $state('perfect');
+	let minTps = $state(10);
 	let quant = $state('');
 	let search = $state('');
 	let strategy = $state('balanced');
-	let context = $state(131072);
-	let limit = $state(300);
+	let topology = $state('all');
+	let context = $state(32768);
+	let limit = $state(100);
 	let includeTooTight = $state(false);
 	let loadNow = $state(false);
 
 	const models = $derived(response?.models ?? []);
 	const system = $derived(response?.system ?? null);
+	const primaryGpu = $derived(
+		system?.gpus?.find((gpu) => gpu.backend === system.backend) ?? system?.gpus?.[0] ?? null
+	);
 	const catalog = $derived(response?.catalog ?? null);
 	const hasPendingDownload = $derived(
 		downloadJobs.some((job) => isActiveDownloadStatus(job.status))
@@ -127,17 +132,31 @@
 		error = '';
 		message = refresh ? 'Refreshing llmfit catalog...' : 'Loading recommendations...';
 		try {
-			const next = await FitAdvisorService.models({
-				refresh,
-				use_case: useCase,
-				min_fit: minFit,
-				quant,
-				search,
-				strategy,
-				context,
-				limit,
-				include_too_tight: includeTooTight
-			});
+			const initialLoad = response === null;
+			const next = await FitAdvisorService.models(
+				initialLoad
+					? { refresh }
+					: {
+							context,
+							include_too_tight: includeTooTight,
+							limit,
+							min_fit: minFit,
+							min_tps: minTps,
+							quant,
+							refresh,
+							search,
+							strategy,
+							topology,
+							use_case: useCase
+						}
+			);
+			if (initialLoad) {
+				const strixHalo = next.system.vulkan_optimal_only === true;
+				minFit = strixHalo ? 'perfect' : 'marginal';
+				minTps = strixHalo ? 10 : 0;
+				context = strixHalo ? 32768 : 131072;
+				limit = strixHalo ? 100 : 300;
+			}
 			response = next;
 			if (selectedModel) {
 				selectedModel =
@@ -333,8 +352,9 @@
 				</div>
 				<h1 class="mt-1 text-2xl font-semibold tracking-normal">Fit Advisor</h1>
 				<p class="mt-1 max-w-3xl text-sm text-muted-foreground">
-					Rank GGUF models against this machine, estimate memory and throughput, then download or
-					write a router preset.
+					{system?.vulkan_optimal_only
+						? 'Rank trusted Vulkan GGUF models for this Strix Halo using local memory and decode calibration.'
+						: 'Rank GGUF models against this machine, estimate memory and throughput, then download or write a router preset.'}
 				</p>
 			</div>
 			<div class="flex flex-wrap gap-2">
@@ -367,36 +387,41 @@
 					<div class="mt-1 text-xs text-muted-foreground">{system.cpu_cores} threads</div>
 				</div>
 				<div class="rounded-lg border bg-card p-3">
-					<div class="text-xs text-muted-foreground">RAM</div>
-					<div class="mt-1 text-sm font-medium">
-						{fmtGb(system.fit_ram_capacity_gb ?? system.total_ram_gb)} total
-					</div>
-					<div class="mt-1 text-xs text-muted-foreground">
-						{fmtGb(system.available_ram_gb)} currently free
-					</div>
+					<div class="text-xs text-muted-foreground">{system.unified_memory ? 'System RAM (shared)' : 'RAM'}</div>
+					<div class="mt-1 text-sm font-medium">{fmtGb(system.fit_ram_capacity_gb ?? system.total_ram_gb)} total</div>
+					<div class="mt-1 text-xs text-muted-foreground">{fmtGb(system.available_ram_gb)} currently free</div>
 				</div>
 				<div class="rounded-lg border bg-card p-3">
 					<div class="text-xs text-muted-foreground">GPU</div>
-					<div class="mt-1 truncate text-sm font-medium">
-						{system.gpu_name || 'No GPU detected'}
+					<div class="mt-1 truncate text-sm font-medium">{system.gpu_name || 'No GPU detected'}</div>
+					<div class="mt-1 text-xs text-muted-foreground">
+						{system.backend}{system.unified_memory ? ' / unified memory' : ''}
+						{system.calibrated_decode_bandwidth_gbps ? ` / ${fmtNum(system.calibrated_decode_bandwidth_gbps, 0)} GB/s calibrated` : ''}
 					</div>
-					<div class="mt-1 text-xs text-muted-foreground">{system.backend}</div>
 				</div>
 				<div class="rounded-lg border bg-card p-3">
-					<div class="text-xs text-muted-foreground">VRAM Per GPU</div>
+					<div class="text-xs text-muted-foreground">{system.unified_memory ? 'Vulkan UMA Pool' : 'VRAM Per GPU'}</div>
 					<div class="mt-1 text-sm font-medium">{fmtGb(system.gpu_vram_gb)}</div>
-					<div class="mt-1 text-xs text-muted-foreground">{system.gpu_count} GPU(s)</div>
+					<div class="mt-1 text-xs text-muted-foreground">
+						{system.unified_memory ? `${fmtGb(primaryGpu?.available_vram_gb)} currently free` : `${system.gpu_count} GPU(s)`}
+					</div>
 				</div>
 				<div class="rounded-lg border bg-card p-3">
-					<div class="text-xs text-muted-foreground">Aggregate VRAM</div>
-					<div class="mt-1 text-sm font-medium">{fmtGb(system.total_gpu_vram_gb)}</div>
-					<div class="mt-1 text-xs text-muted-foreground">used only for split estimates</div>
+					<div class="text-xs text-muted-foreground">{system.unified_memory ? 'amdgpu Memory Model' : 'Aggregate VRAM'}</div>
+					<div class="mt-1 text-sm font-medium">
+						{system.unified_memory ? 'Shared CPU / GPU' : fmtGb(system.total_gpu_vram_gb)}
+					</div>
+					<div class="mt-1 text-xs text-muted-foreground">
+						{system.unified_memory
+							? `${fmtGb(primaryGpu?.local_vram_gb)} local + ${fmtGb(primaryGpu?.gtt_gb)} GTT`
+							: 'used only for split estimates'}
+					</div>
 				</div>
 			</section>
 		{/if}
 
 		<section class="rounded-lg border bg-card p-3">
-			<div class="grid gap-3 md:grid-cols-2 xl:grid-cols-7">
+			<div class="grid gap-3 md:grid-cols-2 xl:grid-cols-5 2xl:grid-cols-9">
 				<label class="text-sm">
 					<span class="text-xs text-muted-foreground">Use Case</span>
 					<select
@@ -412,6 +437,14 @@
 					</select>
 				</label>
 				<label class="text-sm">
+					<span class="text-xs text-muted-foreground">Topology</span>
+					<select class="mt-1 h-10 w-full rounded-md border bg-background px-2" bind:value={topology}>
+						<option value="all">Dense + MoE</option>
+						<option value="dense">Dense only</option>
+						<option value="moe">MoE only</option>
+					</select>
+				</label>
+				<label class="text-sm">
 					<span class="text-xs text-muted-foreground">Minimum Fit</span>
 					<select class="mt-1 h-10 w-full rounded-md border bg-background px-2" bind:value={minFit}>
 						<option value="perfect">Perfect</option>
@@ -419,6 +452,10 @@
 						<option value="marginal">Marginal</option>
 						<option value="too_tight">Too Tight</option>
 					</select>
+				</label>
+				<label class="text-sm">
+					<span class="text-xs text-muted-foreground">Minimum tok/s</span>
+					<input bind:value={minTps} class="mt-1 h-10 w-full rounded-md border bg-background px-2" max="200" min="0" step="1" type="number" />
 				</label>
 				<label class="text-sm">
 					<span class="text-xs text-muted-foreground">Quant</span>
@@ -458,15 +495,22 @@
 						bind:value={limit}
 					/>
 				</label>
-				<label class="flex items-end gap-2 pb-2 text-sm">
-					<input type="checkbox" class="h-4 w-4" bind:checked={includeTooTight} />
-					<span>Show too tight</span>
-				</label>
+				{#if system?.vulkan_optimal_only}
+					<div class="flex items-end pb-2 text-xs text-muted-foreground">Trusted Vulkan GGUF only</div>
+				{:else}
+					<label class="flex items-end gap-2 pb-2 text-sm">
+						<input bind:checked={includeTooTight} class="h-4 w-4" type="checkbox" />
+						<span>Show too tight</span>
+					</label>
+				{/if}
 			</div>
-			<div
-				class="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground"
-			>
-				<div class="flex flex-wrap gap-2">
+			<div class="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
+				{#if system?.vulkan_optimal_only}
+					<div class="flex items-center gap-2">
+						<span class="rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-emerald-300">Strix Halo Vulkan / full UMA offload</span>
+					</div>
+				{:else}
+					<div class="flex flex-wrap gap-2">
 					<button
 						type="button"
 						class={strategy === 'balanced'
@@ -503,7 +547,11 @@
 					>
 						Hybrid offload
 					</button>
-				</div>
+					</div>
+				{/if}
+				{#if system?.unified_memory}
+					<div>Single-stream decode at selected context; estimates are calibrated locally and remote Thunderbolt nodes remain separate.</div>
+				{/if}
 			</div>
 			<div
 				class="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground"
@@ -546,7 +594,7 @@
 								<th class="min-w-[300px] px-3 py-2">Model</th>
 								<th class="px-3 py-2">Quant</th>
 								<th class="px-3 py-2">Mem</th>
-								<th class="px-3 py-2">Tok/s</th>
+								<th class="px-3 py-2">Decode tok/s</th>
 								<th class="px-3 py-2">Ctx</th>
 								<th class="px-3 py-2">State</th>
 							</tr>
@@ -570,8 +618,8 @@
 									</td>
 									<td class="px-3 py-2 font-medium">{fmtNum(model.score)}</td>
 									<td class="px-3 py-2">
-										<div class="font-medium" title={normalizeModelName(model.name)}>
-											{compactModelName(model.name)}
+						<div class="font-medium" title={normalizeModelName(model.name)}>
+							{compactModelName(model.name)}
 										</div>
 										<div class="truncate text-xs text-muted-foreground">
 											{normalizeModelName(model.name)}
@@ -582,12 +630,18 @@
 													class="rounded-full border px-1.5 py-0.5 text-[10px] text-muted-foreground"
 													>{tag}</span
 												>
-											{/each}
-										</div>
+							{/each}
+						</div>
+						<div class="text-xs text-muted-foreground">{model.is_moe ? 'MoE' : 'Dense'} · {fmtNum(model.params_b, 1)}B{model.active_params_b ? ` / ${fmtNum(model.active_params_b, 1)}B active` : ''}</div>
 									</td>
 									<td class="px-3 py-2">{model.quant}</td>
 									<td class="px-3 py-2">{fmtGb(model.memory_required_gb)}</td>
-									<td class="px-3 py-2">{fmtNum(model.estimated_tps)}</td>
+									<td class="px-3 py-2">
+										<div class="font-medium">{fmtNum(model.estimated_tps)}</div>
+										<div class="whitespace-nowrap text-[11px] text-muted-foreground">
+											{model.throughput_measured ? 'measured' : `${fmtNum(model.estimated_tps_low)}-${fmtNum(model.estimated_tps_high)}`}
+										</div>
+									</td>
 									<td class="px-3 py-2">{model.effective_context_length.toLocaleString()}</td>
 									<td class="px-3 py-2">
 										<div class="flex min-w-32 flex-col gap-1">
@@ -651,6 +705,16 @@
 							<div class="rounded-md border p-2">
 								<div class="text-xs text-muted-foreground">Mode</div>
 								<div class="mt-1 font-medium">{selectedModel.gpu_mode}</div>
+							</div>
+							<div class="rounded-md border p-2">
+								<div class="text-xs text-muted-foreground">Decode tok/s</div>
+								<div class="mt-1 font-medium">{fmtNum(selectedModel.estimated_tps)} {selectedModel.throughput_measured ? 'measured' : 'estimated'}</div>
+							</div>
+							<div class="rounded-md border p-2">
+								<div class="text-xs text-muted-foreground">Range / Context</div>
+								<div class="mt-1 font-medium">
+									{fmtNum(selectedModel.estimated_tps_low)}-{fmtNum(selectedModel.estimated_tps_high)} @ {selectedModel.estimate_context_length?.toLocaleString() ?? 'n/a'}
+								</div>
 							</div>
 							<div class="rounded-md border p-2">
 								<div class="text-xs text-muted-foreground">Score</div>
@@ -720,6 +784,11 @@
 								</div>
 							</div>
 						</div>
+						{#if selectedModel.estimate_basis}
+							<div class="rounded-md border border-cyan-500/20 bg-cyan-500/5 p-3 text-xs text-muted-foreground">
+								{selectedModel.estimate_basis}. Tok/s is single-stream decode at the selected context; prompt processing is a separate metric.
+							</div>
+						{/if}
 
 						{#if selectedJob}
 							<div class="rounded-md border p-3">
