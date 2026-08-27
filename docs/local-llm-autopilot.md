@@ -22,6 +22,28 @@ build/bin/llama-server \
 `llama-bench` must be installed beside `llama-server` for synthetic racing. Final
 recommendations use isolated streaming `llama-server` processes.
 
+## Hardware profiles
+
+Fit Advisor detects AMD DRM devices and NVIDIA GPUs independently. A Strix Halo
+UMA system selects `strix_halo_vulkan`; an NVIDIA system selects `nvidia_cuda`.
+If both backends are present, set the intended planner explicitly:
+
+```sh
+LLAMA_FIT_ADVISOR_PROFILE=strix_halo_vulkan build/bin/llama-server ...
+LLAMA_FIT_ADVISOR_PROFILE=nvidia_cuda build/bin/llama-server ...
+```
+
+The Strix profile uses the amdgpu GTT pool once, filters for trusted Vulkan GGUF
+quantizations, and applies local single-stream decode calibration. The CUDA
+profile keeps per-GPU and aggregate VRAM separate and retains single-GPU,
+MultiGPU, MoE offload, and hybrid offload planning.
+
+Keep machine-specific model presets outside the source checkout and pass their
+absolute path with `--models-preset`. Use `LLAMA_SERVER_WORKER` for one worker per
+host, or the preset-only `worker` and `runtime` fields when individual models use
+different builds. This lets a repository update replace source files without
+replacing the active Strix or CUDA configuration.
+
 ## Runtime directories
 
 The source and installation directories stay read-only. Defaults follow XDG:

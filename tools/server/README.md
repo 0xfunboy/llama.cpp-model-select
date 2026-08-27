@@ -1706,6 +1706,39 @@ llama-server -ctx 8192 -n 1024 -np 2
 
 Note: model instances inherit both command line arguments and environment variables from the router server.
 
+The router can also launch model instances with a different `llama-server`
+binary. Set `LLAMA_SERVER_WORKER` to an absolute path when the control-plane
+binary provides a custom UI while an optimized backend build serves models:
+
+```sh
+LLAMA_SERVER_WORKER=/opt/llama-vulkan/bin/llama-server \
+  llama-server --models-preset ./models.json --models-max 1
+```
+
+The worker must implement the same router child protocol as the control-plane
+build. Keep both builds close in version and validate model load/unload after an
+upgrade.
+
+The worker can also be selected per model preset. This allows the model selector
+to expose multiple runtime variants while keeping one control-plane UI:
+
+```json
+{
+  "id": "qwen-vulkan-optimized",
+  "model": "/models/qwen.gguf",
+  "runtime": "Strix Halo Vulkan optimized",
+  "worker": "/opt/llama-vulkan/bin/llama-server"
+}
+```
+
+`worker` is a preset-only option and is never forwarded to the child process.
+`runtime` is a display label returned by the router models API. A per-preset
+worker overrides `LLAMA_SERVER_WORKER` for that preset.
+
+Fit Advisor selects `strix_halo_vulkan` or `nvidia_cuda` from the detected
+devices. On a mixed-backend host, set `LLAMA_FIT_ADVISOR_PROFILE` to one of those
+values so memory totals and split recommendations use only the intended backend.
+
 Alternatively, you can also add GGUF based preset (see next section)
 
 ### Model presets
