@@ -2307,12 +2307,14 @@ void server_ds4_routes::init_routes() {
 
     get_reports = [p = pimpl](const server_http_req &) {
         auto res = std::make_unique<server_http_res>();
-        json reports = json::array();
-        std::vector<json> eval_reports;
+        using ds4_json = nlohmann::ordered_json;
+        ds4_json reports = ds4_json::array();
+        std::vector<ds4_json> eval_reports;
         for (const std::string module : {"ds4-eval", "ds4-bench"}) {
             for (const auto & report : server_persistence::load_reports(module)) {
                 if (!report.is_object()) continue;
-                if (module == "ds4-eval") eval_reports.push_back(report);
+                const ds4_json report_json = ds4_json::parse(report.dump());
+                if (module == "ds4-eval") eval_reports.push_back(report_json);
                 reports.push_back({
                     {"id", json_value(report, "id", std::string())},
                     {"kind", json_value(report, "kind", std::string())},
@@ -2326,12 +2328,12 @@ void server_ds4_routes::init_routes() {
                 });
             }
         }
-        std::sort(reports.begin(), reports.end(), [](const json & a, const json & b) {
-            return json_value(a, "updated_at", json_value(a, "created_at", std::string())) >
-                   json_value(b, "updated_at", json_value(b, "created_at", std::string()));
+        std::sort(reports.begin(), reports.end(), [](const ds4_json & a, const ds4_json & b) {
+            return a.value("updated_at", a.value("created_at", std::string())) >
+                   b.value("updated_at", b.value("created_at", std::string()));
         });
-        const json registry = p->router.scan_model_registry(false);
-        json quality_profiles = quality_evidence::build_profiles(eval_reports, registry);
+        const ds4_json registry = ds4_json::parse(p->router.scan_model_registry(false).dump());
+        ds4_json quality_profiles = quality_evidence::build_profiles(eval_reports, registry);
         if (registry.contains("artifacts") && registry["artifacts"].is_array()) {
             for (const auto & artifact : registry["artifacts"]) {
                 const std::string artifact_id = artifact.value("artifact_id", std::string());
@@ -2340,10 +2342,10 @@ void server_ds4_routes::init_routes() {
                 profile["name"] = artifact.value("name", artifact.value("model_id", artifact_id));
                 profile["model_id"] = artifact.value("model_id", std::string());
                 profile["variant"] = artifact.value("variant", std::string());
-                profile["configured_ids"] = artifact.value("configured_ids", json::array());
+                profile["configured_ids"] = artifact.value("configured_ids", ds4_json::array());
             }
         }
-        ds4_res_ok(res, {{"data", reports}, {"quality_profiles", quality_profiles}, {"object", "list"}});
+        ds4_res_ok(res, json::parse(ds4_json({{"data", reports}, {"quality_profiles", quality_profiles}, {"object", "list"}}).dump()));
         return res;
     };
 

@@ -83,7 +83,7 @@ static std::string json_string_value(const json & value, const std::string & key
         if (value.at(key).is_number_integer()) {
             return std::to_string(value.at(key).get<int64_t>());
         }
-        if (value.at(key).is_number_unsigned()) {
+        if (value.at(key).is_number_integer()) {
             return std::to_string(value.at(key).get<uint64_t>());
         }
         if (value.at(key).is_number_float()) {
@@ -121,7 +121,7 @@ static int64_t json_i64_value(const json & value, const std::string & key, int64
         if (value.at(key).is_number_integer()) {
             return value.at(key).get<int64_t>();
         }
-        if (value.at(key).is_number_unsigned()) {
+        if (value.at(key).is_number_integer()) {
             return (int64_t) value.at(key).get<uint64_t>();
         }
         if (value.at(key).is_number_float()) {

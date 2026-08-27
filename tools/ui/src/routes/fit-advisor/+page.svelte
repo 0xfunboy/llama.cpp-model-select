@@ -7,7 +7,7 @@
 		type FitAdvisorModel,
 		type FitAdvisorModelsResponse
 	} from '$lib/services/fit-advisor.service';
-	import { modelsStore } from '$lib/stores/models.svelte';
+	import { modelsStore } from '$lib/stores';
 	import { compactModelName, normalizeModelName, uniqueModelTags } from '$lib/utils/model-display';
 
 	let response = $state<FitAdvisorModelsResponse | null>(null);

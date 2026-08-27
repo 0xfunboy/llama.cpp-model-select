@@ -37,6 +37,18 @@
 
 namespace {
 
+using fit_json = nlohmann::ordered_json;
+
+template <typename T>
+static T fit_json_value(const fit_json & body, const std::string & key, const T & default_value) {
+    if (!body.is_object() || !body.contains(key) || body.at(key).is_null()) return default_value;
+    try {
+        return body.at(key).get<T>();
+    } catch (const nlohmann::json::exception &) {
+        return default_value;
+    }
+}
+
 static constexpr const char * FIT_CATALOG_URL =
     "https://raw.githubusercontent.com/AlexsJones/llmfit/main/llmfit-core/data/hf_models.json";
 static constexpr size_t FIT_MAX_DOWNLOAD_EVENTS = 2000;
@@ -80,7 +92,7 @@ struct fit_download_job {
 struct fit_download_event {
     uint64_t seq = 0;
     std::string event;
-    json data;
+    fit_json data;
 };
 
 static std::mutex g_fit_download_mutex;
@@ -91,14 +103,14 @@ static uint64_t g_fit_download_next_seq = 0;
 static uint64_t g_fit_download_next_queue_seq = 0;
 static bool g_fit_download_dispatcher_running = false;
 
-static void fit_res_ok(std::unique_ptr<server_http_res> & res, const json & response_data) {
+static void fit_res_ok(std::unique_ptr<server_http_res> & res, const fit_json & response_data) {
     res->status = 200;
-    res->data = safe_json_to_str(response_data);
+    res->data = response_data.dump();
 }
 
-static void fit_res_err(std::unique_ptr<server_http_res> & res, const json & error_data) {
-    res->status = json_value(error_data, "code", 500);
-    res->data = safe_json_to_str({{"error", error_data}});
+static void fit_res_err(std::unique_ptr<server_http_res> & res, const fit_json & error_data) {
+    res->status = fit_json_value(error_data, "code", 500);
+    res->data = fit_json({{"error", error_data}}).dump();
 }
 
 static std::string trim_copy(const std::string & in) {
@@ -355,7 +367,7 @@ static std::optional<double> linux_meminfo_gib(const std::string & key) {
     return std::nullopt;
 }
 
-static json detect_system_json() {
+static fit_json detect_system_json() {
     double total_ram_gb = 0.0;
     double available_ram_gb = 0.0;
 #if defined(__linux__)
@@ -377,7 +389,7 @@ static json detect_system_json() {
     }
     const double fit_ram_capacity_gb = total_ram_gb;
 
-    json gpus = json::array();
+    fit_json gpus = fit_json::array();
     std::vector<double> vram_gb;
     std::string primary_gpu;
     for (const auto & line : process_lines({"nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"})) {
@@ -473,18 +485,18 @@ static double quant_quality_penalty(const std::string & quant) {
     return -5.0;
 }
 
-static bool model_bool(const json & model, const char * key) {
+static bool model_bool(const fit_json & model, const char * key) {
     return model.contains(key) && model[key].is_boolean() && model[key].get<bool>();
 }
 
-static double model_number(const json & model, const char * key, double fallback = 0.0) {
+static double model_number(const fit_json & model, const char * key, double fallback = 0.0) {
     if (model.contains(key) && model[key].is_number()) {
         return model[key].get<double>();
     }
     return fallback;
 }
 
-static bool is_moe_model(const json & model) {
+static bool is_moe_model(const fit_json & model) {
     return model_bool(model, "is_moe") ||
            model_number(model, "active_parameters") > 0.0 ||
            model_number(model, "num_experts") > 0.0 ||
@@ -508,7 +520,7 @@ static bool is_reasoning_named(const std::string & name) {
            n.find("deepseek-r1") != std::string::npos;
 }
 
-static std::optional<std::pair<double, double>> moe_memory_for_quant(const json & model, const std::string & quant, double kv_gb, double overhead_gb) {
+static std::optional<std::pair<double, double>> moe_memory_for_quant(const fit_json & model, const std::string & quant, double kv_gb, double overhead_gb) {
     if (!is_moe_model(model)) {
         return std::nullopt;
     }
@@ -530,11 +542,11 @@ static double kv_bytes_per_element(const std::string & kv_quant) {
     return 2.0;
 }
 
-static double params_b_from_json(const json & model) {
+static double params_b_from_json(const fit_json & model) {
     if (model.contains("parameters_raw") && model["parameters_raw"].is_number()) {
         return model["parameters_raw"].get<double>() / 1000000000.0;
     }
-    std::string s = json_value(model, "parameter_count", std::string("7B"));
+    std::string s = fit_json_value(model, "parameter_count", std::string("7B"));
     s = trim_copy(s);
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return (char) std::toupper(c); });
     try {
@@ -548,14 +560,14 @@ static double params_b_from_json(const json & model) {
     }
 }
 
-static double opt_u32(const json & object, const char * key, double fallback = 0.0) {
+static double opt_u32(const fit_json & object, const char * key, double fallback = 0.0) {
     if (object.contains(key) && object[key].is_number()) {
         return object[key].get<double>();
     }
     return fallback;
 }
 
-static double estimate_kv_cache_gb(const json & model, double params_b, int ctx, const std::string & kv_quant) {
+static double estimate_kv_cache_gb(const fit_json & model, double params_b, int ctx, const std::string & kv_quant) {
     const double bpe = kv_bytes_per_element(kv_quant);
     const double layers = opt_u32(model, "num_hidden_layers");
     const double head_dim = opt_u32(model, "head_dim");
@@ -571,9 +583,9 @@ static double estimate_kv_cache_gb(const json & model, double params_b, int ctx,
     return fp16 * (bpe / 2.0);
 }
 
-static std::string infer_use_case(const json & model) {
-    const std::string name = lower_copy(json_value(model, "name", std::string()));
-    const std::string uc = lower_copy(json_value(model, "use_case", std::string()));
+static std::string infer_use_case(const fit_json & model) {
+    const std::string name = lower_copy(fit_json_value(model, "name", std::string()));
+    const std::string uc = lower_copy(fit_json_value(model, "use_case", std::string()));
     if (uc.find("embedding") != std::string::npos || name.find("embed") != std::string::npos || name.find("bge") != std::string::npos) return "embedding";
     if (name.find("code") != std::string::npos || uc.find("code") != std::string::npos || name.find("coder") != std::string::npos) return "coding";
     if (uc.find("vision") != std::string::npos || uc.find("multimodal") != std::string::npos || name.find("-vl") != std::string::npos) return "multimodal";
@@ -620,7 +632,7 @@ static double context_score(int context_length, int target_context, const std::s
     return 5.0;
 }
 
-static double quality_score(const json & model, double params_b, const std::string & quant, const std::string & use_case) {
+static double quality_score(const fit_json & model, double params_b, const std::string & quant, const std::string & use_case) {
     double quality_params = params_b;
     if (model.contains("active_parameters") && model["active_parameters"].is_number()) {
         quality_params = model["active_parameters"].get<double>() / 1000000000.0;
@@ -633,7 +645,7 @@ static double quality_score(const json & model, double params_b, const std::stri
     else if (quality_params >= 3.0) base = 60.0;
     else if (quality_params >= 1.0) base = 45.0;
 
-    const std::string name = lower_copy(json_value(model, "name", std::string()));
+    const std::string name = lower_copy(fit_json_value(model, "name", std::string()));
     double family = 0.0;
     if (name.find("deepseek") != std::string::npos) family = 3.0;
     else if (name.find("qwen") != std::string::npos || name.find("llama") != std::string::npos) family = 2.0;
@@ -830,7 +842,7 @@ struct fit_hf_remote_file {
     uint64_t size = 0;
 };
 
-static uint64_t json_file_size(const json & file) {
+static uint64_t json_file_size(const fit_json & file) {
     if (file.contains("size") && file["size"].is_number_unsigned()) {
         return file["size"].get<uint64_t>();
     }
@@ -838,7 +850,7 @@ static uint64_t json_file_size(const json & file) {
         return (uint64_t) std::max<int64_t>(0, file["size"].get<int64_t>());
     }
     if (file.contains("lfs") && file["lfs"].is_object()) {
-        const json & lfs = file["lfs"];
+        const fit_json & lfs = file["lfs"];
         if (lfs.contains("size") && lfs["size"].is_number()) {
             return (uint64_t) std::max<double>(0.0, lfs["size"].get<double>());
         }
@@ -861,11 +873,11 @@ static std::vector<fit_hf_remote_file> list_hf_gguf_files(const std::string & re
     }
 
     const std::string raw(body.begin(), body.end());
-    const json meta = json::parse(raw);
+    const fit_json meta = fit_json::parse(raw);
     std::vector<fit_hf_remote_file> files;
     if (meta.contains("siblings") && meta["siblings"].is_array()) {
         for (const auto & item : meta["siblings"]) {
-            const std::string filename = json_value(item, "rfilename", std::string());
+            const std::string filename = fit_json_value(item, "rfilename", std::string());
             if (!filename.empty() && ends_with_ci(filename, ".gguf")) {
                 files.push_back({filename, json_file_size(item)});
             }
@@ -1021,8 +1033,8 @@ static void recompute_download_progress_locked(fit_download_job & job) {
     job.percent = job.total_bytes > 0 ? std::min(100.0, (double) job.downloaded_bytes * 100.0 / (double) job.total_bytes) : 0.0;
 }
 
-static json download_job_snapshot_locked(const std::shared_ptr<fit_download_job> & job) {
-    json files = json::array();
+static fit_json download_job_snapshot_locked(const std::shared_ptr<fit_download_job> & job) {
+    fit_json files = fit_json::array();
     for (size_t i = 0; i < job->files.size(); ++i) {
         const auto & file = job->files[i];
         const uint64_t downloaded = i < job->file_downloaded.size() ? job->file_downloaded[i] : 0;
@@ -1042,31 +1054,31 @@ static json download_job_snapshot_locked(const std::shared_ptr<fit_download_job>
         {"quant", job->quant},
         {"hf_ref", job->hf_ref},
         {"status", job->status},
-        {"error", job->error.empty() ? nullptr : json(job->error)},
+        {"error", job->error.empty() ? nullptr : fit_json(job->error)},
         {"target_dir", job->target_dir.string()},
-        {"requested_filename", job->requested_filename.empty() ? nullptr : json(job->requested_filename)},
-        {"local_path", job->local_path.empty() ? nullptr : json(job->local_path)},
+        {"requested_filename", job->requested_filename.empty() ? nullptr : fit_json(job->requested_filename)},
+        {"local_path", job->local_path.empty() ? nullptr : fit_json(job->local_path)},
         {"downloaded_bytes", job->downloaded_bytes},
         {"total_bytes", job->total_bytes},
         {"speed_bps", job->speed_bps},
         {"percent", job->percent},
         {"exit_code", job->exit_code},
         {"queue_seq", job->queue_seq},
-        {"started_at", job->started_at.empty() ? nullptr : json(job->started_at)},
-        {"updated_at", job->updated_at.empty() ? nullptr : json(job->updated_at)},
-        {"finished_at", job->finished_at.empty() ? nullptr : json(job->finished_at)},
+        {"started_at", job->started_at.empty() ? nullptr : fit_json(job->started_at)},
+        {"updated_at", job->updated_at.empty() ? nullptr : fit_json(job->updated_at)},
+        {"finished_at", job->finished_at.empty() ? nullptr : fit_json(job->finished_at)},
         {"active_file_index", job->active_file_index},
         {"files", files},
     };
 }
 
-static json download_job_snapshot(const std::shared_ptr<fit_download_job> & job) {
+static fit_json download_job_snapshot(const std::shared_ptr<fit_download_job> & job) {
     std::lock_guard<std::mutex> lock(job->mutex);
     return download_job_snapshot_locked(job);
 }
 
 static void publish_download_snapshot(const std::shared_ptr<fit_download_job> & job) {
-    json data = download_job_snapshot(job);
+    fit_json data = download_job_snapshot(job);
     {
         std::lock_guard<std::mutex> lock(g_fit_download_mutex);
         fit_download_event event;
@@ -1080,7 +1092,7 @@ static void publish_download_snapshot(const std::shared_ptr<fit_download_job> & 
         }
     }
     g_fit_download_cv.notify_all();
-    server_persistence::record_download(data);
+    server_persistence::record_download(json::parse(data.dump()));
 }
 
 static void update_download_job(const std::shared_ptr<fit_download_job> & job, const std::function<void(fit_download_job &)> & fn) {
@@ -1123,12 +1135,12 @@ static std::shared_ptr<fit_download_job> find_download_job(const std::string & m
     return fallback;
 }
 
-static json download_snapshot_for_model(const std::string & model_id, const std::string & hf_ref) {
+static fit_json download_snapshot_for_model(const std::string & model_id, const std::string & hf_ref) {
     auto job = find_download_job(model_id, hf_ref);
-    return job ? download_job_snapshot(job) : json(nullptr);
+    return job ? download_job_snapshot(job) : fit_json(nullptr);
 }
 
-static json all_download_snapshots() {
+static fit_json all_download_snapshots() {
     std::vector<std::shared_ptr<fit_download_job>> jobs;
     {
         std::lock_guard<std::mutex> lock(g_fit_download_mutex);
@@ -1142,7 +1154,7 @@ static json all_download_snapshots() {
         return a->updated_at > b->updated_at;
     });
 
-    json out = json::array();
+    fit_json out = fit_json::array();
     for (const auto & job : jobs) {
         out.push_back(download_job_snapshot(job));
     }
@@ -1332,37 +1344,37 @@ static void ensure_download_dispatcher_running() {
     }
 }
 
-static std::string tensor_split_from_system(const json & system) {
+static std::string tensor_split_from_system(const fit_json & system) {
     if (!system.contains("gpus") || !system["gpus"].is_array() || system["gpus"].empty()) {
         return "";
     }
     std::string out;
     for (const auto & gpu : system["gpus"]) {
         if (!out.empty()) out += ",";
-        int gb = std::max(1, (int) std::llround(json_value(gpu, "vram_gb", 1.0)));
+        int gb = std::max(1, (int) std::llround(fit_json_value(gpu, "vram_gb", 1.0)));
         out += std::to_string(gb);
     }
     return out;
 }
 
-static json router_installed_index(server_models_routes & router) {
-    json installed = json::array();
-    const json registry = router.scan_model_registry(false);
+static fit_json router_installed_index(server_models_routes & router) {
+    fit_json installed = fit_json::array();
+    const fit_json registry = router.scan_model_registry(false);
     if (!registry.contains("artifacts") || !registry["artifacts"].is_array()) return installed;
     for (const auto & artifact : registry["artifacts"]) {
-        std::string id = json_value(artifact, "model_id", std::string());
+        std::string id = fit_json_value(artifact, "model_id", std::string());
         if (artifact.contains("configured_ids") && artifact["configured_ids"].is_array() && !artifact["configured_ids"].empty()) {
             id = artifact["configured_ids"].front().get<std::string>();
         }
         installed.push_back({
             {"id", id},
-            {"artifact_id", json_value(artifact, "artifact_id", std::string())},
-            {"model_id", json_value(artifact, "model_id", std::string())},
-            {"preset_id", json_value(artifact, "preset_id", std::string())},
-            {"path", artifact.value("primary_path", json(nullptr))},
-            {"hf_repo", artifact.value("hf_repo", json(nullptr))},
+            {"artifact_id", fit_json_value(artifact, "artifact_id", std::string())},
+            {"model_id", fit_json_value(artifact, "model_id", std::string())},
+            {"preset_id", fit_json_value(artifact, "preset_id", std::string())},
+            {"path", artifact.value("primary_path", fit_json(nullptr))},
+            {"hf_repo", artifact.value("hf_repo", fit_json(nullptr))},
             {"source", "registry"},
-            {"status", json_value(artifact, "health", std::string())},
+            {"status", fit_json_value(artifact, "health", std::string())},
             {"configured", artifact.value("configured", false)},
             {"loadable", artifact.value("loadable", false)},
         });
@@ -1395,14 +1407,14 @@ static bool local_model_file_partial(const std::string & path) {
     return local_file_exists(path) && local_file_has_aria2_sidecar(path);
 }
 
-static json typed_preset_fields(const json & requested) {
+static fit_json typed_preset_fields(const fit_json & requested) {
     static const std::set<std::string> allowed = {
         "id", "model", "hf_repo", "alias", "tags", "ctx_size", "n_gpu_layers", "n_cpu_moe",
         "parallel", "batch_size", "ubatch_size", "main_gpu", "cache_type_k", "cache_type_v",
         "flash_attn", "split_mode", "tensor_split", "threads", "reasoning", "reasoning_budget",
         "load_on_startup",
     };
-    json out = json::object();
+    fit_json out = fit_json::object();
     if (!requested.is_object()) return out;
     for (auto it = requested.begin(); it != requested.end(); ++it) {
         if (!allowed.count(it.key())) continue;
@@ -1424,7 +1436,7 @@ static std::string preset_model_path(const std::string & path) {
     return path;
 }
 
-static json first_gguf_source(const json & model) {
+static fit_json first_gguf_source(const fit_json & model) {
     if (model.contains("gguf_sources") && model["gguf_sources"].is_array() && !model["gguf_sources"].empty()) {
         for (const auto & source : model["gguf_sources"]) {
             if (source.is_object() && source.contains("repo") && source["repo"].is_string()) {
@@ -1432,8 +1444,8 @@ static json first_gguf_source(const json & model) {
             }
         }
     }
-    const std::string format = lower_copy(json_value(model, "format", std::string("gguf")));
-    const std::string name = json_value(model, "name", std::string());
+    const std::string format = lower_copy(fit_json_value(model, "format", std::string("gguf")));
+    const std::string name = fit_json_value(model, "name", std::string());
     // llmfit occasionally classifies a Transformers/ModelOpt repository as
     // GGUF based on its quantization metadata. Keep explicit, reviewed bridges
     // for those cases instead of sending users to a repository with no GGUF.
@@ -1448,19 +1460,19 @@ static json first_gguf_source(const json & model) {
     // itself declares GGUF. This avoids presenting safetensors/MLX/AWQ repos as
     // downloadable llama.cpp artifacts merely because the catalog format lies.
     if (format == "gguf" && name.find('/') != std::string::npos && contains_ci(name, "gguf")) {
-        return {{"repo", name}, {"provider", json_value(model, "provider", std::string())}};
+        return {{"repo", name}, {"provider", fit_json_value(model, "provider", std::string())}};
     }
-    return json::object();
+    return fit_json::object();
 }
 
-static json find_installed(const json & installed, const json & model, const std::string & repo, const std::string & quant) {
-    const std::string id = json_value(model, "name", std::string());
+static fit_json find_installed(const fit_json & installed, const fit_json & model, const std::string & repo, const std::string & quant) {
+    const std::string id = fit_json_value(model, "name", std::string());
     const std::string id_slug = slugify(id);
     const std::string repo_quant = repo.empty() ? "" : repo + ":" + quant;
     for (const auto & item : installed) {
-        const std::string installed_id = json_value(item, "id", std::string());
-        const std::string path = json_value(item, "path", std::string());
-        const std::string hf_repo = json_value(item, "hf_repo", std::string());
+        const std::string installed_id = fit_json_value(item, "id", std::string());
+        const std::string path = fit_json_value(item, "path", std::string());
+        const std::string hf_repo = fit_json_value(item, "hf_repo", std::string());
         if (installed_id == id || installed_id == repo || installed_id == repo_quant || hf_repo == repo_quant || hf_repo == repo) {
             return item;
         }
@@ -1471,15 +1483,15 @@ static json find_installed(const json & installed, const json & model, const std
             }
         }
     }
-    return json::object();
+    return fit_json::object();
 }
 
 static bool preset_should_disable_reasoning(const std::string & model_id) {
     return is_creative_uncensored_tune(model_id);
 }
 
-static json make_recommendation_args(const json & system, const std::string & run_mode, const std::string & model_ref, int ctx, int threads, const std::string & model_id) {
-    json args = json::array();
+static fit_json make_recommendation_args(const fit_json & system, const std::string & run_mode, const std::string & model_ref, int ctx, int threads, const std::string & model_id) {
+    fit_json args = fit_json::array();
     if (local_file_exists(model_ref)) {
         args.push_back("--model");
         args.push_back(model_ref);
@@ -1555,8 +1567,8 @@ static json make_recommendation_args(const json & system, const std::string & ru
     return args;
 }
 
-static json preset_from_plan(const json & system, const std::string & run_mode, const std::string & model_ref, int ctx, int threads, const std::string & model_id) {
-    json preset = {
+static fit_json preset_from_plan(const fit_json & system, const std::string & run_mode, const std::string & model_ref, int ctx, int threads, const std::string & model_id) {
+    fit_json preset = {
         {"ctx_size", ctx},
         {"cache_type_k", "q8_0"},
         {"cache_type_v", "q8_0"},
@@ -1602,17 +1614,17 @@ static json preset_from_plan(const json & system, const std::string & run_mode, 
     return preset;
 }
 
-static json analyze_catalog_model(
-        const json & model,
-        const json & system,
-        const json & installed,
+static fit_json analyze_catalog_model(
+        const fit_json & model,
+        const fit_json & system,
+        const fit_json & installed,
         const server_models_routes & router,
         int target_ctx,
         const std::string & strategy) {
-    const std::string id = json_value(model, "name", std::string());
-    const std::string quant = json_value(model, "quantization", std::string("Q4_K_M"));
+    const std::string id = fit_json_value(model, "name", std::string());
+    const std::string quant = fit_json_value(model, "quantization", std::string("Q4_K_M"));
     const double params_b = params_b_from_json(model);
-    const int native_ctx = std::max(512, json_value(model, "context_length", 4096));
+    const int native_ctx = std::max(512, fit_json_value(model, "context_length", 4096));
     const int ctx = std::max(512, std::min(target_ctx, native_ctx));
     const double weights_gb = params_b * quant_bpp(quant);
     const double kv_gb = estimate_kv_cache_gb(model, params_b, ctx, "q8_0");
@@ -1620,11 +1632,11 @@ static json analyze_catalog_model(
     const double required_gb = weights_gb + kv_gb + overhead_gb;
     const auto moe_memory = moe_memory_for_quant(model, quant, kv_gb, overhead_gb);
 
-    const double single_vram = json_value(system, "gpu_vram_gb", 0.0);
-    const double total_vram = json_value(system, "total_gpu_vram_gb", 0.0);
-    const double ram_capacity = json_value(system, "fit_ram_capacity_gb", json_value(system, "total_ram_gb", 0.0));
-    const double ram_available_now = json_value(system, "available_ram_gb", ram_capacity);
-    const int gpu_count = json_value(system, "gpu_count", 0);
+    const double single_vram = fit_json_value(system, "gpu_vram_gb", 0.0);
+    const double total_vram = fit_json_value(system, "total_gpu_vram_gb", 0.0);
+    const double ram_capacity = fit_json_value(system, "fit_ram_capacity_gb", fit_json_value(system, "total_ram_gb", 0.0));
+    const double ram_available_now = fit_json_value(system, "available_ram_gb", ram_capacity);
+    const int gpu_count = fit_json_value(system, "gpu_count", 0);
 
     std::string fit_level = "too_tight";
     std::string run_mode = "cpu_only";
@@ -1696,7 +1708,7 @@ static json analyze_catalog_model(
     }
 
     const std::string use_case = infer_use_case(model);
-    const double bandwidth = gpu_bandwidth_gbps(json_value(system, "gpu_name", std::string()));
+    const double bandwidth = gpu_bandwidth_gbps(fit_json_value(system, "gpu_name", std::string()));
     double tps = 0.1;
     if (bandwidth > 0.0 && run_mode != "cpu_only") {
         double mode_factor = run_mode == "layer_split" ? 0.90 : (run_mode == "moe_offload" ? 0.80 : (run_mode == "cpu_offload" ? 0.50 : 1.0));
@@ -1733,19 +1745,19 @@ static json analyze_catalog_model(
     }
     const double score = std::round(std::clamp(q*wq + speed*ws + fit*wf + ctx_score*wc + strategy_bonus + capacity_bonus, 0.0, 100.0) * 10.0) / 10.0;
 
-    const json source = first_gguf_source(model);
-    const std::string repo = json_value(source, "repo", std::string());
+    const fit_json source = first_gguf_source(model);
+    const std::string repo = fit_json_value(source, "repo", std::string());
     const std::string download_ref = repo.empty() ? "" : repo + ":" + quant;
-    const json installed_match = find_installed(installed, model, repo, quant);
+    const fit_json installed_match = find_installed(installed, model, repo, quant);
     const bool configured_entry = installed_match.is_object() && !installed_match.empty();
     const std::filesystem::path target_dir = default_download_dir(router, repo, id);
-    const json download_job = download_snapshot_for_model(id, download_ref);
-    const std::string job_status = download_job.is_object() ? json_value(download_job, "status", std::string()) : std::string();
+    const fit_json download_job = download_snapshot_for_model(id, download_ref);
+    const std::string job_status = download_job.is_object() ? fit_json_value(download_job, "status", std::string()) : std::string();
     const bool active_download = download_status_active(job_status);
 
-    std::string local_path = json_value(installed_match, "path", std::string());
+    std::string local_path = fit_json_value(installed_match, "path", std::string());
     if (local_path.empty() && download_job.is_object() && job_status == "downloaded") {
-        local_path = json_value(download_job, "local_path", std::string());
+        local_path = fit_json_value(download_job, "local_path", std::string());
     }
     if (local_path.empty() && !active_download) {
         auto found = find_local_gguf(target_dir, quant);
@@ -1771,8 +1783,8 @@ static json analyze_catalog_model(
     }
 
     const std::string model_ref = !local_path.empty() ? local_path : download_ref;
-    const int threads = json_value(system, "cpu_cores", 8);
-    json preset = preset_from_plan(system, run_mode, model_ref, ctx, threads, id);
+    const int threads = fit_json_value(system, "cpu_cores", 8);
+    fit_json preset = preset_from_plan(system, run_mode, model_ref, ctx, threads, id);
     if (is_creative_uncensored_tune(id)) {
         notes.push_back("Creative/uncensored finetune: not prioritized for DS4-style correctness; reasoning is disabled in the generated preset.");
     }
@@ -1780,18 +1792,18 @@ static json analyze_catalog_model(
         notes.push_back("No verified GGUF source is published for this catalog entry; download is disabled rather than guessing a repository.");
     }
 
-    json tags = json::array();
+    fit_json tags = fit_json::array();
     auto add_tag = [&tags](const std::string & value) {
         if (value.empty()) return;
         if (std::find(tags.begin(), tags.end(), value) == tags.end()) tags.push_back(value);
     };
-    add_tag(json_value(model, "parameter_count", std::string()));
+    add_tag(fit_json_value(model, "parameter_count", std::string()));
     add_tag(quant);
     add_tag(use_case);
     add_tag(run_mode);
     add_tag(fit_level + " fit");
     if (native_ctx > 0) add_tag(std::to_string((int) std::ceil(native_ctx / 1024.0)) + "k ctx");
-    if (json_value(model, "is_moe", false)) add_tag("MoE");
+    if (fit_json_value(model, "is_moe", false)) add_tag("MoE");
     if (model.contains("capabilities") && model["capabilities"].is_array()) {
         for (const auto & capability : model["capabilities"]) if (capability.is_string()) add_tag(capability.get<std::string>());
     }
@@ -1799,13 +1811,13 @@ static json analyze_catalog_model(
     return {
         {"id", id},
         {"name", std::filesystem::path(id).filename().string()},
-        {"provider", json_value(model, "provider", std::string())},
+        {"provider", fit_json_value(model, "provider", std::string())},
         {"tags", tags},
         {"params_b", params_b},
-        {"parameter_count", json_value(model, "parameter_count", std::string())},
-        {"is_moe", json_value(model, "is_moe", false)},
+        {"parameter_count", fit_json_value(model, "parameter_count", std::string())},
+        {"is_moe", fit_json_value(model, "is_moe", false)},
         {"quant", quant},
-        {"format", json_value(model, "format", std::string("gguf"))},
+        {"format", fit_json_value(model, "format", std::string("gguf"))},
         {"context_length", native_ctx},
         {"requested_context_length", target_ctx},
         {"effective_context_length", ctx},
@@ -1832,16 +1844,16 @@ static json analyze_catalog_model(
         {"downloaded", downloaded},
         {"partial", partial},
         {"download_status", download_status},
-        {"installed_model_id", json_value(installed_match, "id", std::string())},
-        {"local_path", local_path.empty() ? nullptr : json(local_path)},
+        {"installed_model_id", fit_json_value(installed_match, "id", std::string())},
+        {"local_path", local_path.empty() ? nullptr : fit_json(local_path)},
         {"target_dir", target_dir.string()},
         {"download_progress", download_job},
         {"notes", notes},
-        {"download", repo.empty() ? json(nullptr) : json({
+        {"download", repo.empty() ? fit_json(nullptr) : fit_json({
             {"repo", repo},
             {"quant", quant},
             {"hf_ref", download_ref},
-            {"provider", json_value(source, "provider", std::string())},
+            {"provider", fit_json_value(source, "provider", std::string())},
             {"url", std::string("https://huggingface.co/") + repo},
             {"target_dir", target_dir.string()},
         })},
@@ -1850,10 +1862,10 @@ static json analyze_catalog_model(
     };
 }
 
-static json sorted_filtered_models(
-        const json & catalog,
-        const json & system,
-        const json & installed,
+static fit_json sorted_filtered_models(
+        const fit_json & catalog,
+        const fit_json & system,
+        const fit_json & installed,
         const server_models_routes & router,
         const server_http_req & req) {
     const bool include_too_tight = req.get_param("include_too_tight", "") == "true";
@@ -1868,26 +1880,26 @@ static json sorted_filtered_models(
     if (limit <= 0) limit = 300;
     limit = std::min(limit, 2000);
 
-    json out = json::array();
+    fit_json out = fit_json::array();
     if (!catalog.is_array()) {
         return out;
     }
     for (const auto & model : catalog) {
         if (!model.is_object()) continue;
-        const std::string format = lower_copy(json_value(model, "format", std::string("gguf")));
+        const std::string format = lower_copy(fit_json_value(model, "format", std::string("gguf")));
         if (format != "gguf") continue;
-        const json row = analyze_catalog_model(model, system, installed, router, target_ctx, strategy);
-        const std::string row_use_case = json_value(row, "use_case", std::string());
-        const std::string row_fit = json_value(row, "fit_level", std::string());
-        const std::string row_quant = json_value(row, "quant", std::string());
-        const std::string row_id = json_value(row, "id", std::string());
+        const fit_json row = analyze_catalog_model(model, system, installed, router, target_ctx, strategy);
+        const std::string row_use_case = fit_json_value(row, "use_case", std::string());
+        const std::string row_fit = fit_json_value(row, "fit_level", std::string());
+        const std::string row_quant = fit_json_value(row, "quant", std::string());
+        const std::string row_id = fit_json_value(row, "id", std::string());
         if (use_case_filter != "all" && use_case_filter != row_use_case) continue;
         if (fit_rank(row_fit) < min_rank) continue;
-        const std::string row_mode = json_value(row, "gpu_mode", std::string());
+        const std::string row_mode = fit_json_value(row, "gpu_mode", std::string());
         if (strategy == "multi_gpu") {
             if (row_mode != "layer_split") continue;
-            const double single_vram = json_value(system, "gpu_vram_gb", 0.0);
-            const double row_required = json_value(row, "full_memory_required_gb", json_value(row, "memory_required_gb", 0.0));
+            const double single_vram = fit_json_value(system, "gpu_vram_gb", 0.0);
+            const double row_required = fit_json_value(row, "full_memory_required_gb", fit_json_value(row, "memory_required_gb", 0.0));
             if (single_vram > 0.0 && row_required <= single_vram * 0.85) continue;
         }
         if (strategy == "moe_offload" && row_mode != "moe_offload") continue;
@@ -1896,11 +1908,11 @@ static json sorted_filtered_models(
         if (!search.empty() && !contains_ci(row_id, search)) continue;
         out.push_back(row);
     }
-    std::sort(out.begin(), out.end(), [](const json & a, const json & b) {
-        const double score_a = json_value(a, "score", 0.0);
-        const double score_b = json_value(b, "score", 0.0);
+    std::sort(out.begin(), out.end(), [](const fit_json & a, const fit_json & b) {
+        const double score_a = fit_json_value(a, "score", 0.0);
+        const double score_b = fit_json_value(b, "score", 0.0);
         if (score_a != score_b) return score_a > score_b;
-        return json_value(a, "estimated_tps", 0.0) > json_value(b, "estimated_tps", 0.0);
+        return fit_json_value(a, "estimated_tps", 0.0) > fit_json_value(b, "estimated_tps", 0.0);
     });
     if ((int) out.size() > limit) {
         out.erase(out.begin() + limit, out.end());
@@ -1916,19 +1928,19 @@ struct server_fit_advisor_routes::impl {
 
     explicit impl(server_models_routes & router) : router(router) {}
 
-    json refresh_catalog(bool allow_cache) {
+    fit_json refresh_catalog(bool allow_cache) {
         std::lock_guard<std::mutex> lock(refresh_mutex);
         common_remote_params params;
         params.timeout = 20;
         const auto [code, body] = common_remote_get_content(FIT_CATALOG_URL, params);
         if (code >= 200 && code < 300 && !body.empty()) {
             std::string raw(body.begin(), body.end());
-            json parsed = json::parse(raw);
+            fit_json parsed = fit_json::parse(raw);
             if (!parsed.is_array()) {
                 throw std::runtime_error("remote llmfit catalog is not a JSON array");
             }
             write_text_file(catalog_cache_path(), raw);
-            json status = {
+            fit_json status = {
                 {"source", "llmfit"},
                 {"url", FIT_CATALOG_URL},
                 {"cache_path", catalog_cache_path().string()},
@@ -1940,9 +1952,9 @@ struct server_fit_advisor_routes::impl {
             return status;
         }
         if (allow_cache && std::filesystem::exists(catalog_cache_path())) {
-            json status = std::filesystem::exists(catalog_status_path())
-                ? json::parse(read_text_file(catalog_status_path()))
-                : json::object();
+            fit_json status = std::filesystem::exists(catalog_status_path())
+                ? fit_json::parse(read_text_file(catalog_status_path()))
+                : fit_json::object();
             status["source"] = "llmfit";
             status["url"] = FIT_CATALOG_URL;
             status["cache_path"] = catalog_cache_path().string();
@@ -1953,7 +1965,7 @@ struct server_fit_advisor_routes::impl {
         throw std::runtime_error(string_format("catalog refresh failed with HTTP status %ld and no cache is available", code));
     }
 
-    json load_catalog(bool refresh) {
+    fit_json load_catalog(bool refresh) {
         if (refresh || !std::filesystem::exists(catalog_cache_path())) {
             try {
                 refresh_catalog(true);
@@ -1963,13 +1975,13 @@ struct server_fit_advisor_routes::impl {
                 }
             }
         }
-        return json::parse(read_text_file(catalog_cache_path()));
+        return fit_json::parse(read_text_file(catalog_cache_path()));
     }
 
-    json catalog_status_json(bool from_cache) {
-        json status = std::filesystem::exists(catalog_status_path())
-            ? json::parse(read_text_file(catalog_status_path()))
-            : json::object();
+    fit_json catalog_status_json(bool from_cache) {
+        fit_json status = std::filesystem::exists(catalog_status_path())
+            ? fit_json::parse(read_text_file(catalog_status_path()))
+            : fit_json::object();
         status["source"] = "llmfit";
         status["url"] = FIT_CATALOG_URL;
         status["cache_path"] = catalog_cache_path().string();
@@ -1999,17 +2011,17 @@ struct server_fit_advisor_routes::impl {
                 from_cache = true;
             }
         }
-        json catalog;
+        fit_json catalog;
         try {
             catalog = load_catalog(false);
         } catch (const std::exception & e) {
             fit_res_err(res, format_error_response(e.what(), ERROR_TYPE_SERVER));
             return res;
         }
-        const json system = detect_system_json();
-        const json installed = router_installed_index(router);
-        const json models = sorted_filtered_models(catalog, system, installed, router, req);
-        const json response = {
+        const fit_json system = detect_system_json();
+        const fit_json installed = router_installed_index(router);
+        const fit_json models = sorted_filtered_models(catalog, system, installed, router, req);
+        const fit_json response = {
             {"object", "list"},
             {"system", system},
             {"catalog", catalog_status_json(from_cache)},
@@ -2018,7 +2030,7 @@ struct server_fit_advisor_routes::impl {
             {"installed", installed},
             {"models", models},
         };
-        server_persistence::record_fit_recommendations(response);
+        server_persistence::record_fit_recommendations(json::parse(response.dump()));
         fit_res_ok(res, response);
         return res;
     }
@@ -2037,11 +2049,11 @@ struct server_fit_advisor_routes::impl {
     server_http_res_ptr handle_download(const server_http_req & req) {
         auto res = std::make_unique<server_http_res>();
         if (!require_admin_api_key(req, router.params, res)) return res;
-        json body = req.body.empty() ? json::object() : json::parse(req.body);
-        const std::string model_id = json_value(body, "model_id", json_value(body, "id", std::string()));
-        std::string hf_ref = json_value(body, "hf_ref", std::string());
-        std::string repo = json_value(body, "repo", std::string());
-        std::string quant = json_value(body, "quant", std::string());
+        fit_json body = req.body.empty() ? fit_json::object() : fit_json::parse(req.body);
+        const std::string model_id = fit_json_value(body, "model_id", fit_json_value(body, "id", std::string()));
+        std::string hf_ref = fit_json_value(body, "hf_ref", std::string());
+        std::string repo = fit_json_value(body, "repo", std::string());
+        std::string quant = fit_json_value(body, "quant", std::string());
         if (hf_ref.empty()) {
             if (!repo.empty()) {
                 hf_ref = quant.empty() ? repo : repo + ":" + quant;
@@ -2067,11 +2079,11 @@ struct server_fit_advisor_routes::impl {
             return res;
         }
 
-        std::filesystem::path target_dir = json_value(body, "target_dir", std::string());
+        std::filesystem::path target_dir = fit_json_value(body, "target_dir", std::string());
         if (target_dir.empty()) {
             target_dir = default_download_dir(router, repo, model_id.empty() ? hf_ref : model_id);
         }
-        const std::string requested_filename = json_value(body, "filename", std::string());
+        const std::string requested_filename = fit_json_value(body, "filename", std::string());
         if (!path_is_within(models_root_dir(router), target_dir) || !safe_download_filename(requested_filename)) {
             fit_res_err(res, format_error_response("download target must stay inside the configured model root and use a GGUF basename", ERROR_TYPE_INVALID_REQUEST));
             return res;
@@ -2092,8 +2104,8 @@ struct server_fit_advisor_routes::impl {
             }
 
             if (auto existing = find_download_job(model_id, hf_ref)) {
-                const json snapshot = download_job_snapshot(existing);
-                const std::string status = json_value(snapshot, "status", std::string());
+                const fit_json snapshot = download_job_snapshot(existing);
+                const std::string status = fit_json_value(snapshot, "status", std::string());
                 if (download_status_active(status) || status == "downloaded") {
                     fit_res_ok(res, {
                         {"success", true},
@@ -2184,7 +2196,7 @@ struct server_fit_advisor_routes::impl {
                 }
                 since = event.seq;
                 output = "event: " + event.event + "\n";
-                output += "data: " + safe_json_to_str(event.data) + "\n\n";
+                output += "data: " + event.data.dump() + "\n\n";
                 return true;
             }
 
@@ -2194,12 +2206,12 @@ struct server_fit_advisor_routes::impl {
         return res;
     }
 
-    std::optional<json::iterator> find_model_entry(json & models, const std::string & id) {
+    std::optional<fit_json::iterator> find_model_entry(fit_json & models, const std::string & id) {
         if (!models.is_array()) {
             return std::nullopt;
         }
         for (auto it = models.begin(); it != models.end(); ++it) {
-            if (it->is_object() && json_value(*it, "id", json_value(*it, "name", std::string())) == id) {
+            if (it->is_object() && fit_json_value(*it, "id", fit_json_value(*it, "name", std::string())) == id) {
                 return it;
             }
         }
@@ -2214,23 +2226,23 @@ struct server_fit_advisor_routes::impl {
             fit_res_err(res, format_error_response("inference resources are busy", ERROR_TYPE_UNAVAILABLE));
             return res;
         }
-        json body = req.body.empty() ? json::object() : json::parse(req.body);
+        fit_json body = req.body.empty() ? fit_json::object() : fit_json::parse(req.body);
 
-        const std::string model_id = json_value(body, "model_id", json_value(body, "id", std::string()));
-        std::string local_path = json_value(body, "local_path", std::string());
-        std::string hf_ref = json_value(body, "hf_ref", std::string());
-        const bool load_now = json_value(body, "load_now", false);
+        const std::string model_id = fit_json_value(body, "model_id", fit_json_value(body, "id", std::string()));
+        std::string local_path = fit_json_value(body, "local_path", std::string());
+        std::string hf_ref = fit_json_value(body, "hf_ref", std::string());
+        const bool load_now = fit_json_value(body, "load_now", false);
 
         if (hf_ref.empty()) {
-            const std::string repo = json_value(body, "repo", std::string());
-            const std::string quant = json_value(body, "quant", std::string());
+            const std::string repo = fit_json_value(body, "repo", std::string());
+            const std::string quant = fit_json_value(body, "quant", std::string());
             if (!repo.empty()) {
                 hf_ref = quant.empty() ? repo : repo + ":" + quant;
             }
         }
         if (local_path.empty()) {
-            std::string repo = json_value(body, "repo", std::string());
-            std::string quant = json_value(body, "quant", std::string());
+            std::string repo = fit_json_value(body, "repo", std::string());
+            std::string quant = fit_json_value(body, "quant", std::string());
             if (repo.empty() && !hf_ref.empty()) {
                 auto split = common_download_split_repo_tag(hf_ref);
                 repo = split.first;
@@ -2239,7 +2251,7 @@ struct server_fit_advisor_routes::impl {
                 }
             }
 
-            const std::filesystem::path target_dir = json_value(
+            const std::filesystem::path target_dir = fit_json_value(
                 body,
                 "target_dir",
                 repo.empty() ? std::string() : default_download_dir(router, repo, model_id.empty() ? hf_ref : model_id).string());
@@ -2251,9 +2263,9 @@ struct server_fit_advisor_routes::impl {
             }
 
             if (local_path.empty()) {
-                const json snapshot = download_snapshot_for_model(model_id, hf_ref);
-                if (snapshot.is_object() && json_value(snapshot, "status", std::string()) == "downloaded") {
-                    local_path = json_value(snapshot, "local_path", std::string());
+                const fit_json snapshot = download_snapshot_for_model(model_id, hf_ref);
+                if (snapshot.is_object() && fit_json_value(snapshot, "status", std::string()) == "downloaded") {
+                    local_path = fit_json_value(snapshot, "local_path", std::string());
                 }
             }
         }
@@ -2270,14 +2282,14 @@ struct server_fit_advisor_routes::impl {
             return res;
         }
         if (!local_path.empty()) {
-            const json registry = router.scan_model_registry(true);
+            const fit_json registry = router.scan_model_registry(true);
             if (model_registry::artifact_id_for_path(registry, local_path).empty()) {
                 fit_res_err(res, format_error_response("model path is outside the registered model roots", ERROR_TYPE_INVALID_REQUEST));
                 return res;
             }
         }
 
-        const std::string id = json_value(body, "preset_id", slugify(!model_id.empty() ? model_id : (!hf_ref.empty() ? hf_ref : local_path)));
+        const std::string id = fit_json_value(body, "preset_id", slugify(!model_id.empty() ? model_id : (!hf_ref.empty() ? hf_ref : local_path)));
         const std::string preset_path = router.params.models_preset;
         if (preset_path.empty() || !string_ends_with(preset_path, ".json")) {
             fit_res_err(res, format_error_response("Fit Advisor configure requires a JSON --models-preset file", ERROR_TYPE_NOT_SUPPORTED));
@@ -2286,18 +2298,18 @@ struct server_fit_advisor_routes::impl {
 
         try {
             std::lock_guard<std::mutex> preset_lock(router.preset_mutex);
-            json root = json::parse(read_text_file(preset_path));
+            fit_json root = fit_json::parse(read_text_file(preset_path));
             if (!root.is_object()) {
-                root = json::object();
+                root = fit_json::object();
             }
             if (!root.contains("version")) {
                 root["version"] = 1;
             }
             if (!root.contains("models") || !root["models"].is_array()) {
-                root["models"] = json::array();
+                root["models"] = fit_json::array();
             }
 
-            json entry = typed_preset_fields(json_value(body, "preset", json::object()));
+            fit_json entry = typed_preset_fields(fit_json_value(body, "preset", fit_json::object()));
             entry["id"] = id;
             if (!local_path.empty()) {
                 entry["model"] = preset_model_path(local_path);
@@ -2308,10 +2320,10 @@ struct server_fit_advisor_routes::impl {
                 entry.erase("recommended_args");
             }
             if (!body.contains("preset")) {
-                const json system = detect_system_json();
-                const int ctx = json_value(body, "ctx_size", 8192);
-                const std::string mode = json_value(body, "gpu_mode", std::string("layer_split"));
-                entry.merge_patch(preset_from_plan(system, mode, !local_path.empty() ? local_path : hf_ref, ctx, json_value(system, "cpu_cores", 8), id));
+                const fit_json system = detect_system_json();
+                const int ctx = fit_json_value(body, "ctx_size", 8192);
+                const std::string mode = fit_json_value(body, "gpu_mode", std::string("layer_split"));
+                entry.merge_patch(preset_from_plan(system, mode, !local_path.empty() ? local_path : hf_ref, ctx, fit_json_value(system, "cpu_cores", 8), id));
                 entry["id"] = id;
             }
             if (body.contains("alias")) {
@@ -2336,14 +2348,14 @@ struct server_fit_advisor_routes::impl {
                 router.models.load(id);
                 loaded = true;
             }
-            const json response = {
+            const fit_json response = {
                 {"success", true},
                 {"model", id},
                 {"models_preset", preset_path},
                 {"entry", entry},
                 {"loaded", loaded},
             };
-            server_persistence::record_configuration("fit-advisor", id, id, response);
+            server_persistence::record_configuration("fit-advisor", id, id, json::parse(response.dump()));
             fit_res_ok(res, response);
         } catch (const std::exception & e) {
             fit_res_err(res, format_error_response(e.what(), ERROR_TYPE_SERVER));
