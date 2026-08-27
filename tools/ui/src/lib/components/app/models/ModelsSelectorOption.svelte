@@ -85,6 +85,15 @@
 		tags={option.tags}
 	/>
 
+	{#if option.runtime}
+		<span
+			class="hidden max-w-48 shrink-0 truncate rounded-md border border-violet-500/40 bg-violet-500/10 px-1.5 py-0.5 font-mono text-[10px] text-violet-700 sm:inline dark:text-violet-300"
+			title={`Worker: ${option.runtime.worker}`}
+		>
+			{option.runtime.name}
+		</span>
+	{/if}
+
 	<div class="flex shrink-0 items-center gap-1">
 		<!-- svelte-ignore a11y_no_static_element_interactions -->
 		<!-- svelte-ignore a11y_click_events_have_key_events -->

@@ -379,6 +379,7 @@ class ModelsStore implements ModelPropsHost, ModelStatusHost {
 				model: modelId,
 				name: this.toDisplayName(displayNameSource),
 				parsedId: ModelsService.parseModelId(modelId),
+				runtime: item.runtime,
 				tags: item.tags ?? []
 			};
 		});

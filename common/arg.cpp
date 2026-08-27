@@ -4723,6 +4723,12 @@ void common_params_add_preset_options(std::vector<common_arg> & args) {
     ).set_env(COMMON_ARG_PRESET_LOAD_ON_STARTUP).set_preset_only());
 
     args.push_back(common_arg(
+        {"runtime"}, "NAME",
+        "in server router mode, display name for the runtime used by this preset",
+        [](common_params &, const std::string &) { /* unused */ }
+    ).set_env(COMMON_ARG_PRESET_RUNTIME).set_preset_only());
+
+    args.push_back(common_arg(
         {"stop-timeout"}, "SECONDS",
         "in server router mode, force-kill model instance after this many seconds of graceful shutdown",
         [](common_params &, int) { /* unused */ }
@@ -4733,6 +4739,12 @@ void common_params_add_preset_options(std::vector<common_arg> & args) {
         "in server router mode, hide a cached model from the model list when this preset resolves to the same model file",
         [](common_params &, const std::string &) { /* unused */ }
     ).set_env(COMMON_ARG_PRESET_DEDUP_CACHE_MODELS).set_preset_only());
+
+    args.push_back(common_arg(
+        {"worker"}, "PATH",
+        "in server router mode, llama-server worker binary used by this preset",
+        [](common_params &, const std::string &) { /* unused */ }
+    ).set_env(COMMON_ARG_PRESET_WORKER).set_preset_only());
 
     // args.push_back(common_arg(
     //     {"pin"},
