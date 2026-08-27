@@ -17,6 +17,7 @@ export interface ModelOption {
 	meta?: ApiModelDataEntry['meta'];
 	parsedId?: ParsedModelId;
 	aliases?: string[];
+	runtime?: ApiModelDataEntry['runtime'];
 	tags?: string[];
 }
 

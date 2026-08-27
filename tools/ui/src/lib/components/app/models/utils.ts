@@ -27,6 +27,7 @@ export function filterModelOptions(options: ModelOption[], searchTerm: string): 
 			option.model.toLowerCase().includes(term) ||
 			option.name?.toLowerCase().includes(term) ||
 			option.aliases?.some((alias: string) => alias.toLowerCase().includes(term)) ||
+			option.runtime?.name.toLowerCase().includes(term) ||
 			option.tags?.some((tag: string) => tag.toLowerCase().includes(term))
 	);
 }

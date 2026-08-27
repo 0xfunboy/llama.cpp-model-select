@@ -300,6 +300,38 @@ static std::filesystem::path get_server_exec_path() {
 #endif
 }
 
+static std::filesystem::path validate_model_worker_exec_path(
+        const std::string & worker,
+        const char * source) {
+    std::error_code ec;
+    std::filesystem::path path(worker);
+    if (!path.is_absolute()) {
+        path = std::filesystem::absolute(path, ec);
+        if (ec) {
+            throw std::runtime_error(string_format(
+                "failed to resolve %s '%s': %s",
+                source,
+                worker.c_str(),
+                ec.message().c_str()));
+        }
+    }
+    if (!std::filesystem::is_regular_file(path, ec)) {
+        throw std::runtime_error(string_format(
+            "%s is not a regular file: %s",
+            source,
+            path.string().c_str()));
+    }
+    return path;
+}
+
+static std::filesystem::path get_model_worker_exec_path(const std::filesystem::path & fallback) {
+    const char * worker = std::getenv("LLAMA_SERVER_WORKER");
+    if (worker == nullptr || worker[0] == '\0') {
+        return fallback;
+    }
+    return validate_model_worker_exec_path(worker, "LLAMA_SERVER_WORKER");
+}
+
 static void unset_reserved_args(common_preset & preset, bool unset_model_args) {
     preset.unset_option("LLAMA_ARG_SSL_KEY_FILE");
     preset.unset_option("LLAMA_ARG_SSL_CERT_FILE");
@@ -365,13 +397,24 @@ void server_model_meta::update_args(common_preset_context & ctx_preset, std::str
     preset.set_option(ctx_preset, "LLAMA_ARG_HOST",  CHILD_ADDR);
     preset.set_option(ctx_preset, "LLAMA_ARG_PORT",  std::to_string(port));
     preset.set_option(ctx_preset, "LLAMA_ARG_ALIAS", name);
+    std::string preset_worker;
+    const bool has_preset_worker = preset.get_option(COMMON_ARG_PRESET_WORKER, preset_worker)
+        && !preset_worker.empty();
+    if (has_preset_worker) {
+        bin_path = validate_model_worker_exec_path(preset_worker, "preset worker").string();
+    }
+
     // TODO: maybe validate preset before rendering ?
     // render args
     args = preset.to_args(bin_path);
 
     // unified binary dispatches by subcommand, re-inject it right after the
     // binary path so the child starts as 'llama serve ...' not 'llama ...'
-    const char * app_cmd = std::getenv("LLAMA_APP_CMD");
+    // LLAMA_APP_CMD describes the router executable. An external worker is
+    // normally a standalone llama-server and must not inherit that dispatch.
+    const char * global_worker = std::getenv("LLAMA_SERVER_WORKER");
+    const bool has_global_worker = global_worker != nullptr && global_worker[0] != '\0';
+    const char * app_cmd = has_preset_worker || has_global_worker ? nullptr : std::getenv("LLAMA_APP_CMD");
     if (app_cmd != nullptr && app_cmd[0] != '\0' && !bin_path.empty()) {
         args.insert(args.begin() + 1, app_cmd);
     }
@@ -425,6 +468,10 @@ server_models::server_models(
         bin_path = argv[0];
         LOG_WRN("failed to get server executable path: %s\n", e.what());
         LOG_WRN("using original argv[0] as fallback: %s\n", argv[0]);
+    }
+    bin_path = get_model_worker_exec_path(bin_path).string();
+    if (std::getenv("LLAMA_SERVER_WORKER") != nullptr) {
+        LOG_INF("using external model worker binary: %s\n", bin_path.c_str());
     }
     load_models();
     debug_fake_timing = !common_get_env("LLAMA_SERVER_DEBUG_FAKE_TIMING").empty();
@@ -2268,6 +2315,15 @@ void server_models_routes::init_routes() {
                 {"can_remove",    meta.source == SERVER_MODEL_SOURCE_CACHE},
                 // {"need_download", meta.need_download},
                 // TODO: add other fields, may require reading GGUF metadata
+            };
+
+            std::string runtime_name;
+            if (!meta.preset.get_option(COMMON_ARG_PRESET_RUNTIME, runtime_name) || runtime_name.empty()) {
+                runtime_name = "default";
+            }
+            model_info["runtime"] = {
+                {"name",   runtime_name},
+                {"worker", meta.args.empty() ? "" : meta.args.front()},
             };
 
             // merge with loaded_info from the child process if available

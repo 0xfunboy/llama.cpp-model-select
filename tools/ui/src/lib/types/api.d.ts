@@ -73,6 +73,13 @@ export interface ApiModelStatus {
 	args?: string[];
 }
 
+export interface ApiModelRuntime {
+	/** Human-readable runtime selected by the model preset */
+	name: string;
+	/** Resolved llama-server worker binary */
+	worker: string;
+}
+
 /**
  * Model entry from /models endpoint (ROUTER mode)
  * Based on actual API response structure
@@ -100,6 +107,8 @@ export interface ApiModelDataEntry {
 	tags?: string[];
 	/** Modality capabilities, reported by the router for every model regardless of load state */
 	architecture?: ApiModelArchitecture;
+	/** Runtime and worker selected by the router preset */
+	runtime?: ApiModelRuntime;
 	/** Legacy meta field (may be present in older responses) */
 	meta?: Record<string, unknown> | null;
 }
