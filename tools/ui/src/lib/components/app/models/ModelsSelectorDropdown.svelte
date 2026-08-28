@@ -1,9 +1,8 @@
 <script lang="ts">
 	import ModelLoadHighlight from './ModelLoadHighlight.svelte';
 	import type { ModelItem } from './utils';
-	import { ChevronDown, Lightbulb, Loader2 } from '@lucide/svelte';
+	import { ChevronDown, Loader2 } from '@lucide/svelte';
 	import {
-		ChatFormActionAddReasoningSubmenu,
 		DialogModelInformation,
 		DropdownMenuSearchable,
 		ModelId,
@@ -15,7 +14,6 @@
 	import { MODEL_SELECTOR_ICON, SETTINGS_KEYS } from '$lib/constants';
 	import { KeyboardKey, ServerModelStatus } from '$lib/enums';
 	import { useModelsSelector } from '$lib/hooks/use-models-selector.svelte';
-	import { useReasoningMenu } from '$lib/hooks/use-reasoning-menu.svelte';
 	import { modelsStore, settingsStore } from '$lib/stores';
 	import { modelLoadFraction } from '$lib/utils';
 
@@ -39,9 +37,6 @@
 
 	let isOpen = $state(false);
 	let highlightedId = $state<string | null>(null);
-	// The model submenu opens together with the menu so the list and its search
-	// box are immediately available, as before the submenu was introduced
-	let modelSubOpen = $state(false);
 
 	const ms = useModelsSelector({
 		currentModel: () => currentModel,
@@ -49,22 +44,9 @@
 		onOpenChange: (open) => {
 			isOpen = open;
 			highlightedId = null;
-
-			if (open) {
-				// Defer submenu open so the Sub component is mounted first;
-				// setting bind:open synchronously can be lost if the Sub hasn't
-				// rendered yet.
-				queueMicrotask(() => {
-					if (isOpen) modelSubOpen = true;
-				});
-			} else {
-				modelSubOpen = false;
-			}
 		},
 		useGlobalSelection: () => useGlobalSelection
 	});
-
-	const reasoning = useReasoningMenu();
 
 	const showOrgNameInTrigger = $derived(
 		settingsStore.config[SETTINGS_KEYS.SHOW_MODEL_ORG_NAME_IN_TRIGGER] ?? false
@@ -75,15 +57,15 @@
 		highlightedId = null;
 	});
 
-	// Focus the model submenu's search box without scrolling the page. bits-ui
+	// Focus the dropdown's search box without scrolling the page. bits-ui
 	// auto-focuses the opened content by default, which can yank the page
 	// scroll; we prevent that on the Content and refocus the search here.
 	$effect(() => {
-		if (!isOpen || !modelSubOpen) return;
+		if (!isOpen) return;
 
 		requestAnimationFrame(() => {
 			const search = document.querySelector<HTMLElement>(
-				'[data-slot="dropdown-menu-sub-content"] input'
+				'[data-slot="dropdown-menu-content"] input'
 			);
 
 			search?.focus({ preventScroll: true });
@@ -219,28 +201,22 @@
 												? 'text-foreground'
 												: 'text-foreground',
 									isOpen && 'text-foreground',
-									'max-w-[min(calc(100vw-4rem) md:max-w-[min(calc(100cqw-9rem),25rem)]'
+									'max-w-[calc(100vw-4rem)] md:max-w-[min(calc(100cqw-9rem),25rem)]'
 								]}
 								disabled={disabled || ms.updating}
 							>
 								<MODEL_SELECTOR_ICON class="h-3.5 w-3.5 shrink-0" />
 
-								<span class="flex min-w-0 items-center gap-1">
-									{#if selectedOption}
-										<ModelId
-											class="min-w-0 overflow-hidden"
-											hideOrgName={!showOrgNameInTrigger}
-											hideQuantization
-											modelId={selectedOption.model}
-										/>
-									{:else}
-										<span class="min-w-0 font-medium">Select model</span>
-									{/if}
-
-									{#if reasoning.isReasoningActive}
-										<Lightbulb class="h-3.5 w-3.5 shrink-0 text-amber-400" />
-									{/if}
-								</span>
+								{#if selectedOption}
+									<ModelId
+										class="min-w-0 overflow-hidden"
+										hideOrgName={!showOrgNameInTrigger}
+										hideQuantization
+										modelId={selectedOption.model}
+									/>
+								{:else}
+									<span class="min-w-0 font-medium">Select model</span>
+								{/if}
 
 								{#if ms.updating || ms.isLoadingModel}
 									<Loader2 class="h-3 w-3.5 shrink-0 animate-spin" />
@@ -264,94 +240,73 @@
 
 				<DropdownMenu.Content
 					align="end"
-					class="w-full md:min-w-64 md:max-w-80 max-w-[calc(100vw-2rem)]"
+					class="w-[min(56rem,calc(100vw-2rem))] max-w-[calc(100vw-2rem)] pt-0"
 					onOpenAutoFocus={(event) => event.preventDefault()}
 				>
-					<DropdownMenu.Sub bind:open={modelSubOpen}>
-						<DropdownMenu.SubTrigger class="flex cursor-pointer items-center gap-2">
-							<MODEL_SELECTOR_ICON class="h-4 w-4" />
+					<DropdownMenuSearchable
+						emptyMessage="No models found."
+						isEmpty={ms.filteredOptions.length === 0 && ms.isCurrentModelInCache}
+						onSearchChange={(v) => ms.setSearchTerm(v)}
+						onSearchKeyDown={handleSearchKeyDown}
+						placeholder="Search models..."
+						searchValue={ms.searchTerm}
+					>
+						<div class="models-list">
+							{#if !ms.isCurrentModelInCache && currentModel}
+								<!-- Show unavailable model as first option (disabled) -->
+								<button
+									aria-disabled="true"
+									aria-selected="true"
+									class="flex w-full cursor-not-allowed items-center bg-red-400/10 p-2 text-left text-sm text-red-400"
+									disabled
+									role="option"
+									type="button"
+								>
+									<ModelId class="flex-1" hideQuantization modelId={currentModel} />
 
-							{#if selectedOption}
-								<ModelId
-									class="min-w-0 flex-1 overflow-hidden"
-									hideOrgName={!showOrgNameInTrigger}
-									hideQuantization
-									modelId={selectedOption.model}
-								/>
-							{:else}
-								<span class="min-w-0 flex-1 truncate text-muted-foreground">No model</span>
+									<span class="ml-2 text-xs whitespace-nowrap opacity-70">(not available)</span>
+								</button>
 							{/if}
-						</DropdownMenu.SubTrigger>
 
-						<DropdownMenu.SubContent class="w-100 max-w-[calc(100vw-2rem)] pt-0">
-							<DropdownMenuSearchable
-								emptyMessage="No models found."
-								isEmpty={ms.filteredOptions.length === 0 && ms.isCurrentModelInCache}
-								onSearchChange={(v) => ms.setSearchTerm(v)}
-								onSearchKeyDown={handleSearchKeyDown}
-								placeholder="Search models..."
-								searchValue={ms.searchTerm}
-							>
-								<div class="models-list">
-									{#if !ms.isCurrentModelInCache && currentModel}
-										<!-- Show unavailable model as first option (disabled) -->
-										<button
-											aria-disabled="true"
-											aria-selected="true"
-											class="flex w-full cursor-not-allowed items-center bg-red-400/10 p-2 text-left text-sm text-red-400"
-											disabled
-											role="option"
-											type="button"
-										>
-											<ModelId class="flex-1" hideQuantization modelId={currentModel} />
+							{#if ms.filteredOptions.length === 0}
+								<p class="px-4 py-3 text-sm text-muted-foreground">No models found.</p>
+							{/if}
 
-											<span class="ml-2 text-xs whitespace-nowrap opacity-70">(not available)</span>
-										</button>
-									{/if}
+							{#snippet modelOption(item: ModelItem, hideOrgName: boolean)}
+								{@const { option } = item}
+								{@const isSelected = currentModel === option.model || ms.activeId === option.id}
+								{@const isHighlighted = option.id === highlightedId}
+								{@const isFav = ms.isFavorite(option.model)}
 
-									{#if ms.filteredOptions.length === 0}
-										<p class="px-4 py-3 text-sm text-muted-foreground">No models found.</p>
-									{/if}
+								<ModelsSelectorOption
+									{hideOrgName}
+									{isFav}
+									{isHighlighted}
+									{isSelected}
+									onInfoClick={ms.handleInfoClick}
+									onKeyDown={(event) => {
+										if (event.key === KeyboardKey.ENTER || event.key === KeyboardKey.SPACE) {
+											event.preventDefault();
+											void handleModelKeyAction(option.id, event.altKey);
+										}
+									}}
+									onMouseEnter={() => (highlightedId = option.id)}
+									onSelect={ms.handleSelect}
+									{option}
+								/>
+							{/snippet}
 
-									{#snippet modelOption(item: ModelItem, hideOrgName: boolean)}
-										{@const { option } = item}
-										{@const isSelected = currentModel === option.model || ms.activeId === option.id}
-										{@const isHighlighted = option.id === highlightedId}
-										{@const isFav = ms.isFavorite(option.model)}
-
-										<ModelsSelectorOption
-											{hideOrgName}
-											{isFav}
-											{isHighlighted}
-											{isSelected}
-											onInfoClick={ms.handleInfoClick}
-											onKeyDown={(event) => {
-												if (event.key === KeyboardKey.ENTER || event.key === KeyboardKey.SPACE) {
-													event.preventDefault();
-													void handleModelKeyAction(option.id, event.altKey);
-												}
-											}}
-											onMouseEnter={() => (highlightedId = option.id)}
-											onSelect={ms.handleSelect}
-											{option}
-										/>
-									{/snippet}
-
-									<ModelsSelectorList
-										activeId={ms.activeId}
-										{currentModel}
-										groups={ms.groupedFilteredOptions}
-										onInfoClick={ms.handleInfoClick}
-										onSelect={ms.handleSelect}
-										renderOption={modelOption}
-										sectionHeaderClass="my-1.5 px-2 py-2 text-[13px] font-semibold text-muted-foreground/70 select-none"
-									/>
-								</div>
-							</DropdownMenuSearchable>
-						</DropdownMenu.SubContent>
-					</DropdownMenu.Sub>
-
-					<ChatFormActionAddReasoningSubmenu />
+							<ModelsSelectorList
+								activeId={ms.activeId}
+								{currentModel}
+								groups={ms.groupedFilteredOptions}
+								onInfoClick={ms.handleInfoClick}
+								onSelect={ms.handleSelect}
+								renderOption={modelOption}
+								sectionHeaderClass="my-1.5 px-2 py-2 text-[13px] font-semibold text-muted-foreground/70 select-none"
+							/>
+						</div>
+					</DropdownMenuSearchable>
 				</DropdownMenu.Content>
 			</DropdownMenu.Root>
 		{:else}
@@ -385,10 +340,6 @@
 									hideQuantization
 									modelId={selectedOption.model}
 								/>
-							{/if}
-
-							{#if reasoning.isReasoningActive}
-								<Lightbulb class="h-3.5 w-3.5 shrink-0 text-amber-400" />
 							{/if}
 
 							{#if ms.updating}
