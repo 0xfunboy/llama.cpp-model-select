@@ -6,14 +6,15 @@
 		ChatFormActionRecord,
 		ChatFormActionsAdd,
 		ChatFormActionSubmit,
-		ChatFormContextGauge
+		ChatFormContextGauge,
+		ChatFormReasoningToggle
 	} from '$lib/components/app';
 	import { Button } from '$lib/components/ui/button';
 	import { ICON_CLASS_DEFAULT } from '$lib/constants';
 	import { setChatFormActionsContext } from '$lib/contexts';
 	import { FileTypeCategory, MessageRole } from '$lib/enums';
 	import { ChatService } from '$lib/services';
-	import { chatStore, conversationsStore, settingsStore } from '$lib/stores';
+	import { chatStore, conversationsStore, deviceStore, settingsStore } from '$lib/stores';
 	import { getFileTypeCategory } from '$lib/utils';
 
 	interface Props {
@@ -157,6 +158,10 @@
 	<div class="flex items-center gap-1.5">
 		{#if hasProcessedTokens}
 			<ChatFormContextGauge />
+		{/if}
+
+		{#if !deviceStore.isMobile}
+			<ChatFormReasoningToggle />
 		{/if}
 
 		{#if showModelSelector}

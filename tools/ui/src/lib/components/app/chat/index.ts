@@ -230,6 +230,11 @@ export { default as ChatFormActionAddToolsSubmenu } from './ChatForm/ChatFormAct
 export { default as ChatFormActionAddReasoningSubmenu } from './ChatForm/ChatFormActions/ChatFormActionAdd/ChatFormActionAddReasoningSubmenu.svelte';
 
 /**
+ * Compact standalone reasoning-effort control displayed beside the model selector.
+ */
+export { default as ChatFormReasoningToggle } from './ChatForm/ChatFormActions/ChatFormReasoningToggle.svelte';
+
+/**
  * Compact context-usage gauge with per-turn and cumulative breakdown in the tooltip.
  */
 export { default as ChatFormContextGauge } from './ChatForm/ChatFormContextGauge/ChatFormContextGauge.svelte';
