@@ -21,6 +21,10 @@
 		showRawTooltip?: boolean;
 		hideQuantization?: boolean;
 		hideTags?: boolean;
+		hideAliases?: boolean;
+		providedTagsOnly?: boolean;
+		stackBadges?: boolean;
+		maxTags?: number;
 		aliases?: string[];
 		tags?: string[];
 		modalities?: ModelModalities;
@@ -32,13 +36,17 @@
 		aliases,
 		capabilities,
 		class: className = '',
+		hideAliases = false,
 		hideOrgName = false,
 		hideQuantization,
 		hideTags,
+		maxTags,
 		modalities,
 		modelId,
+		providedTagsOnly = false,
 		showRaw = undefined,
 		showRawTooltip = false,
+		stackBadges = false,
 		tags,
 		...rest
 	}: Props = $props();
@@ -58,7 +66,18 @@
 	let resolvedHideTags = $derived(hideTags ?? !settingsStore.config.showModelTags);
 
 	let uniqueAliases = $derived([...new Set(aliases ?? [])]);
-	let uniqueTags = $derived([...new Set([...(parsed.tags ?? []), ...(tags ?? [])])]);
+	let uniqueTags = $derived.by(() => {
+		const candidates = providedTagsOnly ? (tags ?? []) : [...(parsed.tags ?? []), ...(tags ?? [])];
+		const redundant = new Set(
+			[parsed.params, parsed.quantization, parsed.activatedParams].filter(
+				(value): value is string => Boolean(value)
+			)
+		);
+
+		return [...new Set(candidates)].filter((tag) => !redundant.has(tag));
+	});
+	let visibleTags = $derived(maxTags === undefined ? uniqueTags : uniqueTags.slice(0, maxTags));
+	let hiddenTagCount = $derived(uniqueTags.length - visibleTags.length);
 
 	const allModalities = [ModelModality.VISION, ModelModality.VIDEO, ModelModality.AUDIO] as const;
 	const allCapabilities: ModelCapability[] = [ModelCapability.REASONING];
@@ -78,11 +97,16 @@
 	<TruncatedText class="font-medium {className}" showTooltip={false} text={modelId} {...rest} />
 {:else}
 	{#snippet nameAndBadges()}
-		<span class="min-w-0 truncate font-medium">
+		<span class={['min-w-0 truncate font-medium', stackBadges && 'w-full leading-5']}>
 			{#if !hideOrgName && parsed.orgName}{parsed.orgName}/{/if}{displayName}
 		</span>
 
-		<span class="inline-flex items-center gap-1">
+		<span
+			class={[
+				'min-w-0 items-center gap-1',
+				stackBadges ? 'flex flex-wrap overflow-hidden' : 'inline-flex'
+			]}
+		>
 			{#if parsed.params}
 				<span class={badgeClass}>
 					{parsed.params}{parsed.activatedParams ? `-${parsed.activatedParams}` : ''}
@@ -95,28 +119,46 @@
 				</span>
 			{/if}
 
-			{#if primaryAlias}
+			{#if primaryAlias && !hideAliases}
 				{#if primaryAlias !== parsed.modelName}
 					<span class={badgeClass}>{parsed.modelName ?? modelId}</span>
 				{/if}
-			{:else if uniqueAliases.length > 1}
+			{:else if uniqueAliases.length > 1 && !hideAliases}
 				{#each uniqueAliases as alias (alias)}
 					<span class={badgeClass}>{alias}</span>
 				{/each}
 			{/if}
 
-			{#if uniqueTags.length > 0 && !resolvedHideTags}
-				{#each uniqueTags as tag (tag)}
+			{#if visibleTags.length > 0 && !resolvedHideTags}
+				{#each visibleTags as tag (tag)}
 					<span class={tagBadgeClass}>{tag}</span>
 				{/each}
+
+				{#if hiddenTagCount > 0}
+					<span class={tagBadgeClass} title={`${hiddenTagCount} more tags`}>
+						+{hiddenTagCount}
+					</span>
+				{/if}
 			{/if}
 		</span>
 	{/snippet}
 
-	<span class="flex min-w-0 items-center gap-1.5 {className}" {...rest}>
+	<span
+		class={[
+			'flex min-w-0',
+			stackBadges ? 'flex-col items-stretch gap-1' : 'items-center gap-1.5',
+			className
+		]}
+		{...rest}
+	>
 		{#if showRawTooltip}
 			<Tooltip.Root>
-				<Tooltip.Trigger class="flex min-w-0 items-center gap-1.5">
+				<Tooltip.Trigger
+					class={[
+						'flex min-w-0',
+						stackBadges ? 'flex-col items-stretch gap-1' : 'items-center gap-1.5'
+					]}
+				>
 					{@render nameAndBadges()}
 				</Tooltip.Trigger>
 

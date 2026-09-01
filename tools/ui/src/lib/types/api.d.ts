@@ -71,6 +71,17 @@ export interface ApiModelStatus {
 	value: ServerModelStatus;
 	/** Command line arguments used when loading (only for loaded models) */
 	args?: string[];
+	/** Latest load progress, also available after reconnecting to the router. */
+	progress?: ApiModelsSseProgress;
+	/** Child exit information retained by the router after a failed load. */
+	exit_code?: number;
+	failed?: boolean;
+	/** Local artifacts participating in this preset, used for honest load-time ranges. */
+	artifact_bytes?: number;
+	/** Maximum graceful stop time configured for this model. */
+	stop_timeout_seconds?: number;
+	/** Requests currently proxied to this worker, including other tabs and API clients. */
+	active_requests?: number;
 }
 
 export interface ApiModelRuntime {
@@ -145,6 +156,7 @@ export interface ApiModelsSseData {
 	status: ServerModelStatus;
 	progress?: ApiModelsSseProgress;
 	exit_code?: number;
+	active_requests?: number;
 }
 
 /**
@@ -492,6 +504,27 @@ export interface ApiRouterModelsLoadResponse {
 	error?: string;
 }
 
+/** Backend-owned model transition, persisted across page reloads. */
+export interface ApiRouterModelOperation {
+	active: boolean;
+	action: 'load' | 'switch' | 'unload' | string;
+	target: string;
+	phase:
+		| 'preparing'
+		| 'preflight'
+		| 'waiting_for_requests'
+		| 'unloading'
+		| 'loading'
+		| 'finalizing'
+		| 'ready'
+		| 'idle'
+		| 'failed'
+		| string;
+	error: string;
+	started_at: number;
+	finished_at: number;
+}
+
 /**
  * Request to check model status
  */
@@ -517,6 +550,7 @@ export interface ApiRouterModelsStatusResponse {
 export interface ApiRouterModelsListResponse {
 	object: string;
 	data: ApiModelDataEntry[];
+	operation?: ApiRouterModelOperation;
 }
 
 /**

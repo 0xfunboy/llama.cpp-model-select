@@ -11,15 +11,71 @@ import {
 	AttachmentType,
 	ContinueIntentKind,
 	MessageRole,
+	ToolCallType,
 	ToolResultKind
 } from '$lib/enums';
-import type { AgenticSection, ContinueIntent, ToolResultLine } from '$lib/types/agentic';
-import type { ApiChatCompletionToolCall } from '$lib/types/api';
+import type {
+	AgenticMessage,
+	AgenticSection,
+	ContinueIntent,
+	ToolResultLine
+} from '$lib/types/agentic';
+import type { ApiChatCompletionToolCall, ApiChatMessageData } from '$lib/types/api';
 import type {
 	DatabaseMessage,
 	DatabaseMessageExtra,
 	DatabaseMessageExtraImageFile
 } from '$lib/types/database';
+
+/**
+ * Convert normalized API history to the stricter agentic transcript.
+ * Tool content parts must survive this boundary: after reload ChatService may
+ * have hydrated a lightweight generated-media reference for a capable model.
+ */
+export function toAgenticMessages(messages: ApiChatMessageData[]): AgenticMessage[] {
+	return messages.map((message) => {
+		if (
+			message.role === MessageRole.ASSISTANT &&
+			message.tool_calls &&
+			message.tool_calls.length > 0
+		) {
+			return {
+				content: message.content,
+				reasoning_content: message.reasoning_content,
+				role: MessageRole.ASSISTANT,
+				tool_calls: message.tool_calls.map((call, index) => ({
+					function: {
+						arguments: call.function?.arguments ?? '',
+						name: call.function?.name ?? ''
+					},
+					id: call.id ?? `call_${index}`,
+					type: (call.type as ToolCallType.FUNCTION) ?? ToolCallType.FUNCTION
+				}))
+			} satisfies AgenticMessage;
+		}
+
+		if (message.role === MessageRole.ASSISTANT) {
+			return {
+				content: message.content,
+				reasoning_content: message.reasoning_content,
+				role: MessageRole.ASSISTANT
+			} satisfies AgenticMessage;
+		}
+
+		if (message.role === MessageRole.TOOL && message.tool_call_id) {
+			return {
+				content: message.content,
+				role: MessageRole.TOOL,
+				tool_call_id: message.tool_call_id
+			} satisfies AgenticMessage;
+		}
+
+		return {
+			content: message.content,
+			role: message.role as MessageRole.SYSTEM | MessageRole.USER
+		} satisfies AgenticMessage;
+	});
+}
 
 /**
  * Derives display sections from a single assistant message and its direct tool results.
@@ -165,6 +221,25 @@ export function deriveAgenticSections(
 	}
 
 	return sections;
+}
+
+/**
+ * True when a text section follows a successfully rendered generated-media
+ * tool in the same agentic message group. The UI uses this narrow condition to
+ * suppress only duplicate model-authored Markdown images, never normal images
+ * in unrelated assistant messages.
+ */
+export function hasCompletedGeneratedMediaBefore(
+	sections: AgenticSection[],
+	index: number
+): boolean {
+	return sections
+		.slice(0, index)
+		.some((section) =>
+			(section.toolResultExtras ?? []).some(
+				(extra) => extra.type === AttachmentType.GENERATED_MEDIA && extra.status === 'completed'
+			)
+		);
 }
 
 /**

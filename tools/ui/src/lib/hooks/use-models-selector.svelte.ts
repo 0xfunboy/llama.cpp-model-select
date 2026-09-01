@@ -3,6 +3,7 @@ import { CHAT_INPUT_FOCUS_SELECTOR } from '$lib/constants';
 import { modelsStore, serverStore } from '$lib/stores';
 import type { ModelOption } from '$lib/types/models';
 import { onMount } from 'svelte';
+import { toast } from 'svelte-sonner';
 
 export interface UseModelsSelectorOptions {
 	currentModel: () => string | null;
@@ -117,6 +118,16 @@ export function useModelsSelector(opts: UseModelsSelectorOptions): UseModelsSele
 		const option = options.find((opt) => opt.id === modelId);
 
 		if (!option) return;
+
+		const activeTarget = modelsStore.status.getTransitionModelId();
+
+		if (activeTarget && activeTarget !== option.model) {
+			toast.info(
+				`Please wait: the backend is still switching to ${modelsStore.toDisplayName(activeTarget)}`
+			);
+
+			return;
+		}
 
 		let shouldCloseMenu = true;
 

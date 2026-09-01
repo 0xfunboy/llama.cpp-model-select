@@ -21,6 +21,17 @@ export const API_TOOLS = {
 	LIST: '/tools'
 };
 
+export const API_MEDIA = {
+	ASSET_OWNERS: '/api/media/assets/owners',
+	CONVERSATION_ASSETS: (conversationId: string) =>
+		`/api/media/conversations/${encodeURIComponent(conversationId)}/assets`,
+	JOBS: '/api/media/jobs',
+	MESSAGE_ASSETS: (messageId: string) =>
+		`/api/media/messages/${encodeURIComponent(messageId)}/assets`,
+	MODELS: '/api/media/models',
+	STATUS: '/api/media/status'
+} as const;
+
 // resumable stream routes, the conv::model identity travels as the conv_id query param
 // because model names can contain slashes that a path segment cannot carry
 // resume retry cadence while the owning model is still loading (server answers 503)

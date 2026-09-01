@@ -94,6 +94,32 @@
 		>
 			<DropdownMenu.Item
 				class="flex cursor-pointer items-center gap-2"
+				onclick={() => {
+					dropdownOpen = false;
+					chatFormActions.onGenerateImage?.();
+				}}
+			>
+				<Image class={ICON_CLASS_DEFAULT} />
+
+				<span>Genera immagine</span>
+			</DropdownMenu.Item>
+
+			<DropdownMenu.Item
+				class="flex cursor-pointer items-center gap-2"
+				onclick={() => {
+					dropdownOpen = false;
+					chatFormActions.onGenerateVideo?.();
+				}}
+			>
+				<Video class={ICON_CLASS_DEFAULT} />
+
+				<span>Genera video</span>
+			</DropdownMenu.Item>
+
+			<DropdownMenu.Separator />
+
+			<DropdownMenu.Item
+				class="flex cursor-pointer items-center gap-2"
 				onclick={() => attachmentMenu.callbacks[AttachmentAction.FILE_UPLOAD]()}
 			>
 				<File class={ICON_CLASS_DEFAULT} />

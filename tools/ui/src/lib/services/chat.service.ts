@@ -32,9 +32,14 @@ import {
 	ReasoningFormat,
 	StreamConnectionState
 } from '$lib/enums';
+import { MediaService } from '$lib/services/media.service';
 import { modelsStore } from '$lib/stores/models/index.svelte';
 import { settingsStore } from '$lib/stores/settings/index.svelte';
-import type { DatabaseMessageExtraMcpPrompt, DatabaseMessageExtraMcpResource } from '$lib/types';
+import type {
+	DatabaseMessageExtraGeneratedMedia,
+	DatabaseMessageExtraMcpPrompt,
+	DatabaseMessageExtraMcpResource
+} from '$lib/types';
 import type {
 	ApiChatCompletionToolCall,
 	ApiChatMessageContentPart,
@@ -136,17 +141,9 @@ export class ChatService {
 	 * as content parts suitable for the chat completion API.
 	 */
 	static async convertDbMessageToApiChatMessageData(
-		message: DatabaseMessage & { extra?: DatabaseMessageExtra[] }
+		message: DatabaseMessage & { extra?: DatabaseMessageExtra[] },
+		model?: string | null
 	): Promise<ApiChatMessageData> {
-		// Handle tool result messages (role: 'tool')
-		if (message.role === MessageRole.TOOL && message.toolCallId) {
-			return {
-				content: message.content,
-				role: MessageRole.TOOL,
-				tool_call_id: message.toolCallId
-			};
-		}
-
 		// Parse tool calls for assistant messages
 		let toolCalls: ApiChatCompletionToolCall[] | undefined;
 
@@ -170,6 +167,10 @@ export class ChatService {
 
 			if (toolCalls && toolCalls.length > 0) {
 				result.tool_calls = toolCalls;
+			}
+
+			if (message.role === MessageRole.TOOL && message.toolCallId) {
+				result.tool_call_id = message.toolCallId;
 			}
 
 			return result;
@@ -263,6 +264,35 @@ export class ChatService {
 			});
 		}
 
+		// Generated assets remain lightweight server references in IndexedDB. Resolve
+		// their bytes only when the selected model can actually consume the modality.
+		const generatedMedia = message.extra.filter(
+			(extra: DatabaseMessageExtra): extra is DatabaseMessageExtraGeneratedMedia =>
+				extra.type === AttachmentType.GENERATED_MEDIA && extra.status === 'completed'
+		);
+		const effectiveModel = model || modelsStore.activeModelId;
+
+		for (const media of generatedMedia) {
+			const supported =
+				media.kind === 'image'
+					? Boolean(effectiveModel && modelsStore.props.modelSupportsVision(effectiveModel))
+					: Boolean(effectiveModel && modelsStore.props.modelSupportsVideo(effectiveModel));
+
+			if (!supported) continue;
+
+			try {
+				const part = await MediaService.contextPartForAttachment(media);
+
+				if (part) contentParts.push(part);
+			} catch (error) {
+				// Keep the textual tool summary usable if the asset was removed or unavailable.
+				console.warn(
+					`[ChatService] Unable to hydrate generated ${media.kind} ${media.assetId}:`,
+					error
+				);
+			}
+		}
+
 		const pdfFiles = message.extra.filter(
 			(extra: DatabaseMessageExtra): extra is DatabaseMessageExtraPdfFile =>
 				extra.type === AttachmentType.PDF
@@ -331,6 +361,10 @@ export class ChatService {
 			result.tool_calls = toolCalls;
 		}
 
+		if (message.role === MessageRole.TOOL && message.toolCallId) {
+			result.tool_call_id = message.toolCallId;
+		}
+
 		return result;
 	}
 
@@ -387,7 +421,10 @@ export class ChatService {
 			await ChatService.sendMessage(
 				[message],
 				{
-					custom: { chat_template_kwargs: { enable_thinking: false } },
+					enableThinking: false,
+					// A title is a bounded background operation. Without this cap a slow reasoning
+					// model can hold the only router slot long after the visible reply completed.
+					max_tokens: 32,
 					model: model || undefined,
 					onChunk: (chunk: string) => {
 						titleResponse += chunk;
@@ -806,14 +843,16 @@ export class ChatService {
 	 * messages. Shared by sendMessage, preEncode and the agentic flow.
 	 */
 	static async normalizeMessagesForApi(
-		messages: ApiChatMessageData[] | (DatabaseMessage & { extra?: DatabaseMessageExtra[] })[]
+		messages: ApiChatMessageData[] | (DatabaseMessage & { extra?: DatabaseMessageExtra[] })[],
+		model?: string | null
 	): Promise<ApiChatMessageData[]> {
 		return (
 			await Promise.all(
 				messages.map((msg) => {
 					if ('id' in msg && 'convId' in msg && 'timestamp' in msg) {
 						return ChatService.convertDbMessageToApiChatMessageData(
-							msg as DatabaseMessage & { extra?: DatabaseMessageExtra[] }
+							msg as DatabaseMessage & { extra?: DatabaseMessageExtra[] },
+							model
 						);
 					}
 
@@ -843,8 +882,10 @@ export class ChatService {
 		excludeReasoning?: boolean,
 		signal?: AbortSignal
 	): Promise<void> {
-		const normalizedMessages: ApiChatMessageData[] =
-			await ChatService.normalizeMessagesForApi(messages);
+		const normalizedMessages: ApiChatMessageData[] = await ChatService.normalizeMessagesForApi(
+			messages,
+			model
+		);
 		const requestBody: Record<string, unknown> = {
 			messages: normalizedMessages.map((msg: ApiChatMessageData) => {
 				const mapped: Record<string, unknown> = {
@@ -1071,8 +1112,10 @@ export class ChatService {
 			xtc_probability,
 			xtc_threshold
 		} = options;
-		const normalizedMessages: ApiChatMessageData[] =
-			await ChatService.normalizeMessagesForApi(messages);
+		const normalizedMessages: ApiChatMessageData[] = await ChatService.normalizeMessagesForApi(
+			messages,
+			options.model
+		);
 
 		// Filter out image attachments if the model doesn't support vision
 		if (options.model && !modelsStore.props.modelSupportsVision(options.model)) {
@@ -1134,7 +1177,11 @@ export class ChatService {
 			: ReasoningFormat.AUTO;
 
 		const reasoningBudgetTokens =
-			enableThinking && reasoningEffort ? (REASONING_EFFORT_TOKENS[reasoningEffort] ?? -1) : -1;
+			enableThinking === false
+				? 0
+				: enableThinking && reasoningEffort
+					? (REASONING_EFFORT_TOKENS[reasoningEffort] ?? -1)
+					: -1;
 
 		// an explicit user choice injects the kwarg, otherwise it is omitted so
 		// the server default applies (--reasoning flag or chat template)

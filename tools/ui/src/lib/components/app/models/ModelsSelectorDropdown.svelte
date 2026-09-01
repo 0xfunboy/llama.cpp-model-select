@@ -212,13 +212,14 @@
 										class="min-w-0 overflow-hidden"
 										hideOrgName={!showOrgNameInTrigger}
 										hideQuantization
+										hideTags
 										modelId={selectedOption.model}
 									/>
 								{:else}
 									<span class="min-w-0 font-medium">Select model</span>
 								{/if}
 
-								{#if ms.updating || ms.isLoadingModel}
+								{#if ms.updating || triggerLoading}
 									<Loader2 class="h-3 w-3.5 shrink-0 animate-spin" />
 								{:else}
 									<ChevronDown class="h-3 w-3.5 shrink-0" />
@@ -262,7 +263,7 @@
 									role="option"
 									type="button"
 								>
-									<ModelId class="flex-1" hideQuantization modelId={currentModel} />
+									<ModelId class="flex-1" hideQuantization hideTags modelId={currentModel} />
 
 									<span class="ml-2 text-xs whitespace-nowrap opacity-70">(not available)</span>
 								</button>
@@ -338,6 +339,7 @@
 									class="min-w-0 overflow-hidden"
 									hideOrgName={!showOrgNameInTrigger}
 									hideQuantization
+									hideTags
 									modelId={selectedOption.model}
 								/>
 							{/if}

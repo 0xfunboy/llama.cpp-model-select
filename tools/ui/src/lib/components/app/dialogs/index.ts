@@ -25,6 +25,8 @@ export { default as DialogMcpServerAddNew } from './DialogMcpServerAddNew.svelte
  * dialog.
  */
 export { default as DialogMcpServers } from './DialogMcpServers.svelte';
+export { default as DialogGenerateMedia } from './DialogGenerateMedia.svelte';
+export { default as DialogGeneratedImagePreview } from './DialogGeneratedImagePreview.svelte';
 
 /**
  * **DialogSettingsChat** - Chat settings shown in a modal dialog

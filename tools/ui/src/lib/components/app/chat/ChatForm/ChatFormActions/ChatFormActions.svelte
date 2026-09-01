@@ -29,6 +29,8 @@
 		showModelSelector?: boolean;
 		uploadedFiles?: ChatUploadedFile[];
 		onFileUpload?: () => void;
+		onGenerateImage?: () => void;
+		onGenerateVideo?: () => void;
 		onMicClick?: () => void;
 		onStop?: () => void;
 		onSystemPromptClick?: () => void;
@@ -44,6 +46,8 @@
 		isReasoning = false,
 		isRecording = false,
 		onFileUpload,
+		onGenerateImage,
+		onGenerateVideo,
 		onMcpSettingsClick,
 		onMicClick,
 		onStop,
@@ -135,6 +139,12 @@
 		},
 		get onFileUpload() {
 			return onFileUpload;
+		},
+		get onGenerateImage() {
+			return onGenerateImage;
+		},
+		get onGenerateVideo() {
+			return onGenerateVideo;
 		},
 		get onMcpSettingsClick() {
 			return onMcpSettingsClick;

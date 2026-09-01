@@ -48,7 +48,14 @@
 		return (model?.status?.value as ServerModelStatus) ?? null;
 	});
 	let isOperationInProgress = $derived(modelsStore.status.isOperationInProgress(option.model));
-	let isFailed = $derived(serverStatus === ServerModelStatus.FAILED);
+	let activeTransitionTarget = $derived(modelsStore.status.getTransitionModelId());
+	let isBlockedByTransition = $derived(
+		Boolean(activeTransitionTarget && activeTransitionTarget !== option.model)
+	);
+	let isFailed = $derived(
+		serverStatus === ServerModelStatus.FAILED ||
+			Boolean(currentRouterModels.find((m) => m.id === option.model)?.status?.failed)
+	);
 	let isSleeping = $derived(serverStatus === ServerModelStatus.SLEEPING);
 	let isLoaded = $derived(
 		(serverStatus === ServerModelStatus.LOADED || isSleeping) && !isOperationInProgress
@@ -65,10 +72,11 @@
 </script>
 
 <div
+	aria-disabled={isBlockedByTransition}
 	aria-selected={isSelected || isHighlighted}
 	class={[
 		'group relative flex w-full items-center gap-2 rounded-sm p-2 text-left text-sm transition focus:outline-none',
-		'cursor-pointer',
+		isBlockedByTransition ? 'cursor-not-allowed opacity-50' : 'cursor-pointer',
 		isSelected && !isHighlighted && 'bg-accent/50',
 		isHighlighted && 'bg-accent',
 		(isSelected || isHighlighted) && 'text-accent-foreground',
@@ -76,7 +84,9 @@
 		'focus:bg-accent',
 		isLoaded ? 'text-popover-foreground' : 'text-muted-foreground'
 	]}
-	onclick={() => onSelect(option.id)}
+	onclick={() => {
+		if (!isBlockedByTransition) onSelect(option.id);
+	}}
 	onkeydown={onKeyDown}
 	onmouseenter={onMouseEnter}
 	role="option"
@@ -87,10 +97,14 @@
 		aliases={option.aliases}
 		{capabilities}
 		class="flex-1"
+		hideAliases
 		{hideOrgName}
+		maxTags={6}
 		{modalities}
 		modelId={option.model}
+		providedTagsOnly
 		showRawTooltip
+		stackBadges
 		tags={option.tags}
 	/>
 

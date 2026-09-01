@@ -1,7 +1,15 @@
-import { AgenticSectionType, MessageRole } from '$lib/enums';
+import { AgenticSectionType, AttachmentType, ContentPartType, MessageRole } from '$lib/enums';
 import type { ApiChatCompletionToolCall } from '$lib/types/api';
-import type { DatabaseMessage } from '$lib/types/database';
-import { deriveAgenticSections, hasAgenticContent } from '$lib/utils/agentic';
+import type {
+	DatabaseMessage,
+	DatabaseMessageExtraGeneratedMediaCompleted
+} from '$lib/types/database';
+import {
+	deriveAgenticSections,
+	hasAgenticContent,
+	hasCompletedGeneratedMediaBefore,
+	toAgenticMessages
+} from '$lib/utils/agentic';
 import { describe, expect, it } from 'vitest';
 
 function makeAssistant(overrides: Partial<DatabaseMessage> = {}): DatabaseMessage {
@@ -85,6 +93,110 @@ describe('deriveAgenticSections', () => {
 		expect(sections[1].type).toBe(AgenticSectionType.TOOL_CALL);
 		expect(sections[1].toolName).toBe('search');
 		expect(sections[1].toolResult).toBe('Found 3 results');
+	});
+
+	it('associates generated media with its matching tool-result section', () => {
+		const firstAsset = {
+			assetId: 'asset-1',
+			assetUrl: '/api/media/assets/asset-1',
+			conversationId: 'conv-1',
+			jobId: 'job-1',
+			kind: 'image' as const,
+			mimeType: 'image/png',
+			model: 'pony-v6-xl',
+			name: 'asset-1.png',
+			ownerMessageId: 'tool-1',
+			prompt: 'first image',
+			size: 100,
+			status: 'completed' as const,
+			type: AttachmentType.GENERATED_MEDIA
+		} satisfies DatabaseMessageExtraGeneratedMediaCompleted;
+		const secondAsset = {
+			...firstAsset,
+			assetId: 'asset-2',
+			assetUrl: '/api/media/assets/asset-2',
+			jobId: 'job-2',
+			name: 'asset-2.png',
+			ownerMessageId: 'tool-2',
+			prompt: 'second image'
+		} satisfies DatabaseMessageExtraGeneratedMediaCompleted;
+		const msg = makeAssistant({
+			toolCalls: JSON.stringify([
+				{ function: { arguments: '{}', name: 'generate_image' }, id: 'call_1', type: 'function' },
+				{ function: { arguments: '{}', name: 'generate_image' }, id: 'call_2', type: 'function' }
+			])
+		});
+		const tool1 = makeToolMsg({
+			extra: [firstAsset],
+			id: 'tool-1',
+			toolCallId: 'call_1'
+		});
+		const tool2 = makeToolMsg({
+			extra: [secondAsset],
+			id: 'tool-2',
+			toolCallId: 'call_2'
+		});
+		const sections = deriveAgenticSections(msg, [tool1, tool2]);
+
+		expect(sections).toHaveLength(2);
+		expect(sections[0].toolResultExtras).toEqual([firstAsset]);
+		expect(sections[1].toolResultExtras).toEqual([secondAsset]);
+		expect(sections[0].toolResultExtras).not.toContain(secondAsset);
+		expect(sections[1].toolResultExtras).not.toContain(firstAsset);
+	});
+
+	it('suppresses Markdown images only in text that follows a completed generated asset', () => {
+		const completed = {
+			assetId: 'asset-rendered',
+			assetUrl: '/api/media/assets/asset-rendered',
+			conversationId: 'conv-1',
+			jobId: 'job-rendered',
+			kind: 'image' as const,
+			mimeType: 'image/png',
+			model: 'krea2-snofs-turbo-fp8',
+			name: 'rendered.png',
+			ownerMessageId: 'tool-rendered',
+			prompt: 'a generated image',
+			size: 100,
+			status: 'completed' as const,
+			type: AttachmentType.GENERATED_MEDIA
+		} satisfies DatabaseMessageExtraGeneratedMediaCompleted;
+		const sections = [
+			{ content: 'Useful preamble', type: AgenticSectionType.TEXT },
+			{
+				content: 'Image generated',
+				toolResultExtras: [completed],
+				type: AgenticSectionType.TOOL_CALL
+			},
+			{ content: 'Useful answer ![duplicate](bad-url)', type: AgenticSectionType.TEXT }
+		];
+
+		expect(hasCompletedGeneratedMediaBefore(sections, 0)).toBe(false);
+		expect(hasCompletedGeneratedMediaBefore(sections, 1)).toBe(false);
+		expect(hasCompletedGeneratedMediaBefore(sections, 2)).toBe(true);
+	});
+
+	it('preserves multimodal tool-result content at the agentic reload boundary', () => {
+		const content = [
+			{ text: 'Image generated locally.', type: ContentPartType.TEXT },
+			{
+				image_url: { url: 'data:image/png;base64,dHJhbnNpZW50' },
+				type: ContentPartType.IMAGE_URL
+			}
+		];
+		const [message] = toAgenticMessages([
+			{
+				content,
+				role: MessageRole.TOOL,
+				tool_call_id: 'call_generated_media'
+			}
+		]);
+
+		expect(message).toEqual({
+			content,
+			role: MessageRole.TOOL,
+			tool_call_id: 'call_generated_media'
+		});
 	});
 
 	it('single turn: pending tool call without result', () => {

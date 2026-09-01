@@ -3,6 +3,7 @@
 	import ChatMessageToolCallBlockEditFile from './ChatMessageToolCallBlockEditFile.svelte';
 	import ChatMessageToolCallBlockExecShellCommand from './ChatMessageToolCallBlockExecShellCommand.svelte';
 	import ChatMessageToolCallBlockFileGlobSearch from './ChatMessageToolCallBlockFileGlobSearch.svelte';
+	import ChatMessageToolCallBlockGenerateMedia from './ChatMessageToolCallBlockGenerateMedia.svelte';
 	import ChatMessageToolCallBlockGetDatetime from './ChatMessageToolCallBlockGetDatetime.svelte';
 	import ChatMessageToolCallBlockGetInfo from './ChatMessageToolCallBlockGetInfo.svelte';
 	import ChatMessageToolCallBlockGrepSearch from './ChatMessageToolCallBlockGrepSearch.svelte';
@@ -43,6 +44,8 @@
 	<ChatMessageToolCallBlockReadFile {isStreaming} {onToggle} {open} {section} />
 {:else if section.toolName === BuiltInTool.BROWSER_READ_MEDIA}
 	<ChatMessageToolCallBlockReadMedia {isStreaming} {onToggle} {open} {section} />
+{:else if section.toolName === BuiltInTool.BROWSER_GENERATE_IMAGE || section.toolName === BuiltInTool.BROWSER_GENERATE_VIDEO}
+	<ChatMessageToolCallBlockGenerateMedia {attachments} {isStreaming} {onToggle} {open} {section} />
 {:else if section.toolName === BuiltInTool.SERVER_EDIT_FILE}
 	<ChatMessageToolCallBlockEditFile {isStreaming} {onToggle} {open} {section} />
 {:else if section.toolName === BuiltInTool.SERVER_WRITE_FILE}

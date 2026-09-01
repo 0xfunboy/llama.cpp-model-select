@@ -7,7 +7,7 @@
  */
 
 import { IDXDB_STORES, IDXDB_TABLES, STORAGE_APP_NAME } from '$lib/constants';
-import { MessageRole } from '$lib/enums';
+import { AttachmentType, MessageRole } from '$lib/enums';
 import type { McpServerOverride } from '$lib/types/database';
 import type { ExportedConversation } from '$lib/types/database';
 import { filterByLeafNodeId, findDescendantMessages, uuid } from '$lib/utils';
@@ -412,7 +412,7 @@ export class DatabaseService {
 						...msg,
 						children: newChildren,
 						convId: newConvId,
-						extra: options.includeAttachments ? msg.extra : undefined,
+						extra: this.prepareForkExtras(msg.extra, options.includeAttachments, newConvId, newId),
 						id: newId,
 						parent: newParent
 					};
@@ -513,6 +513,17 @@ export class DatabaseService {
 		return result;
 	}
 
+	/** Returns the root message and every descendant that a cascading delete will remove. */
+	static async getMessageBranchIds(conversationId: string, messageId: string): Promise<string[]> {
+		const allMessages = await db[IDXDB_TABLES.messages]
+			.where('convId')
+			.equals(conversationId)
+			.toArray();
+		const descendants = findDescendantMessages(allMessages, messageId);
+
+		return [messageId, ...descendants];
+	}
+
 	/**
 	 * Imports multiple conversations and their messages.
 	 * Skips conversations that already exist.
@@ -551,6 +562,25 @@ export class DatabaseService {
 				return { imported, skipped };
 			}
 		);
+	}
+
+	static prepareForkExtras(
+		extras: DatabaseMessageExtra[] | undefined,
+		includeAttachments: boolean,
+		conversationId: string,
+		ownerMessageId: string
+	): DatabaseMessageExtra[] | undefined {
+		if (!includeAttachments || !extras) return undefined;
+
+		const cloned = extras.flatMap((extra): DatabaseMessageExtra[] => {
+			if (extra.type !== AttachmentType.GENERATED_MEDIA) return [{ ...extra }];
+
+			if (extra.status === 'pending') return [];
+
+			return [{ ...extra, conversationId, ownerMessageId }];
+		});
+
+		return cloned.length > 0 ? cloned : undefined;
 	}
 
 	/**

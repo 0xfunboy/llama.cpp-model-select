@@ -15,14 +15,26 @@ import {
 	FilePlus,
 	FileSearch,
 	FileText,
+	ImagePlus,
 	Info,
 	SearchCode,
-	Terminal
+	Terminal,
+	Video
 } from '@lucide/svelte';
 import { BuiltInTool, ToolSource } from '$lib/enums';
 import type { ToolUiEntry } from '$lib/types';
 
 export const TOOL_UI: Readonly<Record<BuiltInTool, ToolUiEntry>> = {
+	[BuiltInTool.BROWSER_GENERATE_IMAGE]: {
+		icon: ImagePlus,
+		label: 'Generating prompt',
+		source: ToolSource.BROWSER
+	},
+	[BuiltInTool.BROWSER_GENERATE_VIDEO]: {
+		icon: Video,
+		label: 'Generating video prompt',
+		source: ToolSource.BROWSER
+	},
 	[BuiltInTool.BROWSER_GET_DATETIME]: {
 		icon: Clock,
 		label: 'Current time',

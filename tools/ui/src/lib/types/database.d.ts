@@ -52,6 +52,51 @@ export interface DatabaseMessageExtraImageFile {
 	base64Url: string;
 }
 
+export interface DatabaseMessageExtraGeneratedMediaBase {
+	type: AttachmentType.GENERATED_MEDIA;
+	/** Controller job id. Stable across a browser reload while generation is running. */
+	jobId: string;
+	/** Conversation/message ownership used by the controller for lifecycle cleanup. */
+	conversationId: string;
+	ownerMessageId: string;
+	kind: 'image' | 'video';
+	mimeType: string;
+	model: string;
+	prompt: string;
+	name: string;
+	size: number;
+	width?: number;
+	height?: number;
+	quality?: string | null;
+}
+
+/** Lightweight placeholder persisted while the controller owns an active job. */
+export interface DatabaseMessageExtraGeneratedMediaPending extends DatabaseMessageExtraGeneratedMediaBase {
+	status: 'pending';
+	assetId?: string;
+	assetUrl?: string;
+}
+
+/** Server-backed generated media. Bytes deliberately stay out of IndexedDB. */
+export interface DatabaseMessageExtraGeneratedMediaCompleted extends DatabaseMessageExtraGeneratedMediaBase {
+	status: 'completed';
+	assetId: string;
+	assetUrl: string;
+}
+
+/** Terminal job without a usable asset. This prevents a stale pending UI after reload/abort. */
+export interface DatabaseMessageExtraGeneratedMediaTerminal extends DatabaseMessageExtraGeneratedMediaBase {
+	status: 'failed' | 'cancelled';
+	assetId?: string;
+	assetUrl?: string;
+	error: string;
+}
+
+export type DatabaseMessageExtraGeneratedMedia =
+	| DatabaseMessageExtraGeneratedMediaPending
+	| DatabaseMessageExtraGeneratedMediaCompleted
+	| DatabaseMessageExtraGeneratedMediaTerminal;
+
 /**
  * Legacy format from the old UI — pasted content was stored as "context" type
  * @deprecated Use DatabaseMessageExtraTextFile instead
@@ -102,6 +147,7 @@ export interface DatabaseMessageExtraMcpResource {
 
 export type DatabaseMessageExtra =
 	| DatabaseMessageExtraImageFile
+	| DatabaseMessageExtraGeneratedMedia
 	| DatabaseMessageExtraTextFile
 	| DatabaseMessageExtraAudioFile
 	| DatabaseMessageExtraVideoFile

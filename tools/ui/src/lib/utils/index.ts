@@ -257,13 +257,25 @@ export {
 // Agentic content utilities (structured section derivation)
 export {
 	deriveAgenticSections,
+	hasCompletedGeneratedMediaBefore,
 	buildAssistantRawOutput,
 	parseToolResultWithMedia,
 	splitSearchSummaryList,
 	hasAgenticContent,
 	classifyToolResult,
-	classifyContinueIntent
+	classifyContinueIntent,
+	toAgenticMessages
 } from './agentic';
+
+// Per-turn media intent gates. Media generation is never an ambient capability.
+export {
+	classifyMediaTurn,
+	filterMediaToolsForTurn,
+	isEmptyAgenticTurn,
+	latestUserTurnText,
+	mediaToolKind,
+	type MediaTurnKind
+} from './media-turn-intent';
 
 // Line-level unified diff for tool result rendering (`edit_file` block)
 export { computeLineDiff, prefixFor, renderUnifiedDiff, type DiffLine } from './compute-line-diff';

@@ -3,6 +3,7 @@
  */
 export enum AttachmentType {
 	AUDIO = 'AUDIO',
+	GENERATED_MEDIA = 'GENERATED_MEDIA',
 	IMAGE = 'IMAGE',
 	LEGACY_CONTEXT = 'context', // Legacy attachment type for backward compatibility
 	MCP_PROMPT = 'MCP_PROMPT',

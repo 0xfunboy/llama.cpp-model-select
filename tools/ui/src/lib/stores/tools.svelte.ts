@@ -10,6 +10,8 @@
 import { browser } from '$app/environment';
 import {
 	buildBrowserInfoToolDefinition,
+	buildGenerateImageToolDefinition,
+	buildGenerateVideoToolDefinition,
 	buildGetDatetimeToolDefinition,
 	buildReadMediaToolDefinition,
 	DISABLED_TOOL_CATEGORIES_LOCALSTORAGE_KEY,
@@ -27,8 +29,9 @@ import {
 	ToolSource
 } from '$lib/enums';
 import { ToolsService } from '$lib/services/tools.service';
-// direct imports between stores, not via the barrel, to avoid circular deps
 import { mcpStore } from '$lib/stores/mcp/index.svelte';
+// direct imports between stores, not via the barrel, to avoid circular deps
+import { mediaStore } from '$lib/stores/media.svelte';
 import { modelsStore } from '$lib/stores/models/index.svelte';
 import { settingsStore } from '$lib/stores/settings/index.svelte';
 import type { OpenAIToolDefinition, ToolEntry, ToolGroup } from '$lib/types';
@@ -113,6 +116,12 @@ class ToolsStore {
 
 	get browserTools(): OpenAIToolDefinition[] {
 		const tools: OpenAIToolDefinition[] = [buildGetDatetimeToolDefinition()];
+		const imageModels = mediaStore.toolModels('image');
+		const videoModels = mediaStore.toolModels('video');
+
+		if (mediaStore.supports('image')) tools.push(buildGenerateImageToolDefinition(imageModels));
+
+		if (mediaStore.supports('video')) tools.push(buildGenerateVideoToolDefinition(videoModels));
 
 		if (settingsStore.config.jsSandboxEnabled) {
 			tools.push(buildSandboxToolDefinition(!!settingsStore.config.symbolicMathEnabled));

@@ -42,6 +42,8 @@ export enum GlobSearchType {
  * the UI while keeping a single wire name.
  */
 export enum BuiltInTool {
+	BROWSER_GENERATE_IMAGE = 'generate_image',
+	BROWSER_GENERATE_VIDEO = 'generate_video',
 	BROWSER_GET_DATETIME = 'get_datetime',
 	BROWSER_READ_MEDIA = 'read_media',
 	BROWSER_RUN_JAVASCRIPT = 'run_javascript',

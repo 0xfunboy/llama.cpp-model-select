@@ -29,6 +29,11 @@ import {
 	ToolCallType
 } from '$lib/enums';
 import { ChatService } from '$lib/services';
+import {
+	type MediaJobRequest,
+	type MediaJobRunResult,
+	MediaService
+} from '$lib/services/media.service';
 import { ReadMediaService } from '$lib/services/read-media.service';
 import { SandboxService } from '$lib/services/sandbox.service';
 import { ToolsService } from '$lib/services/tools.service';
@@ -36,6 +41,7 @@ import { ToolsService } from '$lib/services/tools.service';
 import { AgenticGates } from '$lib/stores/agentic/gates.svelte';
 import { conversationsStore } from '$lib/stores/conversations/index.svelte';
 import { mcpStore } from '$lib/stores/mcp/index.svelte';
+import { mediaStore } from '$lib/stores/media.svelte';
 import { modelsStore } from '$lib/stores/models/index.svelte';
 import { settingsStore } from '$lib/stores/settings/index.svelte';
 import { toolsStore } from '$lib/stores/tools.svelte';
@@ -68,17 +74,24 @@ import type {
 	ChatMessageToolCallTiming
 } from '$lib/types/chat';
 import type {
-	DatabaseMessage,
 	DatabaseMessageExtra,
 	DatabaseMessageExtraAudioFile,
-	DatabaseMessageExtraImageFile
+	DatabaseMessageExtraGeneratedMediaCompleted,
+	DatabaseMessageExtraImageFile,
+	DatabaseMessageExtraVideoFile
 } from '$lib/types/database';
 import {
+	classifyMediaTurn,
 	executeBrowserInfoTool,
 	executeGetDatetimeTool,
+	filterMediaToolsForTurn,
 	getAudioInputFormat,
-	isAbortError
+	isAbortError,
+	isEmptyAgenticTurn,
+	latestUserTurnText,
+	toAgenticMessages
 } from '$lib/utils';
+import { SvelteSet } from 'svelte/reactivity';
 import { SvelteMap } from 'svelte/reactivity';
 
 function createDefaultSession(): AgenticSession {
@@ -93,51 +106,6 @@ function createDefaultSession(): AgenticSession {
 		streamingToolCall: null,
 		totalToolCalls: 0
 	};
-}
-
-function toAgenticMessages(messages: ApiChatMessageData[]): AgenticMessage[] {
-	return messages.map((message) => {
-		if (
-			message.role === MessageRole.ASSISTANT &&
-			message.tool_calls &&
-			message.tool_calls.length > 0
-		) {
-			return {
-				content: message.content,
-				reasoning_content: message.reasoning_content,
-				role: MessageRole.ASSISTANT,
-				tool_calls: message.tool_calls.map((call, index) => ({
-					function: {
-						arguments: call.function?.arguments ?? '',
-						name: call.function?.name ?? ''
-					},
-					id: call.id ?? `call_${index}`,
-					type: (call.type as ToolCallType.FUNCTION) ?? ToolCallType.FUNCTION
-				}))
-			} satisfies AgenticMessage;
-		}
-
-		if (message.role === MessageRole.ASSISTANT) {
-			return {
-				content: message.content,
-				reasoning_content: message.reasoning_content,
-				role: MessageRole.ASSISTANT
-			} satisfies AgenticMessage;
-		}
-
-		if (message.role === MessageRole.TOOL && message.tool_call_id) {
-			return {
-				content: typeof message.content === 'string' ? message.content : '',
-				role: MessageRole.TOOL,
-				tool_call_id: message.tool_call_id
-			} satisfies AgenticMessage;
-		}
-
-		return {
-			content: message.content,
-			role: message.role as MessageRole.SYSTEM | MessageRole.USER
-		} satisfies AgenticMessage;
-	});
 }
 
 class AgenticStore {
@@ -320,6 +288,10 @@ class AgenticStore {
 			await toolsStore.fetchServerTools();
 		}
 
+		// Discover the optional local media controller before freezing the tool set for
+		// this turn. CUDA installations without it keep their existing tools unchanged.
+		if (!mediaStore.isAvailable) await mediaStore.refresh(signal);
+
 		const agenticConfig = this.getConfig(settingsStore.config);
 
 		if (!agenticConfig.enabled) return { handled: false };
@@ -341,16 +313,25 @@ class AgenticStore {
 			}
 		}
 
-		const tools = toolsStore.getEnabledToolsForLLM(disabledTools, disabledToolCategories);
+		const enabledTools = toolsStore.getEnabledToolsForLLM(disabledTools, disabledToolCategories);
+		const armedMedia = mediaStore.peekModelSelection(conversationId);
+		const requestedMedia = armedMedia
+			? new Set([armedMedia.kind])
+			: classifyMediaTurn(latestUserTurnText(messages));
+		const tools = filterMediaToolsForTurn(enabledTools, requestedMedia);
 
 		if (tools.length === 0) {
 			return { handled: false };
 		}
 
-		console.log(`[AgenticStore] Starting agentic flow with ${tools.length} tools`);
+		console.log(
+			`[AgenticStore] Starting agentic flow with ${tools.length} tools; media=${[...requestedMedia].join(',') || 'none'}`
+		);
 
-		const normalizedMessages: ApiChatMessageData[] =
-			await ChatService.normalizeMessagesForApi(messages);
+		const normalizedMessages: ApiChatMessageData[] = await ChatService.normalizeMessagesForApi(
+			messages,
+			options.model
+		);
 
 		this.updateSession(conversationId, {
 			currentTurn: 0,
@@ -402,7 +383,9 @@ class AgenticStore {
 	private buildAttachmentName(mimeType: string, index: number): string {
 		const extension = mimeType.startsWith(MimeTypePrefix.AUDIO)
 			? (AUDIO_MIME_TO_EXTENSION[mimeType] ?? DEFAULT_AUDIO_EXTENSION)
-			: (IMAGE_MIME_TO_EXTENSION[mimeType] ?? DEFAULT_IMAGE_EXTENSION);
+			: mimeType.startsWith(MimeTypePrefix.VIDEO)
+				? mimeType.split('/')[1]?.split(';')[0] || 'webm'
+				: (IMAGE_MIME_TO_EXTENSION[mimeType] ?? DEFAULT_IMAGE_EXTENSION);
 
 		return `${MCP_ATTACHMENT_NAME_PREFIX}-${Date.now()}-${index}.${extension}`;
 	}
@@ -437,7 +420,6 @@ class AgenticStore {
 			createAssistantMessage,
 			createToolResultMessage,
 			onAssistantTurnComplete,
-			onAttachments,
 			onChunk,
 			onCompletionId,
 			onFlowComplete,
@@ -453,6 +435,8 @@ class AgenticStore {
 		let capturedTimings: ChatMessageTimings | undefined;
 		let totalToolCallCount = 0;
 
+		const generatedMediaJobIds = new SvelteSet<string>();
+		const mediaQaRetriedJobs = new SvelteSet<string>();
 		const agenticTimings: ChatMessageAgenticTimings = {
 			llm: { predicted_ms: 0, predicted_n: 0, prompt_ms: 0, prompt_n: 0 },
 			perTurn: [],
@@ -465,6 +449,7 @@ class AgenticStore {
 		const effectiveModel = options.model || modelsStore.models[0]?.model || '';
 
 		let turn = 0;
+		let blankTurnRecoveryUsed = false;
 
 		while (true) {
 			if (turn >= maxTurns) {
@@ -513,78 +498,110 @@ class AgenticStore {
 			};
 
 			try {
-				await ChatService.sendMessage(
-					sessionMessages as ApiChatMessageData[],
-					{
-						...options,
-						onChunk: (chunk: string) => {
-							turnContent += chunk;
-							onChunk?.(chunk);
-						},
-						onComplete: () => {
-							/* Completion handled after sendMessage resolves */
-						},
-						onCompletionId,
-						onError: (error: Error) => {
-							throw error;
-						},
-						onModel,
-						onReasoningChunk: (chunk: string) => {
-							turnReasoningContent += chunk;
-							onReasoningChunk?.(chunk);
-						},
-						onTimings: (timings?: ChatMessageTimings, progress?: ChatMessagePromptProgress) => {
-							onTimings?.(timings, progress);
+				for (let attempt = 0; attempt < 2; attempt += 1) {
+					const recoveryAttempt = attempt === 1;
 
-							if (timings) {
-								capturedTimings = timings;
-								turnTimings = timings;
+					await ChatService.sendMessage(
+						sessionMessages as ApiChatMessageData[],
+						{
+							...options,
+							onChunk: (chunk: string) => {
+								turnContent += chunk;
+								onChunk?.(chunk);
+							},
+							onComplete: () => {
+								/* Completion handled after sendMessage resolves */
+							},
+							onCompletionId,
+							onError: (error: Error) => {
+								throw error;
+							},
+							onModel,
+							onReasoningChunk: (chunk: string) => {
+								turnReasoningContent += chunk;
+								onReasoningChunk?.(chunk);
+							},
+							onTimings: (timings?: ChatMessageTimings, progress?: ChatMessagePromptProgress) => {
+								onTimings?.(timings, progress);
 
-								// completed turns + in-flight turn live counts
-								this.updateSession(conversationId, {
-									liveLlm: {
-										predicted_ms: agenticTimings.llm.predicted_ms + (timings.predicted_ms ?? 0),
-										predicted_n: agenticTimings.llm.predicted_n + (timings.predicted_n ?? 0),
-										prompt_ms: agenticTimings.llm.prompt_ms + (timings.prompt_ms ?? 0),
-										prompt_n: agenticTimings.llm.prompt_n + (timings.prompt_n ?? 0)
-									}
-								});
-							}
-						},
-						onToolCallChunk: (serialized: string) => {
-							try {
-								turnToolCalls = JSON.parse(serialized) as ApiChatCompletionToolCall[];
+								if (timings) {
+									capturedTimings = timings;
+									turnTimings = timings;
 
-								onToolCallsStreaming?.(turnToolCalls);
-
-								if (turnToolCalls.length > 0 && turnToolCalls[0]?.function) {
-									const name = turnToolCalls[0].function.name || '';
-									const args = turnToolCalls[0].function.arguments || '';
-									const argsLengthBucket = Math.floor(args.length / 100);
-
-									if (
-										name !== lastStreamingToolCallName ||
-										argsLengthBucket !== lastStreamingToolCallArgsLength
-									) {
-										lastStreamingToolCallName = name;
-										lastStreamingToolCallArgsLength = argsLengthBucket;
-										this.updateSession(conversationId, {
-											streamingToolCall: { arguments: args, name }
-										});
-									}
+									// completed turns + in-flight turn live counts
+									this.updateSession(conversationId, {
+										liveLlm: {
+											predicted_ms: agenticTimings.llm.predicted_ms + (timings.predicted_ms ?? 0),
+											predicted_n: agenticTimings.llm.predicted_n + (timings.predicted_n ?? 0),
+											prompt_ms: agenticTimings.llm.prompt_ms + (timings.prompt_ms ?? 0),
+											prompt_n: agenticTimings.llm.prompt_n + (timings.prompt_n ?? 0)
+										}
+									});
 								}
-							} catch {
-								/* Ignore parse errors during streaming */
-							}
-						},
-						stream: true,
-						tools: tools.length > 0 ? tools : undefined
-					},
-					conversationId,
-					signal
-				);
+							},
+							onToolCallChunk: (serialized: string) => {
+								try {
+									turnToolCalls = JSON.parse(serialized) as ApiChatCompletionToolCall[];
 
-				this.updateSession(conversationId, { streamingToolCall: null });
+									onToolCallsStreaming?.(turnToolCalls);
+
+									if (turnToolCalls.length > 0 && turnToolCalls[0]?.function) {
+										const name = turnToolCalls[0].function.name || '';
+										const args = turnToolCalls[0].function.arguments || '';
+										const argsLengthBucket = Math.floor(args.length / 100);
+
+										if (
+											name !== lastStreamingToolCallName ||
+											argsLengthBucket !== lastStreamingToolCallArgsLength
+										) {
+											lastStreamingToolCallName = name;
+											lastStreamingToolCallArgsLength = argsLengthBucket;
+											this.updateSession(conversationId, {
+												streamingToolCall: { arguments: args, name }
+											});
+										}
+									}
+								} catch {
+									/* Ignore parse errors during streaming */
+								}
+							},
+							stream: true,
+							// A blank/EOS recovery deliberately avoids every tool template. Keeping even
+							// one definition can reproduce Qwen's intermittent two-token tool preamble.
+							tools: recoveryAttempt ? undefined : tools.length > 0 ? tools : undefined
+						},
+						conversationId,
+						signal
+					);
+
+					this.updateSession(conversationId, { streamingToolCall: null });
+
+					if (!isEmptyAgenticTurn(turnContent, turnReasoningContent, turnToolCalls.length)) {
+						break;
+					}
+
+					if (recoveryAttempt || blankTurnRecoveryUsed) {
+						throw new Error(
+							'Il modello ha chiuso due volte senza produrre testo o una chiamata tool valida.'
+						);
+					}
+
+					blankTurnRecoveryUsed = true;
+					console.warn('[AgenticStore] Blank model turn; retrying once without tools', {
+						hadMediaTools: tools.some((tool) =>
+							[BuiltInTool.BROWSER_GENERATE_IMAGE, BuiltInTool.BROWSER_GENERATE_VIDEO].includes(
+								tool.function.name as BuiltInTool
+							)
+						),
+						predicted_n: turnTimings?.predicted_n ?? null
+					});
+					turnContent = '';
+					turnReasoningContent = '';
+					turnToolCalls = [];
+					turnTimings = undefined;
+					lastStreamingToolCallName = '';
+					lastStreamingToolCallArgsLength = 0;
+				}
 
 				if (turnTimings) {
 					agenticTimings.llm.predicted_n += turnTimings.predicted_n || 0;
@@ -744,13 +761,14 @@ class AgenticStore {
 
 				const toolName = toolCall.function.name;
 				const serverLabel = toolsStore.getToolServerLabel(toolName);
-				// Ask for permission before executing the tool
-				const permission = await this.gates.requestPermission(
-					conversationId,
-					toolName,
-					serverLabel,
-					signal
-				);
+				const isLocalMediaGeneration =
+					toolName === BuiltInTool.BROWSER_GENERATE_IMAGE ||
+					toolName === BuiltInTool.BROWSER_GENERATE_VIDEO;
+				// The user's natural-language generation request is the authorization for these
+				// local-only tools. Other tools retain the normal permission gate.
+				const permission = isLocalMediaGeneration
+					? ToolPermissionDecision.ONCE
+					: await this.gates.requestPermission(conversationId, toolName, serverLabel, signal);
 
 				// Yield to allow Svelte to flush the UI update (hide permission dialog)
 				await new Promise((r) => setTimeout(r, 0));
@@ -767,6 +785,8 @@ class AgenticStore {
 				let result = '';
 				let toolSuccess = true;
 				let createdToolResultMessageId: string | null = null;
+				let generatedMediaAttachment: DatabaseMessageExtraGeneratedMediaCompleted | null = null;
+				let generatedMediaContextPart: ApiChatMessageContentPart | undefined;
 
 				// Streaming tools (currently only exec_shell_command): mark
 				// the session so the matching renderer can switch to live mode.
@@ -778,6 +798,15 @@ class AgenticStore {
 					toolSuccess = false;
 				} else {
 					try {
+						if (isLocalMediaGeneration && createToolResultMessage && updateToolResultMessage) {
+							const msg = await createToolResultMessage(
+								toolCall.id,
+								'Preparing local media generation.'
+							);
+
+							createdToolResultMessageId = msg.id;
+						}
+
 						if (
 							toolSource === ToolSource.SERVER &&
 							toolName === BuiltInTool.SERVER_EXEC_SHELL_COMMAND &&
@@ -838,6 +867,86 @@ class AgenticStore {
 									signal,
 									conversationsStore.activeConversation?.cwd
 								);
+							} else if (
+								toolName === BuiltInTool.BROWSER_GENERATE_IMAGE ||
+								toolName === BuiltInTool.BROWSER_GENERATE_VIDEO
+							) {
+								const kind =
+									toolName === BuiltInTool.BROWSER_GENERATE_VIDEO
+										? ('video' as const)
+										: ('image' as const);
+								const selectedModel = mediaStore.consumeModelSelection(conversationId, kind);
+								const payload = {
+									...args,
+									...(selectedModel ? { model: selectedModel } : {}),
+									kind
+								} as MediaJobRequest;
+								const includeContextPart =
+									kind === 'image'
+										? modelsStore.props.modelSupportsVision(effectiveModel)
+										: modelsStore.props.modelSupportsVideo(effectiveModel);
+								const qaRetryOf =
+									typeof args.qa_retry_of_job_id === 'string' ? args.qa_retry_of_job_id.trim() : '';
+
+								if (qaRetryOf) {
+									if (!includeContextPart || !generatedMediaJobIds.has(qaRetryOf)) {
+										throw new Error(
+											'Vision-QA retry rejected: the referenced media job is not part of this active flow.'
+										);
+									}
+
+									if (mediaQaRetriedJobs.has(qaRetryOf)) {
+										throw new Error(
+											'Vision-QA retry rejected: this image already used its one retry.'
+										);
+									}
+
+									mediaQaRetriedJobs.add(qaRetryOf);
+								}
+
+								const mediaResult: MediaJobRunResult = await MediaService.runJob(payload, {
+									conversationId,
+									includeContextPart,
+									onCompleted: async (_job, completedAttachment, content) => {
+										if (createdToolResultMessageId && updateToolResultMessage) {
+											await updateToolResultMessage(createdToolResultMessageId, content, [
+												completedAttachment
+											]);
+										}
+									},
+									onStatus: (state) => mediaStore.set(toolCall.id, state),
+									onSubmitted: async (_job, pendingAttachment) => {
+										if (createdToolResultMessageId && updateToolResultMessage) {
+											await updateToolResultMessage(
+												createdToolResultMessageId,
+												MediaService.pendingSummary(pendingAttachment),
+												[pendingAttachment]
+											);
+										}
+									},
+									onTerminal: async (_job, terminalAttachment) => {
+										if (createdToolResultMessageId && updateToolResultMessage) {
+											await updateToolResultMessage(
+												createdToolResultMessageId,
+												MediaService.terminalSummary(terminalAttachment),
+												[terminalAttachment]
+											);
+										}
+									},
+									ownerMessageId: createdToolResultMessageId || toolCall.id,
+									signal
+								});
+
+								generatedMediaJobIds.add(mediaResult.job.id);
+								generatedMediaAttachment = mediaResult.attachment;
+								generatedMediaContextPart = mediaResult.contextPart;
+								executionResult = {
+									content:
+										includeContextPart && kind === 'image' && !qaRetryOf
+											? `${mediaResult.content}\nJob ID: ${mediaResult.job.id}\nVision QA: inspect the actual image now. Check exact subject count and identities, requested action, left/right layout, framing, anatomy, required details and exact text. If an objective requirement is visibly wrong, call generate_image once more with qa_retry_of_job_id=${mediaResult.job.id}, qa_correction, and a corrected full scene. Otherwise accept it and answer the user.`
+											: mediaResult.content,
+									isError: false
+								};
 							} else {
 								executionResult = await SandboxService.executeTool(toolName, args, signal);
 							}
@@ -896,38 +1005,37 @@ class AgenticStore {
 					return;
 				}
 
-				const { attachments, cleanedResult } = this.extractBase64Attachments(result);
+				const extracted = this.extractBase64Attachments(result);
+				const attachments = [...extracted.attachments];
+				const cleanedResult = extracted.cleanedResult;
 
-				// For streaming tools the result message was created empty
-				// at the start of execution and updated in place as chunks
-				// arrived via updateToolResultMessage. Skip the second
-				// create call - just attach any base64 attachments found in
-				// the final accumulator (rare, since chunks usually don't
-				// carry image data URIs) and emit the attachments callback.
-				let toolResultMessage: DatabaseMessage | undefined;
+				if (generatedMediaAttachment) attachments.push(generatedMediaAttachment);
+
+				// Streaming and media tools create their result row before work starts.
+				// Update it in place, replacing a pending media reference with the final one.
 
 				if (createdToolResultMessageId) {
-					toolResultMessage = { id: createdToolResultMessageId } as DatabaseMessage;
-
-					if (attachments.length > 0 && updateToolResultMessage) {
-						await updateToolResultMessage(createdToolResultMessageId, cleanedResult, attachments);
+					if (updateToolResultMessage) {
+						await updateToolResultMessage(
+							createdToolResultMessageId,
+							cleanedResult,
+							attachments.length > 0 ? attachments : undefined
+						);
 					}
 				} else if (createToolResultMessage) {
-					toolResultMessage = await createToolResultMessage(
+					await createToolResultMessage(
 						toolCall.id,
 						cleanedResult,
 						attachments.length > 0 ? attachments : undefined
 					);
 				}
 
-				if (attachments.length > 0 && toolResultMessage) {
-					onAttachments?.(toolResultMessage.id, attachments);
-				}
-
 				// Build content parts for session history (including images for vision models)
 				const contentParts: ApiChatMessageContentPart[] = [
 					{ text: cleanedResult, type: ContentPartType.TEXT }
 				];
+
+				if (generatedMediaContextPart) contentParts.push(generatedMediaContextPart);
 
 				for (const attachment of attachments) {
 					if (attachment.type === AttachmentType.AUDIO) {
@@ -1032,6 +1140,17 @@ class AgenticStore {
 					name,
 					type: AttachmentType.AUDIO
 				});
+
+				return `[Attachment saved: ${name}]`;
+			}
+
+			if (mimeType.startsWith(MimeTypePrefix.VIDEO)) {
+				attachments.push({
+					base64Data,
+					mimeType,
+					name,
+					type: AttachmentType.VIDEO
+				} as DatabaseMessageExtraVideoFile);
 
 				return `[Attachment saved: ${name}]`;
 			}

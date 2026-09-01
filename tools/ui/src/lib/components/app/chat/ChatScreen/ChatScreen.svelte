@@ -1,4 +1,6 @@
 <script lang="ts">
+	import ChatMediaBackendStatus from './ChatMediaBackendStatus.svelte';
+	import ChatModelBackendStatus from './ChatModelBackendStatus.svelte';
 	import ChatScreenActionScrollDown from './ChatScreenActionScrollDown.svelte';
 	import ChatScreenDialogsAndAlerts from './ChatScreenDialogsAndAlerts.svelte';
 	import ChatScreenGreeting from './ChatScreenGreeting.svelte';
@@ -22,6 +24,7 @@
 		chatStore,
 		conversationsStore,
 		deviceStore,
+		modelsStore,
 		serverStore,
 		settingsStore
 	} from '$lib/stores';
@@ -324,7 +327,15 @@
 				isEmpty ? 'md:bottom-[calc(50dvh-7rem)] 2xl:bottom-[calc(50dvh-4rem)]' : 'md:bottom-4'
 			]}
 		>
-			<ChatScreenGreeting {isEmpty} />
+			<ChatScreenGreeting
+				isEmpty={isEmpty &&
+					!modelsStore.status.isTransitionInProgress() &&
+					modelsStore.status.backendOperation?.phase !== 'failed'}
+			/>
+
+			<ChatModelBackendStatus {isEmpty} />
+
+			<ChatMediaBackendStatus />
 
 			<ChatScreenServerError />
 
@@ -349,7 +360,10 @@
 			<ChatScreenForm
 				bind:uploadedFiles={fileUpload.uploadedFiles}
 				class="pointer-events-auto conversation-chat-form"
-				disabled={hasPropsError || chatStore.isEditing()}
+				disabled={hasPropsError ||
+					chatStore.isEditing() ||
+					modelsStore.status.isTransitionInProgress() ||
+					(modelsStore.status.hasActiveRequests() && !isCurrentConversationLoading)}
 				{initialMessage}
 				isLoading={isCurrentConversationLoading}
 				onFileRemove={fileUpload.handleFileRemove}
