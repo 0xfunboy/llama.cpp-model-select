@@ -5,7 +5,7 @@
 The first milestone uses one host and two cooperating binaries:
 
 - The `llama.cpp-strix-halo` server is the control plane. It owns the Web UI,
-  model selector, lifecycle API, Fit Advisor, downloads, and benchmarks.
+  model selector, lifecycle API, Fit Planner, downloads and evidence campaigns.
 - The optimized Strix Halo Vulkan `llama-server` is the inference worker. The
   control plane starts it through `LLAMA_SERVER_WORKER`.
 - `/home/funboy/models` is the only managed model root.
@@ -93,7 +93,7 @@ Before enabling a second host in production:
    a model download automatically.
 
 The cluster feature is complete only when its benchmark and recovery behavior are
-visible in the same Web UI as the existing DS4 reports.
+visible in Optimize alongside the existing Performance and Quality evidence.
 
 ## Primary references
 

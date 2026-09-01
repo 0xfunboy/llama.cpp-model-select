@@ -20,22 +20,19 @@ streaming measurements and quality results are labelled separately; only a
 context-verified, memory-observed, streaming-measured and quality-qualified row
 can be applied automatically.
 
-The fork patch set is intentionally product-shaped, not just a collection of
-tools:
+The product has two primary model-management destinations:
 
-- **Library** - directory discovery, health, downloads, duplicates and initial
-  fit. This is the default starting point because the normal workflow begins
-  with finding or adding a model.
-- **Test Lab** - guided use-case selection, candidate selection, adaptive
-  synthetic racing, streaming profiling and quality scope planning.
-- **Recommendations** - one qualified winner, alternatives, hardware evidence
-  and DS4-derived capability rankings by use case.
-- **Evaluator** - integrated DS4 quality evaluation for reasoning, coding, RAG,
-  tool use, long context and other product packs. Large multi-model runs are
-  resumable and may take hours or days.
-- **Router** - stable `local-*` virtual models and inspectable route decisions.
-- **History** - immutable campaigns, comparison and portable archive.
-- **Doctor** - first-run readiness plus stale build/driver evidence detection.
+- **Models** - artifact discovery and health, hardware fit planning, persistent
+  downloads and router configuration. Values derived from metadata are labelled
+  Estimated; they are not presented as benchmarks.
+- **Optimize** - the guided measurement workflow. Overview explains readiness,
+  Run tests starts resumable campaigns, Evidence keeps performance and quality
+  separate, and Archive combines saved Caliber and DS4 runs.
+
+DS4-Eval and DS4-Bench remain available as advanced engines and through their
+existing URLs, but they are not separate top-level products. Diagnostics is
+available from Optimize. Least-cost routing is shown only after the machine has
+qualified evidence for it.
 
 Everything is offline-first. Runtime state lives under the platform XDG data and
 state directories; sanitized JSON is an import/export format, not a second store.
@@ -49,16 +46,18 @@ overview.
 
 - **Native model selector UI** backed by router presets in `models.json`.
 - **Admin router control API** for lifecycle-safe model switching:
-  - `GET /admin/models`
-  - `POST /admin/switch`
-- **Unified Local LLM Autopilot dashboard** at `/caliber-advisor`; Fit, Caliber
-  and DS4 evidence are integrated into one novice-safe workflow.
-- **Fit engine**, backed by a native C++ advisor
+    - `GET /admin/models`
+    - `POST /admin/switch`
+- **Models and Fit Planner** at `/fit-advisor` for discovery, downloads and
+  estimated fit before a model is measured.
+- **Optimize dashboard** at `/caliber-advisor`; Caliber and DS4 evidence are
+  integrated into one guided workflow.
+- **Fit planning engine**, backed by a native C++ advisor
   inspired by [`AlexsJones/llmfit`](https://github.com/AlexsJones/llmfit).
 - **Caliber engine**, a Svelte/native-router
   port of core planning, scoring, guided-run, benchmark and reporting ideas from
   [`SpeederX/calibr`](https://github.com/SpeederX/calibr).
-- **Use-case Evaluator** for resumable DwarfStar-style quality runs plus
+- **Evidence Lab** for resumable DwarfStar-style quality runs plus
   built-in general, chat, coding, reasoning, FIM, RAG, tools and long-context
   packs, inspired by [`antirez/ds4`](https://github.com/antirez/ds4).
 - **Model report and comparison views** with sector summaries, winner selection,
@@ -66,7 +65,7 @@ overview.
 - **aria2c Hugging Face download manager** for resumable GGUF downloads.
 - **Router preset writer** that can add downloaded or selected models directly to
   the active `--models-preset` JSON file.
-- **Local SQLite archive** for benchmark reports, download state, Fit Advisor
+- **Local SQLite archive** for benchmark reports, download state, Fit Planner
   recommendations and configured presets, with import/export from Settings.
 - **Least-cost virtual models**: `local-auto`, `local-fast`, `local-best`,
   `local-code`, `local-long`, and `local-vision`.
@@ -74,6 +73,9 @@ overview.
   plane build to launch a separate CUDA or Vulkan `llama-server` runtime.
 - **Per-model runtime selection** through trusted preset `worker` paths, with the
   resolved runtime and worker shown in the model selector and router API.
+- **Local media tools** that attach generated images and videos to chat history,
+  expose backend progress and remove owned assets when a message or conversation
+  is deleted.
 
 ### Credits And Imported Work
 
@@ -89,7 +91,7 @@ local-model operations ideas from several focused projects:
   DwarfStar-style quality checks in this fork build on that project family and
   its model-evaluation focus.
 - Thanks to **Alex Jones** for [`llmfit`](https://github.com/AlexsJones/llmfit).
-  Fit Advisor uses the same practical premise: rank GGUF candidates against the
+  Fit Planner uses the same practical premise: rank GGUF candidates against the
   actual machine before downloading or configuring them.
 
 ### Router And Model Lifecycle Features
@@ -105,7 +107,7 @@ local-model operations ideas from several focused projects:
 - Keeps the OpenAI-compatible request path native to `llama-server`; the model is
   selected through router mode rather than a separate proxy stack.
 
-### Fit Advisor Features
+### Models And Fit Planner Features
 
 - Scores GGUF catalog models against the host's CPU, total RAM, single-GPU VRAM,
   and aggregate multi-GPU VRAM.
@@ -116,25 +118,26 @@ local-model operations ideas from several focused projects:
 - Treats Strix Halo GTT as one shared CPU/GPU memory pool, avoiding double-counted
   capacity and inappropriate CPU-offload recommendations.
 - Supports strategy modes:
-  - `Balanced`
-  - `MultiGPU`
-  - `MoE offload`
-  - `Hybrid offload`
+    - `Balanced`
+    - `MultiGPU`
+    - `MoE offload`
+    - `Hybrid offload`
 - Estimates weight memory, KV cache memory, overhead, runtime mode, fit level,
   rough tokens/sec, and score components.
 - Runtime modes include:
-  - `gpu_single`
-  - `layer_split`
-  - `moe_offload`
-  - `cpu_offload`
-  - `cpu_only`
+    - `gpu_single`
+    - `layer_split`
+    - `moe_offload`
+    - `cpu_offload`
+    - `cpu_only`
 - Pulls and caches the llmfit Hugging Face GGUF catalog.
 - Filters by use case, minimum fit, quantization, search text, result limit, and
   selectable context preset.
 - Context selection is a dropdown with common tiers; the guided product defaults
   to a realistic `32k` and requires explicit selection for extreme contexts.
-- Score output is decomposed into quality, speed, fit, context, and capacity
-  components so ranking decisions are inspectable.
+- Score output is decomposed into a capability prior, speed, fit, context and
+  capacity components. The capability prior is an Estimated metadata heuristic,
+  not measured intelligence.
 - High-capacity hosts weight long-context, larger coding/reasoning models more
   heavily than tiny fast models.
 - Generates recommended command args and router preset JSON, including tensor
@@ -145,14 +148,18 @@ local-model operations ideas from several focused projects:
 - Persists recommendations, download state and FIT configurations into the local
   archive so they can be backed up or compared later.
 
-### Caliber Advisor Features
+### Optimize And Caliber Features
 
 - Provides a guided workflow for selecting the target use case, benchmark depth,
   candidate models and context target.
 - Lists installed router models and can select every available model for a
   campaign while skipping models that already have successful historical
   measurements.
-- Reuses Fit Advisor downloads and FIT configuration, so a catalog model can be
+- Treats every configured launch preset as a separate evidence identity, even
+  when base, LoRA or runtime variants share the same GGUF artifact.
+- Uses hardware shortlist size only to bound candidate selection; it does not
+  present an unimplemented wall-clock limit as a guarantee.
+- Reuses Models downloads and Fit Planner configuration, so a catalog model can be
   downloaded, configured and then measured without leaving the UI.
 - Plans benchmark sweeps from GGUF metadata, target context, KV-cache settings,
   offload mode and host hardware.
@@ -162,11 +169,13 @@ local-model operations ideas from several focused projects:
 - Aggregates all completed reports into a historical comparison view; later runs
   remain comparable with earlier runs without repeating benchmarks for the same
   model.
+- Keeps stale and legacy reports visible in Archive with compatibility reasons,
+  while excluding them from current winners and automatic configuration.
 - Offers winner profiles for:
-  - daily-driver balance
-  - fastest response
-  - speed per watt/GB
-  - safest memory fit
+    - daily-driver balance
+    - fastest response
+    - speed per watt/GB
+    - safest memory fit
 - Renders a Calibr-style report with hardware strip, data-scope controls,
   winner criteria, memory-vs-latency scatter, per-model expandable rows,
   measured config tables and throughput/memory bars.
@@ -175,13 +184,13 @@ local-model operations ideas from several focused projects:
 - Marks synthetic `llama-bench` rows explicitly so benchmark output is not
   confused with full streaming chat telemetry.
 
-### Use-case Evaluator And DS4 Features
+### Evidence Lab And DS4 Features
 
 - Runs the test suite from `tools/server/ds4-eval-cases.json`.
 - Uses the same model registry, compact labels, configured IDs and aliases as
-  Library, Test Lab and Recommendations.
+  Models, Run tests and Optimize results.
 - Shows newly discovered GGUF artifacts immediately while keeping unconfigured
-  artifacts disabled until Library writes a router preset that DS4 can load.
+  artifacts disabled until Models writes a router preset that DS4 can load.
 - Covers multiple subject sectors and product packs, including general,
   chat, coding, reasoning, FIM, RAG, tools and long context where present in the
   suite.
@@ -195,7 +204,7 @@ local-model operations ideas from several focused projects:
   stop reason in the report for diagnosis.
 - Skips a model that cannot load, records the load error and continues with the
   remaining selection instead of aborting a multi-model campaign.
-- Supports direct launch from the Test Lab `Use-case Evaluator` scope.
+- Supports direct launch from the Run tests quality scope.
 - Streams long-running job progress to the UI.
 - Keeps job state visible after page changes or browser reconnects.
 - Saves partial reports on stop and supports resuming compatible reports.
@@ -204,7 +213,7 @@ local-model operations ideas from several focused projects:
 - Provides a model report panel below test logs with sector-level percentages.
 - Supports single-model summaries and race-style comparison between models from
   completed evaluation runs.
-- Feeds Recommendations with weighted capability rankings so sector fit is based
+- Feeds Optimize with weighted capability rankings so sector fit is based
   on a mix of measured skills, evidence coverage and sample confidence rather
   than a single raw score.
 - Retains completed model results as historical benchmark data while allowing
@@ -216,11 +225,11 @@ local-model operations ideas from several focused projects:
   `$XDG_DATA_HOME/llama.cpp-model-select/platform.sqlite` (normally
   `~/.local/share/llama.cpp-model-select/platform.sqlite`).
 - Provides Settings import/export for portable backups of:
-  - Fit Advisor recommendations
-  - download states
-  - FIT configurations
-  - Caliber reports and measured rows
-  - DS4-Eval reports and best results
+    - Fit Planner recommendations
+    - download states
+    - FIT configurations
+    - Caliber reports and measured rows
+    - DS4-Eval reports and best results
 - Keeps completed benchmark data available for future comparison until a better
   result replaces it or the report is explicitly removed.
 
@@ -234,16 +243,16 @@ local-model operations ideas from several focused projects:
 - Resolves target GGUF files from selected quantization, including sharded GGUF
   sets.
 - Exposes download states:
-  - `available`
-  - `queued`
-  - `resolving`
-  - `downloading`
-  - `downloaded`
-  - `configured`
-  - `failed`
+    - `available`
+    - `queued`
+    - `resolving`
+    - `downloading`
+    - `downloaded`
+    - `configured`
+    - `failed`
 - Exposes download monitor endpoints:
-  - `GET /api/fit-advisor/downloads`
-  - `GET /api/fit-advisor/downloads/sse`
+    - `GET /api/fit-advisor/downloads`
+    - `GET /api/fit-advisor/downloads/sse`
 - The UI shows downloaded bytes, total size, percent, speed, target directory,
   errors, and enables `FIT` after the model reaches `downloaded`.
 
@@ -255,9 +264,9 @@ local-model operations ideas from several focused projects:
 - Flattens non-portable historical reasoning chunks when a target template only
   accepts text assistant content.
 - Prevents automatic model load races across independent UI sections.
-- Keeps Test Lab checkbox controls visually and behaviorally independent.
-- Aligns use-case choice cards and normalizes model labels across Library, Test
-  Lab, Recommendations and Evaluator.
+- Keeps Run tests checkbox controls visually and behaviorally independent.
+- Aligns use-case choice cards and normalizes model labels across Models,
+  Optimize and Evidence.
 - Deprioritizes creative or uncensored finetunes for DS4-style correctness and
   disables generated reasoning flags for those presets when appropriate.
 - Fixes advisor ranking issues caused by using transient free RAM instead of total
@@ -283,7 +292,7 @@ llama-server \
 - The multi-node Thunderbolt architecture and qualification gates are documented
   in [`docs/strix-halo-cluster.md`](docs/strix-halo-cluster.md).
 
-- `aria2c` is required for Fit Advisor managed downloads.
+- `aria2c` is required for Fit Planner managed downloads.
 - `models.json` in this fork is a local preset file and may contain machine-specific
   paths; adjust it when reinstalling on a different host.
 
