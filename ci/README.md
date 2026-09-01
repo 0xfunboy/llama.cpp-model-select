@@ -1,5 +1,9 @@
 # CI
 
+The automatic CI policy for this fork is documented in [Fork CI and safe pushes](../docs/fork-ci.md).
+Use `scripts/pre-push-check.sh all` for the supported fork matrix.
+The workflows described below are the broader upstream llama.cpp matrix and are manual in this fork unless a release explicitly targets that platform.
+
 This CI implements heavy-duty workflows that run on self-hosted runners. Typically the purpose of these workflows is to
 cover hardware configurations that are not available from Github-hosted runners and/or require more computational
 resource than normally available.

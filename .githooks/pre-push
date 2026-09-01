@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+remote_name="${1:-origin}"
+zero_oid="0000000000000000000000000000000000000000"
+stamp_file="$(git rev-parse --git-path llama-ci-clean)"
+
+if ! git diff --quiet || ! git diff --cached --quiet; then
+    echo "pre-push: tracked files differ from HEAD; commit or stash them before validation" >&2
+    exit 1
+fi
+
+while read -r _local_ref local_oid _remote_ref remote_oid; do
+    if [[ "${local_oid}" == "${zero_oid}" ]]; then
+        continue
+    fi
+
+    base_oid="${remote_oid}"
+    if [[ "${remote_oid}" == "${zero_oid}" ]]; then
+        remote_master="refs/remotes/${remote_name}/master"
+        if git rev-parse --verify --quiet "${remote_master}" >/dev/null; then
+            base_oid="$(git merge-base "${local_oid}" "${remote_master}")"
+        else
+            base_oid="$(git rev-list --max-parents=0 "${local_oid}" | tail -n 1)"
+        fi
+    fi
+
+    git diff --check "${base_oid}..${local_oid}"
+
+    commit_oid="$(git rev-parse "${local_oid}^{commit}")"
+    validated_oid=""
+    if [[ -f "${stamp_file}" ]]; then
+        validated_oid="$(<"${stamp_file}")"
+    fi
+    if [[ "${commit_oid}" != "${validated_oid}" ]]; then
+        echo "pre-push: ${commit_oid} has not passed the full local gate" >&2
+        echo "run scripts/pre-push-check.sh all before pushing" >&2
+        exit 1
+    fi
+done

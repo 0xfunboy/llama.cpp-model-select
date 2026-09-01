@@ -38,6 +38,9 @@ Everything is offline-first. Runtime state lives under the platform XDG data and
 state directories; sanitized JSON is an import/export format, not a second store.
 See [the operator and migration guide](docs/local-llm-autopilot.md).
 
+Development pushes use one fork-specific workflow for UI, CPU/server, Vulkan and CUDA compile checks.
+See [Fork CI and safe pushes](docs/fork-ci.md) for the definition of a CI-clean commit and the local pre-push gate.
+
 This fork tracks upstream `ggml-org/llama.cpp` and keeps inference on native
 `llama-server` router mode. The upstream README continues below this fork
 overview.
