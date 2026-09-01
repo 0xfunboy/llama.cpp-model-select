@@ -45,7 +45,7 @@
 		await screen.findByRole('menu');
 
 		await waitFor(() => {
-			expect(document.activeElement).toHaveTextContent('Add files');
+			expect(screen.getAllByRole('menuitem')[0]).toHaveFocus();
 		});
 	}}
 />

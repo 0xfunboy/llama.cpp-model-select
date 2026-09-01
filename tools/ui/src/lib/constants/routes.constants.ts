@@ -9,20 +9,20 @@ export const URL_PARAMS = {
 } as const;
 
 export const ROUTES = {
-	/** Chat base — for dynamic chat URLs use RouterService. */
+	AUTOPILOT: '#/caliber-advisor',
+	CALIBER_ADVISOR: '#/caliber-advisor',
+	/** Chat base - for dynamic chat URLs use RouterService. */
 	CHAT: '#/chat',
-	/** MCP servers. */
-	MCP_SERVERS: '#/mcp-servers',
-	/** Settings base — for dynamic settings URLs use RouterService. */
-	SETTINGS: '#/settings',
-	/** Search — mobile-only full-page conversation search. */
-	SEARCH: '#/search',
+	DS4_BENCH: '#/ds4-bench',
 	/** Local model evaluation and advisor dashboards. */
 	DS4_EVAL: '#/ds4-eval',
-	DS4_BENCH: '#/ds4-bench',
 	FIT_ADVISOR: '#/fit-advisor',
-	CALIBER_ADVISOR: '#/caliber-advisor',
-	AUTOPILOT: '#/caliber-advisor',
-	/** Root — start of the app. */
+	/** MCP servers. */
+	MCP_SERVERS: '#/mcp-servers',
+	/** Search - mobile-only full-page conversation search. */
+	SEARCH: '#/search',
+	/** Settings base - for dynamic settings URLs use RouterService. */
+	SETTINGS: '#/settings',
+	/** Root - start of the app. */
 	START: '#/'
 } as const;

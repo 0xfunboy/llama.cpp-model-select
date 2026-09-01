@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest';
 import { compactModelName, normalizeModelName, uniqueModelTags } from '$lib/utils/model-display';
+import { describe, expect, it } from 'vitest';
 
 describe('model display normalization', () => {
 	it('normalizes separators and provider noise', () => {
