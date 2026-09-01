@@ -1879,7 +1879,16 @@ Listing all models in cache. The model metadata will also include a field to ind
       ]
     },
     ...
-  }]
+  }],
+  "operation": {
+    "active": false,
+    "action": "load",
+    "target": "ggml-org/gemma-3-4b-it-GGUF:Q4_K_M",
+    "phase": "ready",
+    "error": "",
+    "started_at": 1730000000000,
+    "finished_at": 1730000005000
+  }
 }
 ```
 
@@ -1900,7 +1909,12 @@ The `status` object can be:
 ```json
 "status": {
   "value": "loading",
-  "args": ["llama-server", "-ctx", "4096"]
+  "args": ["llama-server", "-ctx", "4096"],
+  "progress": {
+    "stages": ["text_model"],
+    "current": "text_model",
+    "value": 0.42
+  }
 }
 ```
 
@@ -1943,7 +1957,9 @@ Note: for "downloading" state, there can be multiple files be downloading in par
 
 ### POST `/models/load`: Load a model
 
-Load a model
+Load a model. The response completes only after the model becomes ready. While
+the request is running, GET `/v1/models` reports the backend-owned `operation`
+and persisted load progress. A concurrent model switch returns HTTP 503.
 
 Payload:
 - `model`: name of the model to be loaded.
@@ -1958,14 +1974,16 @@ Response:
 
 ```json
 {
-  "success": true
+  "success": true,
+  "model": "ggml-org/gemma-3-4b-it-GGUF:Q4_K_M",
+  "status": "loaded"
 }
 ```
 
 
 ### POST `/models/unload`: Unload a model
 
-Unload a model
+Unload a model. The response completes after the child process has stopped.
 
 Payload:
 
@@ -1979,7 +1997,9 @@ Response:
 
 ```json
 {
-  "success": true
+  "success": true,
+  "model": "ggml-org/gemma-3-4b-it-GGUF:Q4_K_M",
+  "status": "unloaded"
 }
 ```
 
