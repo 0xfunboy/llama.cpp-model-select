@@ -1,14 +1,14 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
 	import { Download, Gauge, RefreshCw, SlidersHorizontal, Zap } from '@lucide/svelte';
 	import {
-		FitAdvisorService,
 		type FitAdvisorDownloadJob,
 		type FitAdvisorModel,
-		type FitAdvisorModelsResponse
+		type FitAdvisorModelsResponse,
+		FitAdvisorService
 	} from '$lib/services/fit-advisor.service';
 	import { modelsStore } from '$lib/stores';
 	import { compactModelName, normalizeModelName, uniqueModelTags } from '$lib/utils/model-display';
+	import { onMount } from 'svelte';
 
 	let response = $state<FitAdvisorModelsResponse | null>(null);
 	let selectedModel = $state<FitAdvisorModel | null>(null);
@@ -43,20 +43,21 @@
 		downloadJobs.some((job) => isActiveDownloadStatus(job.status))
 	);
 	const contextOptions = [
-		{ value: 4096, label: '4k' },
-		{ value: 8192, label: '8k' },
-		{ value: 16384, label: '16k' },
-		{ value: 32768, label: '32k' },
-		{ value: 65536, label: '64k' },
-		{ value: 131072, label: '131k' },
-		{ value: 262144, label: '262k' },
-		{ value: 1048576, label: '1M' }
+		{ label: '4k', value: 4096 },
+		{ label: '8k', value: 8192 },
+		{ label: '16k', value: 16384 },
+		{ label: '32k', value: 32768 },
+		{ label: '64k', value: 65536 },
+		{ label: '131k', value: 131072 },
+		{ label: '262k', value: 262144 },
+		{ label: '1M', value: 1048576 }
 	];
 
 	onMount(() => {
 		void loadModels(true);
 		void loadDownloads();
 		startDownloadStream();
+
 		return () => {
 			downloadStreamController?.abort();
 		};
@@ -65,6 +66,7 @@
 	async function loadDownloads() {
 		try {
 			const result = await FitAdvisorService.listDownloads();
+
 			downloadJobs = result.data;
 			downloadLastSeq = Math.max(downloadLastSeq, ...result.data.map((job) => job.seq ?? 0), 0);
 		} catch (e) {
@@ -75,6 +77,7 @@
 	function upsertDownloadJob(job: FitAdvisorDownloadJob) {
 		downloadLastSeq = Math.max(downloadLastSeq, job.seq ?? 0);
 		const index = downloadJobs.findIndex((item) => item.id === job.id);
+
 		downloadJobs =
 			index === -1
 				? [job, ...downloadJobs]
@@ -86,8 +89,6 @@
 		) {
 			selectedModel = {
 				...selectedModel,
-				local_path: job.local_path ?? selectedModel.local_path,
-				target_dir: job.target_dir ?? selectedModel.target_dir,
 				download_progress: job,
 				download_status:
 					job.status === 'downloaded'
@@ -97,9 +98,12 @@
 							: job.status === 'failed'
 								? 'failed'
 								: 'downloading',
-				downloaded: job.status === 'downloaded'
+				downloaded: job.status === 'downloaded',
+				local_path: job.local_path ?? selectedModel.local_path,
+				target_dir: job.target_dir ?? selectedModel.target_dir
 			};
 		}
+
 		if (job.status === 'downloaded' || job.status === 'failed') {
 			void loadModels(false);
 		}
@@ -108,6 +112,7 @@
 	function startDownloadStream() {
 		downloadStreamController?.abort();
 		const controller = new AbortController();
+
 		downloadStreamController = controller;
 		const run = async () => {
 			while (!controller.signal.aborted) {
@@ -119,18 +124,20 @@
 					);
 				} catch (e) {
 					if (controller.signal.aborted) break;
+
 					console.warn('Fit Advisor download stream disconnected', e);
 					await new Promise((resolve) => setTimeout(resolve, 2000));
 				}
 			}
 		};
+
 		void run();
 	}
 
 	async function loadModels(refresh = false) {
 		isLoading = true;
 		error = '';
-		message = refresh ? 'Refreshing llmfit catalog...' : 'Loading recommendations...';
+		message = refresh ? 'Refreshing model catalog...' : 'Loading model plans...';
 		try {
 			const initialLoad = response === null;
 			const next = await FitAdvisorService.models(
@@ -150,21 +157,26 @@
 							use_case: useCase
 						}
 			);
+
 			if (initialLoad) {
 				const strixHalo = next.system.vulkan_optimal_only === true;
+
 				minFit = strixHalo ? 'perfect' : 'marginal';
 				minTps = strixHalo ? 10 : 0;
 				context = strixHalo ? 32768 : 131072;
 				limit = strixHalo ? 100 : 300;
 			}
+
 			response = next;
+
 			if (selectedModel) {
 				selectedModel =
 					next.models.find((model) => model.id === selectedModel?.id) ?? next.models[0] ?? null;
 			} else {
 				selectedModel = next.models[0] ?? null;
 			}
-			message = `Loaded ${next.returned_models} recommendations from ${next.total_catalog_models} catalog entries.`;
+
+			message = `Loaded ${next.returned_models} model plans from ${next.total_catalog_models} catalog entries.`;
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
 			message = '';
@@ -189,14 +201,17 @@
 
 	async function downloadModel(model: FitAdvisorModel) {
 		if (!model.download) return;
+
 		isDownloading = true;
 		error = '';
 		message = `${hasPendingDownload ? 'Queueing' : 'Starting'} download for ${model.download.hf_ref}...`;
 		try {
 			const result = await FitAdvisorService.download(model);
+
 			if (result.job) {
 				upsertDownloadJob(result.job);
 			}
+
 			message = result.already_present
 				? `${result.model} is already present.`
 				: `Download started for ${result.model}.`;
@@ -217,11 +232,12 @@
 			const job = downloadJobFor(model);
 			const enrichedModel: FitAdvisorModel = {
 				...model,
+				download_progress: job ?? model.download_progress,
 				local_path: model.local_path ?? job?.local_path ?? null,
-				target_dir: model.target_dir ?? job?.target_dir,
-				download_progress: job ?? model.download_progress
+				target_dir: model.target_dir ?? job?.target_dir
 			};
 			const result = await FitAdvisorService.configure(enrichedModel, loadNow);
+
 			message = result.loaded
 				? `Configured and loading ${result.model}.`
 				: `Configured ${result.model} in ${result.models_preset}.`;
@@ -236,35 +252,45 @@
 
 	function fmtGb(value: number | undefined, digits = 1): string {
 		if (typeof value !== 'number' || !Number.isFinite(value)) return 'n/a';
+
 		return value.toFixed(digits) + ' GB';
 	}
 
 	function fmtNum(value: number | undefined, digits = 1): string {
 		if (typeof value !== 'number' || !Number.isFinite(value)) return 'n/a';
+
 		return value.toFixed(digits);
 	}
 
 	function fmtBytes(value: number | undefined): string {
 		if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return 'n/a';
+
 		const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+
 		let scaled = value;
 		let index = 0;
+
 		while (scaled >= 1024 && index < units.length - 1) {
 			scaled /= 1024;
 			index += 1;
 		}
+
 		return `${scaled.toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
 	}
 
 	function fmtSpeed(value: number | undefined): string {
 		if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return 'idle';
+
 		return `${fmtBytes(value)}/s`;
 	}
 
 	function fitClass(level: string): string {
 		if (level === 'perfect') return 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30';
+
 		if (level === 'good') return 'bg-cyan-500/15 text-cyan-300 border-cyan-500/30';
+
 		if (level === 'marginal') return 'bg-amber-500/15 text-amber-300 border-amber-500/30';
+
 		return 'bg-red-500/15 text-red-300 border-red-500/30';
 	}
 
@@ -280,6 +306,7 @@
 				null
 			);
 		}
+
 		return downloadJobs.find((job) => job.model_id === model.id) ?? model.download_progress ?? null;
 	}
 
@@ -289,27 +316,38 @@
 
 	function statusFor(model: FitAdvisorModel): string {
 		if (model.configured || model.installed) return 'configured';
+
 		const job = downloadJobFor(model);
+
 		if (job) {
 			if (isActiveDownloadStatus(job.status)) return job.status;
+
 			return job.status;
 		}
+
 		if (model.download_status) return model.download_status;
+
 		return model.downloaded ? 'downloaded' : 'available';
 	}
 
 	function statusClass(status: string): string {
 		if (status === 'configured') return 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30';
+
 		if (status === 'downloaded') return 'bg-cyan-500/15 text-cyan-300 border-cyan-500/30';
+
 		if (status === 'partial') return 'bg-amber-500/15 text-amber-300 border-amber-500/30';
+
 		if (status === 'downloading' || status === 'resolving' || status === 'queued')
 			return 'bg-amber-500/15 text-amber-300 border-amber-500/30';
+
 		if (status === 'failed') return 'bg-red-500/15 text-red-300 border-red-500/30';
+
 		return 'bg-muted text-muted-foreground border-border';
 	}
 
 	function canDownload(model: FitAdvisorModel): boolean {
 		const status = statusFor(model);
+
 		return (
 			Boolean(model.download) &&
 			!['queued', 'resolving', 'downloading', 'downloaded', 'configured'].includes(status)
@@ -318,28 +356,36 @@
 
 	function canFit(model: FitAdvisorModel): boolean {
 		const status = statusFor(model);
+
 		return status === 'downloaded' || status === 'configured';
 	}
 
 	function downloadButtonLabel(model: FitAdvisorModel): string {
 		if (!model.download) return 'No GGUF source';
+
 		const job = downloadJobFor(model);
+
 		if (job && isActiveDownloadStatus(job.status)) {
 			const progress =
 				typeof job.percent === 'number' && Number.isFinite(job.percent)
 					? ` ${Math.round(job.percent)}%`
 					: '';
+
 			if (job.status === 'queued') return 'Queued';
+
 			if (job.status === 'resolving') return 'Resolving';
+
 			return `Downloading${progress}`;
 		}
+
 		if (hasPendingDownload && statusFor(model) === 'available') return 'Queue DL';
+
 		return statusFor(model) === 'partial' ? 'Resume DL' : 'Download';
 	}
 </script>
 
 <svelte:head>
-	<title>Fit Advisor</title>
+	<title>Models - Fit Planner</title>
 </svelte:head>
 
 <main class="min-h-screen bg-background text-foreground">
@@ -348,30 +394,40 @@
 			<div>
 				<div class="flex items-center gap-2 text-sm text-muted-foreground">
 					<Gauge class="h-4 w-4" />
-					llmfit logic, native llama.cpp router
+					Local model catalog and fit planning
 				</div>
-				<h1 class="mt-1 text-2xl font-semibold tracking-normal">Fit Advisor</h1>
+
+				<div class="mt-1 flex items-center gap-3">
+					<h1 class="text-2xl font-semibold tracking-normal">Models</h1>
+
+					<span class="rounded-full border bg-muted/50 px-2 py-0.5 text-xs text-muted-foreground">
+						Fit Planner
+					</span>
+				</div>
+
 				<p class="mt-1 max-w-3xl text-sm text-muted-foreground">
 					{system?.vulkan_optimal_only
-						? 'Rank trusted Vulkan GGUF models for this Strix Halo using local memory and decode calibration.'
-						: 'Rank GGUF models against this machine, estimate memory and throughput, then download or write a router preset.'}
+						? 'Discover trusted Vulkan GGUF models for this Strix Halo, compare planning estimates with local measurements, then download or configure a model.'
+						: 'Discover GGUF models, compare planning estimates with local measurements, then download or configure a model.'}
 				</p>
 			</div>
+
 			<div class="flex flex-wrap gap-2">
 				<button
-					type="button"
 					class="inline-flex h-10 items-center gap-2 rounded-md border px-3 text-sm hover:bg-muted disabled:opacity-50"
 					disabled={isRefreshing || isLoading}
 					onclick={refreshCatalog}
+					type="button"
 				>
 					<RefreshCw class="h-4 w-4" />
 					Refresh Catalog
 				</button>
+
 				<button
-					type="button"
 					class="inline-flex h-10 items-center gap-2 rounded-md bg-primary px-3 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
 					disabled={isLoading}
 					onclick={() => loadModels(false)}
+					type="button"
 				>
 					<SlidersHorizontal class="h-4 w-4" />
 					Apply Filters
@@ -383,34 +439,64 @@
 			<section class="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
 				<div class="rounded-lg border bg-card p-3">
 					<div class="text-xs text-muted-foreground">CPU</div>
+
 					<div class="mt-1 truncate text-sm font-medium">{system.cpu_name}</div>
+
 					<div class="mt-1 text-xs text-muted-foreground">{system.cpu_cores} threads</div>
 				</div>
+
 				<div class="rounded-lg border bg-card p-3">
-					<div class="text-xs text-muted-foreground">{system.unified_memory ? 'System RAM (shared)' : 'RAM'}</div>
-					<div class="mt-1 text-sm font-medium">{fmtGb(system.fit_ram_capacity_gb ?? system.total_ram_gb)} total</div>
-					<div class="mt-1 text-xs text-muted-foreground">{fmtGb(system.available_ram_gb)} currently free</div>
+					<div class="text-xs text-muted-foreground">
+						{system.unified_memory ? 'System RAM (shared)' : 'RAM'}
+					</div>
+
+					<div class="mt-1 text-sm font-medium">
+						{fmtGb(system.fit_ram_capacity_gb ?? system.total_ram_gb)} total
+					</div>
+
+					<div class="mt-1 text-xs text-muted-foreground">
+						{fmtGb(system.available_ram_gb)} currently free
+					</div>
 				</div>
+
 				<div class="rounded-lg border bg-card p-3">
 					<div class="text-xs text-muted-foreground">GPU</div>
-					<div class="mt-1 truncate text-sm font-medium">{system.gpu_name || 'No GPU detected'}</div>
+
+					<div class="mt-1 truncate text-sm font-medium">
+						{system.gpu_name || 'No GPU detected'}
+					</div>
+
 					<div class="mt-1 text-xs text-muted-foreground">
 						{system.backend}{system.unified_memory ? ' / unified memory' : ''}
-						{system.calibrated_decode_bandwidth_gbps ? ` / ${fmtNum(system.calibrated_decode_bandwidth_gbps, 0)} GB/s calibrated` : ''}
+						{system.calibrated_decode_bandwidth_gbps
+							? ` / ${fmtNum(system.calibrated_decode_bandwidth_gbps, 0)} GB/s calibrated`
+							: ''}
 					</div>
 				</div>
+
 				<div class="rounded-lg border bg-card p-3">
-					<div class="text-xs text-muted-foreground">{system.unified_memory ? 'Vulkan UMA Pool' : 'VRAM Per GPU'}</div>
+					<div class="text-xs text-muted-foreground">
+						{system.unified_memory ? 'Vulkan UMA Pool' : 'VRAM Per GPU'}
+					</div>
+
 					<div class="mt-1 text-sm font-medium">{fmtGb(system.gpu_vram_gb)}</div>
+
 					<div class="mt-1 text-xs text-muted-foreground">
-						{system.unified_memory ? `${fmtGb(primaryGpu?.available_vram_gb)} currently free` : `${system.gpu_count} GPU(s)`}
+						{system.unified_memory
+							? `${fmtGb(primaryGpu?.available_vram_gb)} currently free`
+							: `${system.gpu_count} GPU(s)`}
 					</div>
 				</div>
+
 				<div class="rounded-lg border bg-card p-3">
-					<div class="text-xs text-muted-foreground">{system.unified_memory ? 'amdgpu Memory Model' : 'Aggregate VRAM'}</div>
+					<div class="text-xs text-muted-foreground">
+						{system.unified_memory ? 'amdgpu Memory Model' : 'Aggregate VRAM'}
+					</div>
+
 					<div class="mt-1 text-sm font-medium">
 						{system.unified_memory ? 'Shared CPU / GPU' : fmtGb(system.total_gpu_vram_gb)}
 					</div>
+
 					<div class="mt-1 text-xs text-muted-foreground">
 						{system.unified_memory
 							? `${fmtGb(primaryGpu?.local_vram_gb)} local + ${fmtGb(primaryGpu?.gtt_gb)} GTT`
@@ -421,138 +507,217 @@
 		{/if}
 
 		<section class="rounded-lg border bg-card p-3">
+			<div
+				class="mb-3 flex flex-wrap items-center gap-x-5 gap-y-2 border-b pb-3 text-xs text-muted-foreground"
+			>
+				<div class="flex items-center gap-2">
+					<span
+						class="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2 py-0.5 text-emerald-300"
+					>
+						Measured
+					</span>
+
+					<span>Observed by a local benchmark on this machine.</span>
+				</div>
+
+				<div class="flex items-center gap-2">
+					<span
+						class="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-amber-300"
+					>
+						Estimated
+					</span>
+
+					<span>Projected from hardware and model metadata; validate before relying on it.</span>
+				</div>
+
+				<div>Capability prior is an estimate, not a task-quality benchmark.</div>
+			</div>
+
 			<div class="grid gap-3 md:grid-cols-2 xl:grid-cols-5 2xl:grid-cols-9">
 				<label class="text-sm">
 					<span class="text-xs text-muted-foreground">Use Case</span>
+
 					<select
-						class="mt-1 h-10 w-full rounded-md border bg-background px-2"
 						bind:value={useCase}
+						class="mt-1 h-10 w-full rounded-md border bg-background px-2"
 					>
 						<option value="all">All</option>
+
 						<option value="coding">Coding</option>
+
 						<option value="reasoning">Reasoning</option>
+
 						<option value="chat">Chat</option>
+
 						<option value="general">General</option>
+
 						<option value="multimodal">Multimodal</option>
 					</select>
 				</label>
+
 				<label class="text-sm">
 					<span class="text-xs text-muted-foreground">Topology</span>
-					<select class="mt-1 h-10 w-full rounded-md border bg-background px-2" bind:value={topology}>
+
+					<select
+						bind:value={topology}
+						class="mt-1 h-10 w-full rounded-md border bg-background px-2"
+					>
 						<option value="all">Dense + MoE</option>
+
 						<option value="dense">Dense only</option>
+
 						<option value="moe">MoE only</option>
 					</select>
 				</label>
+
 				<label class="text-sm">
-					<span class="text-xs text-muted-foreground">Minimum Fit</span>
-					<select class="mt-1 h-10 w-full rounded-md border bg-background px-2" bind:value={minFit}>
+					<span class="text-xs text-muted-foreground">Minimum Estimated Fit</span>
+
+					<select bind:value={minFit} class="mt-1 h-10 w-full rounded-md border bg-background px-2">
 						<option value="perfect">Perfect</option>
+
 						<option value="good">Good</option>
+
 						<option value="marginal">Marginal</option>
+
 						<option value="too_tight">Too Tight</option>
 					</select>
 				</label>
+
 				<label class="text-sm">
-					<span class="text-xs text-muted-foreground">Minimum tok/s</span>
-					<input bind:value={minTps} class="mt-1 h-10 w-full rounded-md border bg-background px-2" max="200" min="0" step="1" type="number" />
+					<span class="text-xs text-muted-foreground">Minimum Planned tok/s</span>
+
+					<input
+						bind:value={minTps}
+						class="mt-1 h-10 w-full rounded-md border bg-background px-2"
+						max="200"
+						min="0"
+						step="1"
+						type="number"
+					/>
 				</label>
+
 				<label class="text-sm">
 					<span class="text-xs text-muted-foreground">Quant</span>
+
 					<input
+						bind:value={quant}
 						class="mt-1 h-10 w-full rounded-md border bg-background px-2"
 						placeholder="Q4, Q8, IQ..."
-						bind:value={quant}
 					/>
 				</label>
+
 				<label class="text-sm">
 					<span class="text-xs text-muted-foreground">Search</span>
+
 					<input
+						bind:value={search}
 						class="mt-1 h-10 w-full rounded-md border bg-background px-2"
 						placeholder="qwen, coder..."
-						bind:value={search}
 					/>
 				</label>
+
 				<label class="text-sm">
 					<span class="text-xs text-muted-foreground">Context</span>
+
 					<select
-						class="mt-1 h-10 w-full rounded-md border bg-background px-2"
 						bind:value={context}
+						class="mt-1 h-10 w-full rounded-md border bg-background px-2"
 					>
 						{#each contextOptions as option (option.value)}
 							<option value={option.value}>{option.label}</option>
 						{/each}
 					</select>
 				</label>
+
 				<label class="text-sm">
 					<span class="text-xs text-muted-foreground">Limit</span>
+
 					<input
-						class="mt-1 h-10 w-full rounded-md border bg-background px-2"
-						type="number"
-						min="10"
-						max="2000"
-						step="10"
 						bind:value={limit}
+						class="mt-1 h-10 w-full rounded-md border bg-background px-2"
+						max="2000"
+						min="10"
+						step="10"
+						type="number"
 					/>
 				</label>
+
 				{#if system?.vulkan_optimal_only}
-					<div class="flex items-end pb-2 text-xs text-muted-foreground">Trusted Vulkan GGUF only</div>
+					<div class="flex items-end pb-2 text-xs text-muted-foreground">
+						Trusted Vulkan GGUF only
+					</div>
 				{:else}
 					<label class="flex items-end gap-2 pb-2 text-sm">
 						<input bind:checked={includeTooTight} class="h-4 w-4" type="checkbox" />
+
 						<span>Show too tight</span>
 					</label>
 				{/if}
 			</div>
-			<div class="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
+
+			<div
+				class="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground"
+			>
 				{#if system?.vulkan_optimal_only}
 					<div class="flex items-center gap-2">
-						<span class="rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-emerald-300">Strix Halo Vulkan / full UMA offload</span>
+						<span
+							class="rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-emerald-300"
+							>Strix Halo Vulkan / full UMA offload</span
+						>
 					</div>
 				{:else}
 					<div class="flex flex-wrap gap-2">
-					<button
-						type="button"
-						class={strategy === 'balanced'
-							? 'h-9 rounded-md bg-primary px-3 text-xs text-primary-foreground'
-							: 'h-9 rounded-md border px-3 text-xs hover:bg-muted'}
-						onclick={() => (strategy = 'balanced')}
-					>
-						Balanced
-					</button>
-					<button
-						type="button"
-						class={strategy === 'multi_gpu'
-							? 'h-9 rounded-md bg-primary px-3 text-xs text-primary-foreground'
-							: 'h-9 rounded-md border px-3 text-xs hover:bg-muted'}
-						onclick={() => (strategy = 'multi_gpu')}
-					>
-						MultiGPU
-					</button>
-					<button
-						type="button"
-						class={strategy === 'moe_offload'
-							? 'h-9 rounded-md bg-primary px-3 text-xs text-primary-foreground'
-							: 'h-9 rounded-md border px-3 text-xs hover:bg-muted'}
-						onclick={() => (strategy = 'moe_offload')}
-					>
-						MoE offload
-					</button>
-					<button
-						type="button"
-						class={strategy === 'hybrid_offload'
-							? 'h-9 rounded-md bg-primary px-3 text-xs text-primary-foreground'
-							: 'h-9 rounded-md border px-3 text-xs hover:bg-muted'}
-						onclick={() => (strategy = 'hybrid_offload')}
-					>
-						Hybrid offload
-					</button>
+						<button
+							class={strategy === 'balanced'
+								? 'h-9 rounded-md bg-primary px-3 text-xs text-primary-foreground'
+								: 'h-9 rounded-md border px-3 text-xs hover:bg-muted'}
+							onclick={() => (strategy = 'balanced')}
+							type="button"
+						>
+							Balanced
+						</button>
+
+						<button
+							class={strategy === 'multi_gpu'
+								? 'h-9 rounded-md bg-primary px-3 text-xs text-primary-foreground'
+								: 'h-9 rounded-md border px-3 text-xs hover:bg-muted'}
+							onclick={() => (strategy = 'multi_gpu')}
+							type="button"
+						>
+							MultiGPU
+						</button>
+
+						<button
+							class={strategy === 'moe_offload'
+								? 'h-9 rounded-md bg-primary px-3 text-xs text-primary-foreground'
+								: 'h-9 rounded-md border px-3 text-xs hover:bg-muted'}
+							onclick={() => (strategy = 'moe_offload')}
+							type="button"
+						>
+							MoE offload
+						</button>
+
+						<button
+							class={strategy === 'hybrid_offload'
+								? 'h-9 rounded-md bg-primary px-3 text-xs text-primary-foreground'
+								: 'h-9 rounded-md border px-3 text-xs hover:bg-muted'}
+							onclick={() => (strategy = 'hybrid_offload')}
+							type="button"
+						>
+							Hybrid offload
+						</button>
 					</div>
 				{/if}
+
 				{#if system?.unified_memory}
-					<div>Single-stream decode at selected context; estimates are calibrated locally and remote Thunderbolt nodes remain separate.</div>
+					<div>
+						Single-stream decode at selected context; estimates are calibrated locally and remote
+						Thunderbolt nodes remain separate.
+					</div>
 				{/if}
 			</div>
+
 			<div
 				class="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground"
 			>
@@ -562,8 +727,9 @@
 							'not updated yet'} · {catalog.cache_path}
 					{/if}
 				</div>
+
 				<label class="flex items-center gap-2">
-					<input type="checkbox" class="h-4 w-4" bind:checked={loadNow} />
+					<input bind:checked={loadNow} class="h-4 w-4" type="checkbox" />
 					Load immediately after configure
 				</label>
 			</div>
@@ -580,25 +746,35 @@
 		<section class="grid min-h-[560px] gap-4 xl:grid-cols-[minmax(0,1fr)_420px]">
 			<div class="overflow-hidden rounded-lg border bg-card">
 				<div class="flex items-center justify-between border-b px-3 py-2">
-					<div class="text-sm font-medium">Recommendations</div>
+					<div class="text-sm font-medium">Model Plans</div>
+
 					<div class="text-xs text-muted-foreground">
 						{isLoading ? 'Loading...' : `${models.length} visible`}
 					</div>
 				</div>
+
 				<div class="max-h-[70vh] overflow-auto">
 					<table class="w-full text-left text-sm">
 						<thead class="sticky top-0 bg-muted text-xs text-muted-foreground">
 							<tr>
-								<th class="px-3 py-2">Fit</th>
-								<th class="px-3 py-2">Score</th>
+								<th class="px-3 py-2">Est. Fit</th>
+
+								<th class="px-3 py-2">Est. Plan Score</th>
+
 								<th class="min-w-[300px] px-3 py-2">Model</th>
+
 								<th class="px-3 py-2">Quant</th>
-								<th class="px-3 py-2">Mem</th>
+
+								<th class="px-3 py-2">Est. Memory</th>
+
 								<th class="px-3 py-2">Decode tok/s</th>
+
 								<th class="px-3 py-2">Ctx</th>
+
 								<th class="px-3 py-2">State</th>
 							</tr>
 						</thead>
+
 						<tbody>
 							{#each models as model (model.id + model.quant)}
 								{@const status = statusFor(model)}
@@ -616,39 +792,68 @@
 											>{model.fit_level}</span
 										>
 									</td>
+
 									<td class="px-3 py-2 font-medium">{fmtNum(model.score)}</td>
+
 									<td class="px-3 py-2">
-						<div class="font-medium" title={normalizeModelName(model.name)}>
-							{compactModelName(model.name)}
+										<div class="font-medium" title={normalizeModelName(model.name)}>
+											{compactModelName(model.name)}
 										</div>
+
 										<div class="truncate text-xs text-muted-foreground">
 											{normalizeModelName(model.name)}
 										</div>
+
 										<div class="mt-1 flex flex-wrap gap-1">
 											{#each uniqueModelTags([model.provider, ...(model.tags ?? [])], 6) as tag (tag)}
 												<span
 													class="rounded-full border px-1.5 py-0.5 text-[10px] text-muted-foreground"
 													>{tag}</span
 												>
-							{/each}
-						</div>
-						<div class="text-xs text-muted-foreground">{model.is_moe ? 'MoE' : 'Dense'} · {fmtNum(model.params_b, 1)}B{model.active_params_b ? ` / ${fmtNum(model.active_params_b, 1)}B active` : ''}</div>
-									</td>
-									<td class="px-3 py-2">{model.quant}</td>
-									<td class="px-3 py-2">{fmtGb(model.memory_required_gb)}</td>
-									<td class="px-3 py-2">
-										<div class="font-medium">{fmtNum(model.estimated_tps)}</div>
-										<div class="whitespace-nowrap text-[11px] text-muted-foreground">
-											{model.throughput_measured ? 'measured' : `${fmtNum(model.estimated_tps_low)}-${fmtNum(model.estimated_tps_high)}`}
+											{/each}
+										</div>
+
+										<div class="text-xs text-muted-foreground">
+											{model.is_moe ? 'MoE' : 'Dense'} - {fmtNum(
+												model.params_b,
+												1
+											)}B{model.active_params_b
+												? ` / ${fmtNum(model.active_params_b, 1)}B active`
+												: ''}
 										</div>
 									</td>
+
+									<td class="px-3 py-2">{model.quant}</td>
+
+									<td class="px-3 py-2">{fmtGb(model.memory_required_gb)}</td>
+
+									<td class="px-3 py-2">
+										<div class="font-medium">{fmtNum(model.estimated_tps)}</div>
+
+										<span
+											class={model.throughput_measured
+												? 'mt-1 inline-flex rounded-full border border-emerald-500/30 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] text-emerald-300'
+												: 'mt-1 inline-flex rounded-full border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-[10px] text-amber-300'}
+										>
+											{model.throughput_measured ? 'Measured' : 'Estimated'}
+										</span>
+
+										{#if !model.throughput_measured}
+											<div class="mt-1 whitespace-nowrap text-[11px] text-muted-foreground">
+												Range {fmtNum(model.estimated_tps_low)}-{fmtNum(model.estimated_tps_high)}
+											</div>
+										{/if}
+									</td>
+
 									<td class="px-3 py-2">{model.effective_context_length.toLocaleString()}</td>
+
 									<td class="px-3 py-2">
 										<div class="flex min-w-32 flex-col gap-1">
 											<span
 												class="w-fit rounded-full border px-2 py-0.5 text-xs {statusClass(status)}"
 												>{status}</span
 											>
+
 											{#if job && (status === 'queued' || status === 'resolving' || status === 'downloading')}
 												<div class="h-1.5 w-28 overflow-hidden rounded-full bg-muted">
 													<div
@@ -663,9 +868,10 @@
 							{/each}
 						</tbody>
 					</table>
+
 					{#if !isLoading && models.length === 0}
 						<div class="p-8 text-center text-sm text-muted-foreground">
-							No model matches the current filters.
+							No model plan matches the current filters.
 						</div>
 					{/if}
 				</div>
@@ -673,11 +879,13 @@
 
 			<aside class="rounded-lg border bg-card">
 				<div class="border-b px-4 py-3">
-					<div class="text-sm font-medium">Plan Details</div>
+					<div class="text-sm font-medium">Fit Plan Details</div>
+
 					<div class="text-xs text-muted-foreground">
-						Memory estimates are advisory, not a replacement for a real bench.
+						Planning values are advisory. Measured values are marked explicitly.
 					</div>
 				</div>
+
 				{#if selectedModel}
 					{@const selectedJob = downloadJobFor(selectedModel)}
 					{@const selectedStatus = statusFor(selectedModel)}
@@ -686,9 +894,11 @@
 							<div class="text-lg font-semibold" title={normalizeModelName(selectedModel.name)}>
 								{compactModelName(selectedModel.name)}
 							</div>
+
 							<div class="break-all text-xs text-muted-foreground">
 								{normalizeModelName(selectedModel.name)}
 							</div>
+
 							<div class="mt-2 flex flex-wrap gap-1">
 								{#each uniqueModelTags( [selectedModel.provider, ...(selectedModel.tags ?? [])] ) as tag (tag)}
 									<span class="rounded-full border px-2 py-0.5 text-xs text-muted-foreground"
@@ -697,85 +907,133 @@
 								{/each}
 							</div>
 						</div>
+
 						<div class="grid grid-cols-2 gap-2 text-sm">
 							<div class="rounded-md border p-2">
-								<div class="text-xs text-muted-foreground">Fit</div>
+								<div class="text-xs text-muted-foreground">Fit (estimated)</div>
+
 								<div class="mt-1 font-medium">{selectedModel.fit_level}</div>
 							</div>
+
 							<div class="rounded-md border p-2">
-								<div class="text-xs text-muted-foreground">Mode</div>
+								<div class="text-xs text-muted-foreground">Offload Plan (estimated)</div>
+
 								<div class="mt-1 font-medium">{selectedModel.gpu_mode}</div>
 							</div>
+
 							<div class="rounded-md border p-2">
 								<div class="text-xs text-muted-foreground">Decode tok/s</div>
-								<div class="mt-1 font-medium">{fmtNum(selectedModel.estimated_tps)} {selectedModel.throughput_measured ? 'measured' : 'estimated'}</div>
+
+								<div class="mt-1 font-medium">{fmtNum(selectedModel.estimated_tps)}</div>
+
+								<span
+									class={selectedModel.throughput_measured
+										? 'mt-1 inline-flex rounded-full border border-emerald-500/30 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] text-emerald-300'
+										: 'mt-1 inline-flex rounded-full border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-[10px] text-amber-300'}
+								>
+									{selectedModel.throughput_measured ? 'Measured' : 'Estimated'}
+								</span>
 							</div>
+
 							<div class="rounded-md border p-2">
-								<div class="text-xs text-muted-foreground">Range / Context</div>
+								<div class="text-xs text-muted-foreground">
+									Planning Range / Context (estimated)
+								</div>
+
 								<div class="mt-1 font-medium">
-									{fmtNum(selectedModel.estimated_tps_low)}-{fmtNum(selectedModel.estimated_tps_high)} @ {selectedModel.estimate_context_length?.toLocaleString() ?? 'n/a'}
+									{fmtNum(selectedModel.estimated_tps_low)}-{fmtNum(
+										selectedModel.estimated_tps_high
+									)} @ {selectedModel.estimate_context_length?.toLocaleString() ?? 'n/a'}
 								</div>
 							</div>
+
 							<div class="rounded-md border p-2">
-								<div class="text-xs text-muted-foreground">Score</div>
+								<div class="text-xs text-muted-foreground">Plan Score (estimated)</div>
+
 								<div class="mt-1 font-medium">{fmtNum(selectedModel.score)}</div>
 							</div>
+
 							<div class="rounded-md border p-2">
-								<div class="text-xs text-muted-foreground">Context Score</div>
+								<div class="text-xs text-muted-foreground">Context Fit (estimated)</div>
+
 								<div class="mt-1 font-medium">{fmtNum(selectedModel.score_components.context)}</div>
 							</div>
+
 							<div class="rounded-md border p-2">
-								<div class="text-xs text-muted-foreground">Weights</div>
+								<div class="text-xs text-muted-foreground">Weight Memory (estimated)</div>
+
 								<div class="mt-1 font-medium">{fmtGb(selectedModel.weights_gb)}</div>
 							</div>
+
 							<div class="rounded-md border p-2">
-								<div class="text-xs text-muted-foreground">KV q8_0</div>
+								<div class="text-xs text-muted-foreground">KV q8_0 Memory (estimated)</div>
+
 								<div class="mt-1 font-medium">{fmtGb(selectedModel.kv_cache_gb)}</div>
 							</div>
+
 							<div class="rounded-md border p-2">
-								<div class="text-xs text-muted-foreground">Required</div>
+								<div class="text-xs text-muted-foreground">Required Memory (estimated)</div>
+
 								<div class="mt-1 font-medium">{fmtGb(selectedModel.memory_required_gb)}</div>
 							</div>
+
 							<div class="rounded-md border p-2">
-								<div class="text-xs text-muted-foreground">Fit Pool</div>
+								<div class="text-xs text-muted-foreground">Planner Memory Budget</div>
+
 								<div class="mt-1 font-medium">{fmtGb(selectedModel.memory_available_gb)}</div>
 							</div>
+
 							{#if selectedModel.ram_available_now_gb && selectedModel.ram_capacity_gb && selectedModel.memory_available_gb === selectedModel.ram_capacity_gb}
 								<div class="rounded-md border p-2">
-									<div class="text-xs text-muted-foreground">Free RAM Now</div>
+									<div class="text-xs text-muted-foreground">Free RAM Now (live)</div>
+
 									<div class="mt-1 font-medium">{fmtGb(selectedModel.ram_available_now_gb)}</div>
 								</div>
 							{/if}
+
 							{#if selectedModel.full_memory_required_gb && selectedModel.full_memory_required_gb > selectedModel.memory_required_gb + 0.1}
 								<div class="rounded-md border p-2">
-									<div class="text-xs text-muted-foreground">Full model</div>
+									<div class="text-xs text-muted-foreground">Full Model Memory (estimated)</div>
+
 									<div class="mt-1 font-medium">{fmtGb(selectedModel.full_memory_required_gb)}</div>
 								</div>
 							{/if}
+
 							{#if selectedModel.moe_offloaded_gb && selectedModel.moe_offloaded_gb > 0}
 								<div class="rounded-md border p-2">
-									<div class="text-xs text-muted-foreground">MoE RAM offload</div>
+									<div class="text-xs text-muted-foreground">MoE RAM Offload (estimated)</div>
+
 									<div class="mt-1 font-medium">{fmtGb(selectedModel.moe_offloaded_gb)}</div>
 								</div>
 							{/if}
+
 							<div class="rounded-md border p-2">
-								<div class="text-xs text-muted-foreground">Quality / Speed</div>
-								<div class="mt-1 font-medium">
-									{fmtNum(selectedModel.score_components.quality)} / {fmtNum(
-										selectedModel.score_components.speed
-									)}
-								</div>
+								<div class="text-xs text-muted-foreground">Capability Prior (estimated)</div>
+
+								<div class="mt-1 font-medium">{fmtNum(selectedModel.score_components.quality)}</div>
 							</div>
+
 							<div class="rounded-md border p-2">
-								<div class="text-xs text-muted-foreground">Fit Score</div>
+								<div class="text-xs text-muted-foreground">Speed Score (estimated)</div>
+
+								<div class="mt-1 font-medium">{fmtNum(selectedModel.score_components.speed)}</div>
+							</div>
+
+							<div class="rounded-md border p-2">
+								<div class="text-xs text-muted-foreground">Fit Score (estimated)</div>
+
 								<div class="mt-1 font-medium">{fmtNum(selectedModel.score_components.fit)}</div>
 							</div>
+
 							<div class="rounded-md border p-2">
 								<div class="text-xs text-muted-foreground">State</div>
+
 								<div class="mt-1 font-medium">{selectedStatus}</div>
 							</div>
+
 							<div class="rounded-md border p-2">
 								<div class="text-xs text-muted-foreground">Target</div>
+
 								<div class="mt-1 truncate font-medium">
 									{selectedModel.target_dir ||
 										selectedModel.download?.target_dir ||
@@ -784,9 +1042,15 @@
 								</div>
 							</div>
 						</div>
+
 						{#if selectedModel.estimate_basis}
-							<div class="rounded-md border border-cyan-500/20 bg-cyan-500/5 p-3 text-xs text-muted-foreground">
-								{selectedModel.estimate_basis}. Tok/s is single-stream decode at the selected context; prompt processing is a separate metric.
+							<div
+								class="rounded-md border border-cyan-500/20 bg-cyan-500/5 p-3 text-xs text-muted-foreground"
+							>
+								{selectedModel.estimate_basis}. The decode value is {selectedModel.throughput_measured
+									? 'measured locally'
+									: 'estimated'} for a single stream at the selected context. Prompt processing is a separate
+								metric.
 							</div>
 						{/if}
 
@@ -796,14 +1060,17 @@
 									class="mb-2 flex items-center justify-between gap-3 text-xs text-muted-foreground"
 								>
 									<span>Download Progress</span>
+
 									<span>{fmtSpeed(selectedJob.speed_bps)}</span>
 								</div>
+
 								<div class="h-2 overflow-hidden rounded-full bg-muted">
 									<div
 										class="h-full bg-primary transition-[width]"
 										style={`width: ${Math.max(selectedJob.percent > 0 ? 1 : 0, Math.min(100, selectedJob.percent || 0))}%`}
 									></div>
 								</div>
+
 								<div
 									class="mt-2 flex flex-wrap justify-between gap-2 text-xs text-muted-foreground"
 								>
@@ -812,13 +1079,16 @@
 											selectedJob.total_bytes
 										)}</span
 									>
+
 									<span>{fmtNum(selectedJob.percent, 1)}%</span>
 								</div>
+
 								{#if selectedJob.local_path}
 									<div class="mt-2 break-all text-xs text-muted-foreground">
 										{selectedJob.local_path}
 									</div>
 								{/if}
+
 								{#if selectedJob.error}
 									<div
 										class="mt-2 rounded border border-red-500/30 bg-red-500/10 p-2 text-xs text-red-200"
@@ -831,6 +1101,7 @@
 
 						<div>
 							<div class="mb-2 text-xs font-medium uppercase text-muted-foreground">Notes</div>
+
 							<ul class="space-y-1 text-sm text-muted-foreground">
 								{#each selectedModel.notes as note, index (`${index}-${note}`)}
 									<li>{note}</li>
@@ -842,6 +1113,7 @@
 							<div class="mb-2 text-xs font-medium uppercase text-muted-foreground">
 								Recommended Command Args
 							</div>
+
 							<pre
 								class="max-h-48 overflow-auto rounded-md bg-muted p-3 text-xs leading-relaxed whitespace-pre-wrap">{argsText(
 									selectedModel
@@ -850,28 +1122,29 @@
 
 						<div class="flex flex-wrap gap-2">
 							<button
-								type="button"
 								class="inline-flex h-10 items-center gap-2 rounded-md border px-3 text-sm hover:bg-muted disabled:opacity-50"
 								disabled={!canDownload(selectedModel) || isDownloading}
 								onclick={() => downloadModel(selectedModel!)}
+								type="button"
 							>
 								<Download class="h-4 w-4" />
 								{downloadButtonLabel(selectedModel)}
 							</button>
+
 							<button
-								type="button"
 								class="inline-flex h-10 items-center gap-2 rounded-md bg-primary px-3 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
 								disabled={isConfiguring || !canFit(selectedModel)}
 								onclick={() => configureModel(selectedModel!)}
+								type="button"
 							>
 								<Zap class="h-4 w-4" />
-								FIT
+								Configure
 							</button>
 						</div>
 					</div>
 				{:else}
 					<div class="p-8 text-sm text-muted-foreground">
-						Select a recommendation to inspect the launch plan.
+						Select a model plan to inspect its launch configuration.
 					</div>
 				{/if}
 			</aside>
