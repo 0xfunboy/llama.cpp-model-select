@@ -7,13 +7,63 @@ export interface CaliberModel {
 	name: string;
 	source: string;
 	status: string;
+	artifact_id?: string;
+	model_id?: string;
 	loadable?: boolean;
 	configured?: boolean;
+	configured_id?: string;
 	configured_ids?: string[];
+	benchmark_eligible?: boolean;
+	eligibility_reason?: string;
 	tags?: string[];
 	aliases?: string[];
 	path?: string | null;
 	plan_meta?: Record<string, unknown>;
+}
+
+function pathHasSegment(path: string, segment: string): boolean {
+	const parts = path.toLowerCase().replaceAll('\\', '/').split('/').filter(Boolean);
+
+	return parts.includes(segment.toLowerCase());
+}
+
+export function isCaliberBenchmarkEligible(model: CaliberModel): boolean {
+	if (typeof model.benchmark_eligible === 'boolean') return model.benchmark_eligible;
+
+	const path = model.path ?? '';
+
+	if (pathHasSegment(path, 'media') || pathHasSegment(path, 'text_encoders')) return false;
+
+	const architecture = String(model.plan_meta?.gguf_architecture ?? '').toLowerCase();
+
+	if (
+		new Set([
+			'flux',
+			'hunyuan_video',
+			'lumina2',
+			'sd3',
+			'sdxl',
+			'stable_diffusion',
+			't5encoder',
+			'wan'
+		]).has(architecture)
+	)
+		return false;
+
+	const identity =
+		`${model.id} ${model.model_id ?? ''} ${path.split(/[\\/]/).at(-1) ?? ''}`.toLowerCase();
+
+	return ![
+		'fastwan',
+		'hunyuan-video',
+		'i2v',
+		'ltx-video',
+		't2v',
+		'ti2v',
+		'wan2',
+		'z-image',
+		'zimage'
+	].some((marker) => identity.includes(marker));
 }
 
 export interface CaliberModelsResponse {
@@ -99,6 +149,7 @@ export interface CaliberConfigureResponse {
 function parseSseBlock(block: string): CaliberSweepEvent | null {
 	let event = 'message';
 	let data = '';
+
 	for (const line of block.split('\n')) {
 		if (line.startsWith('event:')) {
 			event = line.slice(6).trim();
@@ -106,13 +157,28 @@ function parseSseBlock(block: string): CaliberSweepEvent | null {
 			data += line.slice(5).trim();
 		}
 	}
+
 	if (!data) return null;
-	return { event, data: JSON.parse(data) as CaliberSweepStatus & Record<string, unknown> };
+
+	return { data: JSON.parse(data) as CaliberSweepStatus & Record<string, unknown>, event };
 }
 
 export class CaliberAdvisorService {
-	static system(): Promise<Record<string, unknown>> {
-		return apiFetch<Record<string, unknown>>('/api/caliber-advisor/system', { authOnly: true });
+	static configure(payload: Record<string, unknown>): Promise<CaliberConfigureResponse> {
+		return apiPost<CaliberConfigureResponse, Record<string, unknown>>(
+			'/api/caliber-advisor/configure',
+			payload
+		);
+	}
+
+	static deleteReport(id: string): Promise<CaliberDeleteReportResponse> {
+		return apiFetch<CaliberDeleteReportResponse>(
+			`/api/caliber-advisor/reports/${encodeURIComponent(id)}`,
+			{
+				authOnly: true,
+				method: 'DELETE'
+			}
+		);
 	}
 
 	static models(reload = false): Promise<CaliberModelsResponse> {
@@ -129,18 +195,22 @@ export class CaliberAdvisorService {
 		);
 	}
 
-	static sweep(payload: Record<string, unknown>): Promise<CaliberSweepResponse> {
-		return apiPost<CaliberSweepResponse, Record<string, unknown>>(
-			'/api/caliber-advisor/sweep',
-			payload
+	static report(id: string): Promise<Record<string, unknown>> {
+		return apiFetch<Record<string, unknown>>(
+			`/api/caliber-advisor/report?id=${encodeURIComponent(id)}`,
+			{ authOnly: true }
 		);
 	}
 
-	static sweepStatus(jobId?: string): Promise<CaliberSweepStatus> {
-		const suffix = jobId ? `?id=${encodeURIComponent(jobId)}` : '';
-		return apiFetch<CaliberSweepStatus>(`/api/caliber-advisor/sweep/status${suffix}`, {
-			authOnly: true
-		});
+	static reports(limit = 50, offset = 0): Promise<CaliberReportsResponse> {
+		return apiFetch<CaliberReportsResponse>(
+			`/api/caliber-advisor/reports?limit=${limit}&offset=${offset}`,
+			{ authOnly: true }
+		);
+	}
+
+	static results(): Promise<Record<string, unknown>> {
+		return apiFetch<Record<string, unknown>>('/api/caliber-advisor/results', { authOnly: true });
 	}
 
 	static stopSweep(jobId?: string): Promise<CaliberSweepStatus> {
@@ -157,7 +227,9 @@ export class CaliberAdvisorService {
 		since = 0
 	): Promise<void> {
 		const params = new URLSearchParams({ id: jobId });
+
 		if (since > 0) params.set('since', String(since));
+
 		const response = await fetch(base + `/api/caliber-advisor/sweep/events?${params.toString()}`, {
 			headers: getAuthHeaders(),
 			signal
@@ -168,62 +240,57 @@ export class CaliberAdvisorService {
 				'Caliber Advisor event stream failed: ' + response.status + ' ' + response.statusText
 			);
 		}
+
 		if (!response.body) throw new Error('Caliber Advisor event stream is empty');
 
 		const reader = response.body.getReader();
 		const decoder = new TextDecoder();
+
 		let buffer = '';
+
 		for (;;) {
 			const { done, value } = await reader.read();
+
 			if (done) break;
+
 			buffer += decoder.decode(value, { stream: true });
 			for (;;) {
 				const index = buffer.indexOf('\n\n');
+
 				if (index === -1) break;
+
 				const parsed = parseSseBlock(buffer.slice(0, index));
+
 				buffer = buffer.slice(index + 2);
+
 				if (parsed) onEvent(parsed);
 			}
 		}
 		const tail = buffer.trim();
+
 		if (tail) {
 			const parsed = parseSseBlock(tail);
+
 			if (parsed) onEvent(parsed);
 		}
 	}
 
-	static reports(limit = 50, offset = 0): Promise<CaliberReportsResponse> {
-		return apiFetch<CaliberReportsResponse>(
-			`/api/caliber-advisor/reports?limit=${limit}&offset=${offset}`,
-			{ authOnly: true }
-		);
-	}
-
-	static report(id: string): Promise<Record<string, unknown>> {
-		return apiFetch<Record<string, unknown>>(
-			`/api/caliber-advisor/report?id=${encodeURIComponent(id)}`,
-			{ authOnly: true }
-		);
-	}
-
-	static deleteReport(id: string): Promise<CaliberDeleteReportResponse> {
-		return apiFetch<CaliberDeleteReportResponse>(
-			`/api/caliber-advisor/reports/${encodeURIComponent(id)}`,
-			{
-				authOnly: true,
-				method: 'DELETE'
-			}
-		);
-	}
-
-	static results(): Promise<Record<string, unknown>> {
-		return apiFetch<Record<string, unknown>>('/api/caliber-advisor/results', { authOnly: true });
-	}
-
-	static configure(payload: Record<string, unknown>): Promise<CaliberConfigureResponse> {
-		return apiPost<CaliberConfigureResponse, Record<string, unknown>>(
-			'/api/caliber-advisor/configure',
+	static sweep(payload: Record<string, unknown>): Promise<CaliberSweepResponse> {
+		return apiPost<CaliberSweepResponse, Record<string, unknown>>(
+			'/api/caliber-advisor/sweep',
 			payload
 		);
+	}
+
+	static sweepStatus(jobId?: string): Promise<CaliberSweepStatus> {
+		const suffix = jobId ? `?id=${encodeURIComponent(jobId)}` : '';
+
+		return apiFetch<CaliberSweepStatus>(`/api/caliber-advisor/sweep/status${suffix}`, {
+			authOnly: true
+		});
+	}
+
+	static system(): Promise<Record<string, unknown>> {
+		return apiFetch<Record<string, unknown>>('/api/caliber-advisor/system', { authOnly: true });
 	}
 }

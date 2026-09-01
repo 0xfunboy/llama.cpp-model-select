@@ -1,6 +1,4 @@
 <script lang="ts">
-	import { onMount, tick } from 'svelte';
-	import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 	import {
 		Activity,
 		BarChart3,
@@ -13,19 +11,22 @@
 		X
 	} from '@lucide/svelte';
 	import {
-		Ds4Service,
 		type Ds4Event,
 		type Ds4JobSnapshot,
 		type Ds4Model,
 		type Ds4Report,
-		type Ds4ReportSummary
+		type Ds4ReportSummary,
+		Ds4Service
 	} from '$lib/services/ds4.service';
 	import { compactModelName, normalizeModelName, uniqueModelTags } from '$lib/utils/model-display';
+	import { onMount, tick } from 'svelte';
+	import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 
 	interface Props {
 		mode: 'eval' | 'bench';
 		embedded?: boolean;
 		initialModels?: string[];
+		initialReportId?: string;
 	}
 
 	interface EvalRow {
@@ -84,7 +85,7 @@
 		delta: number;
 	}
 
-	let { mode, embedded = false, initialModels = [] }: Props = $props();
+	let { embedded = false, initialModels = [], initialReportId = '', mode }: Props = $props();
 
 	const isEval = $derived(mode === 'eval');
 	const title = $derived(isEval ? 'Use-case Evaluator' : 'Context Benchmark');
@@ -102,6 +103,7 @@
 	let isResuming = $state(false);
 	let isStopping = $state(false);
 	let error = $state('');
+	let reportError = $state('');
 	let jobId = $state('');
 	let jobStatus = $state('idle');
 	let jobCurrent = $state(0);
@@ -121,6 +123,8 @@
 	let singleReportModel = $state('');
 	let raceModelA = $state('');
 	let raceModelB = $state('');
+	let appliedInitialModels = '';
+	let appliedInitialReportId = '';
 
 	let maxTokens = $state(2048);
 	let thinkingBudget = $state(1024);
@@ -154,12 +158,14 @@
 		if (activeReport?.kind === 'eval' && Array.isArray(activeReport.results)) {
 			return activeReport.results as EvalRow[];
 		}
+
 		return evalRows;
 	});
 	const displayBenchRows = $derived.by(() => {
 		if (activeReport?.kind === 'bench' && Array.isArray(activeReport.results)) {
 			return activeReport.results as BenchRow[];
 		}
+
 		return benchRows;
 	});
 	const evalModelErrors = $derived.by(() =>
@@ -188,61 +194,103 @@
 	);
 	const evalPass = $derived.by(() => {
 		if (activeReport?.kind === 'eval') return summaryNumber('pass');
+
 		return evalRows.filter((row) => row.pass).length;
 	});
 	const evalFail = $derived.by(() => {
 		if (activeReport?.kind === 'eval') return summaryNumber('fail');
+
 		return evalRows.filter((row) => row.pass === false).length;
 	});
 	const evalGuarded = $derived.by(() => {
 		if (activeReport?.kind === 'eval') return summaryNumber('guarded');
+
 		return evalRows.filter((row) => row.generation_status === 'guarded').length;
 	});
 	const evalTotal = $derived(Math.max(1, evalPass + evalFail));
 	const bestPromptTps = $derived.by(() => {
 		if (activeReport?.kind === 'bench') return summaryNumber('best_prompt_tokens_per_second');
+
 		return Math.max(0, ...benchRows.map((row) => num(row.prompt_tokens_per_second)));
 	});
 	const bestDecodeTps = $derived.by(() => {
 		if (activeReport?.kind === 'bench') return summaryNumber('best_decode_tokens_per_second');
+
 		return Math.max(0, ...benchRows.map((row) => num(row.decode_tokens_per_second)));
 	});
 	const canResumeSelectedReport = $derived.by(() => {
 		if (!activeReport || activeReport.kind !== mode || isRunning || otherActiveJob) return false;
+
 		return activeReport.resumable === true || activeReport.status === 'paused';
 	});
 	const canDeleteSelectedReport = $derived.by(() => {
 		if (!activeReport || activeReport.kind !== mode || isRunning) return false;
+
 		return activeReport.resumable === true || activeReport.status === 'paused';
 	});
+	const visibleError = $derived([error, reportError].filter(Boolean).join(' | '));
 
 	onMount(() => {
-		selectedModels = initialModels.length > 0 ? [...initialModels] : ['ALL'];
+		if (!embedded) selectedModels = initialModels.length > 0 ? [...initialModels] : ['ALL'];
+
 		void initialize();
+
 		return () => {
 			streamController?.abort();
 		};
 	});
 
 	$effect(() => {
+		if (!embedded || isRunning) return;
+
+		const available = new Set(
+			models.filter((model) => model.evaluator_eligible !== false).map((model) => model.id)
+		);
+		const requested = [...new Set(initialModels.filter(Boolean))].filter(
+			(id) => models.length === 0 || available.has(id)
+		);
+		const signature = JSON.stringify(requested);
+
+		if (signature === appliedInitialModels) return;
+
+		appliedInitialModels = signature;
+		selectedModels = requested;
+	});
+
+	$effect(() => {
+		if (!embedded || !initialReportId || initialReportId === appliedInitialReportId) return;
+
+		if (!reports.some((report) => report.id === initialReportId)) return;
+
+		appliedInitialReportId = initialReportId;
+		selectedReportId = initialReportId;
+		void loadReport(initialReportId);
+	});
+
+	$effect(() => {
 		const ids = reportModels;
+
 		if (ids.length === 0) {
 			singleReportModel = '';
 			raceModelA = '';
 			raceModelB = '';
 			reportMode = 'single';
+
 			return;
 		}
 
 		if (!ids.includes(singleReportModel)) {
 			singleReportModel = ids[0];
 		}
+
 		if (!ids.includes(raceModelA)) {
 			raceModelA = ids[0];
 		}
+
 		if (ids.length > 1 && (!ids.includes(raceModelB) || raceModelB === raceModelA)) {
 			raceModelB = ids.find((id) => id !== raceModelA) ?? ids[1];
 		}
+
 		if (ids.length < 2) {
 			raceModelB = '';
 			reportMode = 'single';
@@ -271,41 +319,57 @@
 	function ansiClass(codes: string): string {
 		const parts = codes.split(';');
 		const classes: string[] = [];
+
 		if (parts.includes('1')) classes.push('font-bold');
+
 		if (parts.includes('2')) classes.push('text-foreground/55');
+
 		if (parts.includes('31')) classes.push('text-red-400');
+
 		if (parts.includes('32')) classes.push('text-emerald-400');
+
 		if (parts.includes('33')) classes.push('text-yellow-300');
+
 		if (parts.includes('36')) classes.push('text-cyan-300');
+
 		return classes.join(' ');
 	}
 
 	function ansiToHtml(text: string): string {
 		let output = '';
 		let open = false;
+
 		const pattern = new RegExp(`${String.fromCharCode(27)}\\[([0-9;]*)m`, 'g');
+
 		let lastIndex = 0;
 		let match: RegExpExecArray | null;
 
 		while ((match = pattern.exec(text)) !== null) {
 			output += escapeHtml(text.slice(lastIndex, match.index));
+
 			if (open) {
 				output += '</span>';
 				open = false;
 			}
+
 			const codes = match[1] || '0';
+
 			if (codes !== '0') {
 				const klass = ansiClass(codes);
+
 				if (klass) {
 					output += '<span class="' + klass + '">';
 					open = true;
 				}
 			}
+
 			lastIndex = pattern.lastIndex;
 		}
 
 		output += escapeHtml(text.slice(lastIndex));
+
 		if (open) output += '</span>';
+
 		return output;
 	}
 
@@ -319,15 +383,19 @@
 
 	function formatDelta(value: number): string {
 		if (!Number.isFinite(value)) return '0%';
+
 		return (value > 0 ? '+' : '') + Math.round(value) + '%';
 	}
 
 	function uniqueModels(rows: EvalRow[]): string[] {
 		const seen = new SvelteSet<string>();
+
 		for (const row of rows) {
 			const model = String(row.model || '').trim();
+
 			if (model) seen.add(model);
 		}
+
 		return [...seen].sort((a, b) => a.localeCompare(b));
 	}
 
@@ -335,14 +403,18 @@
 		const source = String(row.source || '')
 			.trim()
 			.toLowerCase();
+
 		if (source === 'compsec') return ['Cybersecurity'];
 
 		const raw = String(row.domain || '').trim();
+
 		if (!raw) return ['General'];
+
 		const sectors = raw
 			.split(',')
 			.map((item) => item.trim())
 			.filter(Boolean);
+
 		return sectors.length > 0 ? sectors : ['General'];
 	}
 
@@ -357,16 +429,18 @@
 		const row =
 			map.get(key) ??
 			({
-				model,
-				sector,
-				pass: 0,
+				avg_tokens_per_second: 0,
 				fail: 0,
-				total: 0,
+				model,
+				pass: 0,
 				score: 0,
-				avg_tokens_per_second: 0
+				sector,
+				total: 0
 			} satisfies EvalSectorSummary);
+
 		if (pass) row.pass += 1;
 		else row.fail += 1;
+
 		row.total += 1;
 		row.avg_tokens_per_second += tokensPerSecond;
 		map.set(key, row);
@@ -375,16 +449,21 @@
 	function finalizeSummary<T extends EvalModelSummary>(row: T): T {
 		row.score = scorePercent(row.pass, row.total);
 		row.avg_tokens_per_second = row.total > 0 ? row.avg_tokens_per_second / row.total : 0;
+
 		return row;
 	}
 
 	function buildModelSummaries(rows: EvalRow[]): EvalModelSummary[] {
 		const byModel = new Map<string, EvalSectorSummary>();
+
 		for (const row of rows) {
 			const model = String(row.model || '').trim();
+
 			if (!model) continue;
+
 			addSummary(byModel, model, model, row.pass === true, num(row.tokens_per_second));
 		}
+
 		return [...byModel.values()]
 			.map(finalizeSummary)
 			.sort((a, b) => b.score - a.score || b.total - a.total || a.model.localeCompare(b.model));
@@ -392,9 +471,12 @@
 
 	function buildSectorSummaries(rows: EvalRow[]): EvalSectorSummary[] {
 		const bySector = new Map<string, EvalSectorSummary>();
+
 		for (const row of rows) {
 			const model = String(row.model || '').trim();
+
 			if (!model) continue;
+
 			for (const sector of sectorsForRow(row)) {
 				addSummary(
 					bySector,
@@ -406,6 +488,7 @@
 				);
 			}
 		}
+
 		return [...bySector.values()]
 			.map(finalizeSummary)
 			.sort((a, b) => a.sector.localeCompare(b.sector) || a.model.localeCompare(b.model));
@@ -417,20 +500,24 @@
 		rightModel: string
 	): EvalRaceSectorSummary[] {
 		if (!leftModel || !rightModel || leftModel === rightModel) return [];
+
 		const sectors = new SvelteSet<string>();
+
 		for (const row of rows) {
 			if (row.model === leftModel || row.model === rightModel) sectors.add(row.sector);
 		}
+
 		return [...sectors]
 			.sort((a, b) => a.localeCompare(b))
 			.map((sector) => {
 				const left = rows.find((row) => row.model === leftModel && row.sector === sector);
 				const right = rows.find((row) => row.model === rightModel && row.sector === sector);
+
 				return {
-					sector,
+					delta: (left?.score ?? 0) - (right?.score ?? 0),
 					left,
 					right,
-					delta: (left?.score ?? 0) - (right?.score ?? 0)
+					sector
 				};
 			});
 	}
@@ -444,11 +531,16 @@
 		for (const report of completedReports) {
 			if (report.kind !== 'eval' || report.status !== 'completed' || !Array.isArray(report.results))
 				continue;
+
 			const rowsByModel = new SvelteMap<string, EvalRow[]>();
+
 			for (const row of report.results as EvalRow[]) {
 				const model = String(row.model || '').trim();
+
 				if (!model) continue;
+
 				const rows = rowsByModel.get(model) ?? [];
+
 				rows.push(row);
 				rowsByModel.set(model, rows);
 			}
@@ -459,13 +551,14 @@
 				const score = total > 0 ? pass / total : 0;
 				const updated = String(report.updated_at || report.created_at || '');
 				const current = bestByModel.get(model);
+
 				if (
 					!current ||
 					score > current.score ||
 					(score === current.score && total > current.total) ||
 					(score === current.score && total === current.total && updated > current.updated)
 				) {
-					bestByModel.set(model, { score, total, updated, rows });
+					bestByModel.set(model, { rows, score, total, updated });
 				}
 			}
 		}
@@ -475,19 +568,23 @@
 
 	function basename(path?: string): string {
 		if (!path) return '';
+
 		const normalized = path.replaceAll('\\', '/');
+
 		return normalized.slice(normalized.lastIndexOf('/') + 1);
 	}
 
 	function modelLabel(model: Ds4Model): string {
 		if (model.id === 'ALL') return 'ALL models';
+
 		const file = basename(model.path);
 		const details = uniqueModelTags([
 			model.variant,
 			...(model.tags ?? []),
-			model.configured === false ? 'not selectable: configure in Library first' : '',
+			model.configured === false ? 'not selectable: configure in Models first' : '',
 			model.evaluated ? 'evaluated: select manually to retest' : 'not evaluated yet'
 		]);
+
 		return [normalizeModelName(model.name || model.model_id || model.id), file, ...details]
 			.filter(Boolean)
 			.join(' · ');
@@ -497,6 +594,7 @@
 		const model = models.find(
 			(item) => item.id === value || item.aliases?.includes(value) || item.model_id === value
 		);
+
 		return compactModelName(model?.name || model?.model_id || value);
 	}
 
@@ -509,6 +607,7 @@
 					: report.status
 						? '[' + report.status + '] '
 						: '';
+
 		return status + report.created_at + ' · ' + report.model_selector;
 	}
 
@@ -527,7 +626,9 @@
 
 	function normalizeSelection(): string[] {
 		if (selectedModels.includes('ALL')) return ['ALL'];
+
 		const available = new Set(models.map((model) => model.id));
+
 		return selectedModels.filter((id) => available.has(id));
 	}
 
@@ -537,13 +638,19 @@
 
 	function toggleModel(id: string) {
 		if (isRunning) return;
+
 		if (id === 'ALL') {
 			selectedModels = ['ALL'];
+
 			return;
 		}
+
 		const target = models.find((model) => model.id === id);
+
 		if (target?.evaluator_eligible === false) return;
+
 		const withoutAll = selectedModels.filter((value) => value !== 'ALL');
+
 		if (withoutAll.includes(id)) {
 			selectedModels = withoutAll.filter((value) => value !== id);
 		} else {
@@ -563,10 +670,12 @@
 		isLoadingModels = true;
 		try {
 			const response = await Ds4Service.listModels(reload);
+
 			models = response.data;
 			const available = new Set(
 				models.filter((model) => model.evaluator_eligible !== false).map((model) => model.id)
 			);
+
 			if (selectedModels.includes('ALL')) {
 				selectedModels = models
 					.filter(
@@ -576,7 +685,9 @@
 					.map((model) => model.id);
 			} else {
 				selectedModels = selectedModels.filter((id) => available.has(id));
-				if (selectedModels.length === 0 && available.has('ALL')) selectedModels = ['ALL'];
+
+				if (!embedded && selectedModels.length === 0 && available.has('ALL'))
+					selectedModels = ['ALL'];
 			}
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
@@ -588,14 +699,17 @@
 	async function refreshReports() {
 		try {
 			const response = await Ds4Service.listReports();
+
 			reports = response.data
 				.filter((report) => report.kind === mode)
 				.sort((a, b) => b.created_at.localeCompare(a.created_at));
 			await refreshArchiveReports();
-		} catch {
+			reportError = '';
+		} catch (e) {
 			reports = [];
 			archiveEvalRows = [];
 			archiveEvalReportCount = 0;
+			reportError = `DS4 reports: ${e instanceof Error ? e.message : String(e)}`;
 		}
 	}
 
@@ -603,8 +717,10 @@
 		if (!isEval) {
 			archiveEvalRows = [];
 			archiveEvalReportCount = 0;
+
 			return;
 		}
+
 		const completed = reports.filter(
 			(report) =>
 				report.kind === 'eval' && report.status === 'completed' && report.resumable !== true
@@ -619,6 +735,7 @@
 			})
 		);
 		const validReports = loaded.filter((report): report is Ds4Report => Boolean(report));
+
 		archiveEvalRows = bestEvalRowsFromReports(validReports);
 		archiveEvalReportCount = validReports.length;
 	}
@@ -629,13 +746,17 @@
 		jobCurrent = snapshot.current;
 		jobTotal = snapshot.total;
 		lastSeq = Math.max(lastSeq, (snapshot.next_seq ?? 1) - 1);
+
 		if (snapshot.error) error = snapshot.error;
+
 		if (snapshot.report && Object.keys(snapshot.report).length > 0) {
 			activeReport = snapshot.report;
+
 			if (Array.isArray(snapshot.report.models)) {
 				const reportModels = snapshot.report.models.filter(
 					(value): value is string => typeof value === 'string'
 				);
+
 				if (reportModels.length > 0) selectedModels = reportModels;
 			}
 		}
@@ -664,12 +785,15 @@
 		if (event.event === 'log' && typeof event.data.text === 'string') {
 			appendTerminal(event.data.text);
 		}
+
 		if (event.event === 'case') {
 			evalRows = [...evalRows, event.data as EvalRow].slice(-500);
 		}
+
 		if (event.event === 'bench-row') {
 			benchRows = [...benchRows, event.data as BenchRow].slice(-500);
 		}
+
 		if (event.event === 'done' && event.data.error) {
 			error = String(event.data.error);
 		}
@@ -679,18 +803,23 @@
 		isResuming = true;
 		try {
 			const active = await Ds4Service.getActiveJob(mode);
+
 			if (active.active && active.job) {
 				if (active.job.kind === mode) {
 					void attachJob(active.job.id, true, true);
 				} else {
 					otherActiveJob = active.job;
 				}
+
 				return;
 			}
 
 			const stored = localStorage.getItem(storageKey());
+
 			if (!stored) return;
+
 			const snapshot = await Ds4Service.getJob(stored);
+
 			if (snapshot.kind === mode && !snapshot.finished) {
 				void attachJob(snapshot.id, true, true);
 			} else {
@@ -706,17 +835,21 @@
 	async function attachJob(id: string, replay: boolean, resumed: boolean) {
 		streamController?.abort();
 		const controller = new AbortController();
+
 		streamController = controller;
 		isRunning = true;
 		otherActiveJob = null;
 		resetLiveState();
 		jobId = id;
 		localStorage.setItem(storageKey(), id);
+
 		if (resumed) appendTerminal('Resumed ' + title + ' job ' + id + '\n');
 
 		let finalSnapshot: Ds4JobSnapshot | null = null;
+
 		try {
 			const snapshot = await Ds4Service.getJob(id);
+
 			setSnapshot(snapshot);
 			await Ds4Service.streamJob(id, handleEvent, controller.signal, replay ? 0 : lastSeq);
 			finalSnapshot = await Ds4Service.getJob(id);
@@ -730,6 +863,7 @@
 		} finally {
 			if (streamController === controller && !controller.signal.aborted) {
 				isRunning = finalSnapshot ? !finalSnapshot.finished : false;
+
 				if (!isRunning) localStorage.removeItem(storageKey());
 			}
 		}
@@ -737,7 +871,9 @@
 
 	async function startTest() {
 		const selected = normalizeSelection();
+
 		if (selected.length === 0) return;
+
 		streamController?.abort();
 		resetLiveState();
 		isRunning = true;
@@ -746,21 +882,21 @@
 		try {
 			const start = isEval
 				? await Ds4Service.runEval({
+						limit: evalLimit > 0 ? evalLimit : undefined,
+						max_tokens: maxTokens,
 						model,
 						models: selected,
-						max_tokens: maxTokens,
-						thinking_budget_tokens: thinkingBudget,
-						thinking,
 						temperature,
-						limit: evalLimit > 0 ? evalLimit : undefined
+						thinking,
+						thinking_budget_tokens: thinkingBudget
 					})
 				: await Ds4Service.runBench({
-						model,
-						models: selected,
-						ctx_start: ctxStart,
 						ctx_max: ctxMax,
+						ctx_start: ctxStart,
 						ctx_step: ctxStep,
-						gen_tokens: genTokens
+						gen_tokens: genTokens,
+						model,
+						models: selected
 					});
 
 			appendTerminal('Started ' + title + ' job ' + start.id + '\n');
@@ -774,9 +910,11 @@
 
 	async function stopTest() {
 		if (!jobId && !isRunning) return;
+
 		isStopping = true;
 		try {
 			const snapshot = await Ds4Service.stopJob(jobId || undefined);
+
 			setSnapshot(snapshot);
 			await refreshReports();
 			appendTerminal(
@@ -791,7 +929,9 @@
 
 	async function resumeSelectedReport() {
 		if (!activeReport || !canResumeSelectedReport) return;
+
 		const report = activeReport;
+
 		streamController?.abort();
 		resetLiveState();
 		isRunning = true;
@@ -800,6 +940,7 @@
 				report.kind === 'eval'
 					? await Ds4Service.runEval({ resume_report_id: report.id })
 					: await Ds4Service.runBench({ resume_report_id: report.id });
+
 			appendTerminal('Resuming ' + title + ' from report ' + report.id + '\n');
 			await attachJob(start.id, true, false);
 		} catch (e) {
@@ -811,10 +952,14 @@
 
 	async function deleteSelectedReport() {
 		if (!activeReport || !canDeleteSelectedReport) return;
+
 		const id = activeReport.id;
+
 		try {
 			await Ds4Service.deleteReport(id);
+
 			if (selectedReportId === id) selectedReportId = '';
+
 			activeReport = null;
 			await refreshReports();
 		} catch (e) {
@@ -825,10 +970,13 @@
 	async function loadReport(id: string) {
 		if (!id) {
 			activeReport = null;
+
 			return;
 		}
+
 		try {
 			activeReport = await Ds4Service.getReport(id);
+			selectedReportId = id;
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
 		}
@@ -852,10 +1000,14 @@
 				{:else}
 					<Activity class="h-4 w-4" />
 				{/if}
+
 				<span>Local LLM Autopilot · DS4 evidence engine</span>
 			</div>
+
 			<h1 class="mt-1 text-2xl font-semibold tracking-normal">{title}</h1>
+
 			<p class="mt-1 max-w-3xl text-sm text-muted-foreground">{subtitle}</p>
+
 			{#if isEval}
 				<p class="mt-2 max-w-3xl text-xs text-amber-600 dark:text-amber-300">
 					A complete multi-model evaluation can take many hours or several days. Runs are saved
@@ -865,21 +1017,21 @@
 		</div>
 
 		<button
-			type="button"
 			class="inline-flex h-9 items-center justify-center gap-2 rounded-md border px-3 text-sm hover:bg-muted disabled:opacity-50"
 			disabled={isLoadingModels || isRunning}
 			onclick={() => refreshModels(true)}
+			type="button"
 		>
 			<RefreshCw class="h-4 w-4" />
 			Refresh models
 		</button>
 	</header>
 
-	{#if error}
+	{#if visibleError}
 		<div
 			class="rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm text-destructive"
 		>
-			{error}
+			{visibleError}
 		</div>
 	{/if}
 
@@ -900,49 +1052,56 @@
 			<div class="space-y-2">
 				<div class="flex items-center justify-between gap-3">
 					<div class="text-sm font-medium">Models</div>
+
 					<div class="flex items-center gap-2 text-xs">
 						<button
-							type="button"
 							class="text-muted-foreground hover:text-foreground"
+							disabled={isRunning}
 							onclick={selectAllModels}
-							disabled={isRunning}>All new</button
+							type="button">All new</button
 						>
+
 						<button
-							type="button"
 							class="text-muted-foreground hover:text-foreground"
+							disabled={isRunning}
 							onclick={clearModelSelection}
-							disabled={isRunning}>Clear</button
+							type="button">Clear</button
 						>
 					</div>
 				</div>
+
 				<div class="max-h-72 space-y-1 overflow-auto rounded-md border p-2">
 					{#each models.filter((model) => model.id !== 'ALL') as model (model.id)}
 						<label
-							class="flex items-start gap-2 rounded-md px-2 py-2 text-sm hover:bg-muted"
 							class:cursor-pointer={model.evaluator_eligible !== false}
 							class:opacity-55={model.evaluator_eligible === false}
+							class="flex items-start gap-2 rounded-md px-2 py-2 text-sm hover:bg-muted"
 						>
 							<input
-								class="mt-1"
-								type="checkbox"
 								checked={isModelSelected(model.id)}
+								class="mt-1"
 								disabled={isRunning || model.evaluator_eligible === false}
 								onchange={() => toggleModel(model.id)}
+								type="checkbox"
 							/>
+
 							<span class="min-w-0 flex-1">
 								<span
 									class="block truncate font-medium"
 									title={normalizeModelName(model.name || model.id)}
 									>{compactModelName(model.name || model.model_id || model.id)}</span
 								>
+
 								<span class="block truncate text-xs text-muted-foreground">{modelLabel(model)}</span
 								>
+
 								{#if model.eligibility_reason}
 									<span class="block text-xs text-amber-600 dark:text-amber-300"
 										>{model.eligibility_reason}</span
 									>
 								{/if}
 							</span>
+
 							{#if isModelSelected(model.id)}
 								<SquareCheck class="mt-0.5 h-4 w-4 text-primary" />
 							{:else}
@@ -951,12 +1110,14 @@
 						</label>
 					{/each}
 				</div>
+
 				<div class="text-xs text-muted-foreground">
 					Selected: {selectedModelLabel || 'none'} ({selectedModelCount} model{selectedModelCount ===
 					1
 						? ''
 						: 's'})
 				</div>
+
 				{#if isEval}
 					<div class="text-xs text-muted-foreground">
 						All new selects configured models without a completed DS4 score. Evaluated models remain
@@ -969,52 +1130,62 @@
 				<div class="grid grid-cols-2 gap-3">
 					<label class="space-y-2 text-sm">
 						<span class="font-medium">Max tokens</span>
+
 						<input
-							class="h-10 w-full rounded-md border bg-background px-3"
-							type="number"
-							min="1"
-							max="4096"
 							bind:value={maxTokens}
+							class="h-10 w-full rounded-md border bg-background px-3"
 							disabled={isRunning}
+							max="4096"
+							min="1"
+							type="number"
 						/>
 					</label>
+
 					<label class="space-y-2 text-sm">
 						<span class="font-medium">Think budget</span>
+
 						<input
-							class="h-10 w-full rounded-md border bg-background px-3"
-							type="number"
-							min="1"
-							max="4096"
 							bind:value={thinkingBudget}
+							class="h-10 w-full rounded-md border bg-background px-3"
 							disabled={isRunning}
+							max="4096"
+							min="1"
+							type="number"
 						/>
 					</label>
+
 					<label class="space-y-2 text-sm">
 						<span class="font-medium">Limit</span>
+
 						<input
-							class="h-10 w-full rounded-md border bg-background px-3"
-							type="number"
-							min="0"
 							bind:value={evalLimit}
+							class="h-10 w-full rounded-md border bg-background px-3"
 							disabled={isRunning}
+							min="0"
+							type="number"
 						/>
 					</label>
+
 					<label class="space-y-2 text-sm">
 						<span class="font-medium">Temperature</span>
+
 						<input
-							class="h-10 w-full rounded-md border bg-background px-3"
-							type="number"
-							step="0.05"
-							min="0"
 							bind:value={temperature}
+							class="h-10 w-full rounded-md border bg-background px-3"
 							disabled={isRunning}
+							min="0"
+							step="0.05"
+							type="number"
 						/>
 					</label>
 				</div>
+
 				<label class="flex items-center gap-2 text-sm">
-					<input type="checkbox" bind:checked={thinking} disabled={isRunning} />
+					<input bind:checked={thinking} disabled={isRunning} type="checkbox" />
+
 					<span>Enable thinking/reasoning template controls</span>
 				</label>
+
 				<p class="text-xs text-muted-foreground">
 					Per-case guardrails stop repetitive output, cap generation at 4,096 tokens and record the
 					case as guarded before continuing the campaign.
@@ -1023,42 +1194,49 @@
 				<div class="grid grid-cols-2 gap-3">
 					<label class="space-y-2 text-sm">
 						<span class="font-medium">Ctx start</span>
+
 						<input
-							class="h-10 w-full rounded-md border bg-background px-3"
-							type="number"
-							min="128"
 							bind:value={ctxStart}
+							class="h-10 w-full rounded-md border bg-background px-3"
 							disabled={isRunning}
+							min="128"
+							type="number"
 						/>
 					</label>
+
 					<label class="space-y-2 text-sm">
 						<span class="font-medium">Ctx max</span>
+
 						<input
-							class="h-10 w-full rounded-md border bg-background px-3"
-							type="number"
-							min="128"
 							bind:value={ctxMax}
+							class="h-10 w-full rounded-md border bg-background px-3"
 							disabled={isRunning}
+							min="128"
+							type="number"
 						/>
 					</label>
+
 					<label class="space-y-2 text-sm">
 						<span class="font-medium">Ctx step</span>
+
 						<input
-							class="h-10 w-full rounded-md border bg-background px-3"
-							type="number"
-							min="128"
 							bind:value={ctxStep}
+							class="h-10 w-full rounded-md border bg-background px-3"
 							disabled={isRunning}
+							min="128"
+							type="number"
 						/>
 					</label>
+
 					<label class="space-y-2 text-sm">
 						<span class="font-medium">Gen tokens</span>
+
 						<input
-							class="h-10 w-full rounded-md border bg-background px-3"
-							type="number"
-							min="1"
 							bind:value={genTokens}
+							class="h-10 w-full rounded-md border bg-background px-3"
 							disabled={isRunning}
+							min="1"
+							type="number"
 						/>
 					</label>
 				</div>
@@ -1066,18 +1244,19 @@
 
 			<div class="grid grid-cols-[minmax(0,1fr)_auto] gap-2">
 				<button
-					type="button"
 					class="h-10 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
 					disabled={!canStart}
 					onclick={startTest}
+					type="button"
 				>
 					{isResuming ? 'Resuming...' : isRunning ? 'Running...' : 'Start Test'}
 				</button>
+
 				<button
-					type="button"
 					class="inline-flex h-10 items-center justify-center gap-2 rounded-md border px-3 text-sm hover:bg-muted disabled:opacity-50"
 					disabled={!isRunning || isStopping}
 					onclick={stopTest}
+					type="button"
 				>
 					<X class="h-4 w-4" />
 					{isStopping ? 'Stopping' : 'Stop'}
@@ -1087,8 +1266,10 @@
 			<div class="space-y-2">
 				<div class="flex items-center justify-between text-xs text-muted-foreground">
 					<span>{jobStatus}</span>
+
 					<span>{jobCurrent}/{jobTotal}</span>
 				</div>
+
 				<div class="h-2 overflow-hidden rounded-full bg-muted">
 					<div
 						class="h-full rounded-full bg-primary transition-[width]"
@@ -1103,8 +1284,10 @@
 				<div class="font-mono text-xs text-white/70">
 					{jobId || title.toLowerCase() + ' terminal'}
 				</div>
+
 				<div class="text-xs text-white/45">{progressPercent}% · seq {lastSeq}</div>
 			</div>
+
 			<div
 				bind:this={terminalRef}
 				class="h-[34rem] overflow-auto p-3 font-mono text-xs leading-relaxed whitespace-pre-wrap text-white"
@@ -1118,8 +1301,10 @@
 		<div class="mb-4 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
 			<div class="flex items-center gap-2">
 				<BarChart3 class="h-4 w-4" />
+
 				<div>
 					<h2 class="text-sm font-semibold">Current Report</h2>
+
 					<p class="text-xs text-muted-foreground">
 						{activeReport
 							? 'Showing saved report ' + activeReport.id
@@ -1133,35 +1318,39 @@
 			<div class="flex flex-col gap-2 sm:flex-row sm:items-center">
 				<select
 					bind:value={selectedReportId}
-					onchange={() => loadReport(selectedReportId)}
 					class="h-10 min-w-72 rounded-md border bg-background px-3 text-sm"
+					onchange={() => loadReport(selectedReportId)}
 				>
 					<option value="">Live / no saved report</option>
+
 					{#each reports as report (report.id)}
 						<option value={report.id}>{reportLabel(report)}</option>
 					{/each}
 				</select>
+
 				<button
-					type="button"
 					class="h-10 rounded-md border px-3 text-sm hover:bg-muted disabled:opacity-50"
 					disabled={!canResumeSelectedReport}
 					onclick={resumeSelectedReport}
+					type="button"
 				>
 					Resume interrupted
 				</button>
+
 				<button
-					type="button"
 					class="inline-flex h-10 items-center gap-2 rounded-md border px-3 text-sm hover:bg-muted disabled:opacity-50"
 					disabled={!canDeleteSelectedReport}
 					onclick={deleteSelectedReport}
+					type="button"
 				>
 					<Trash2 class="h-4 w-4" />
 					Delete pending
 				</button>
+
 				<button
-					type="button"
 					class="h-10 rounded-md border px-3 text-sm hover:bg-muted"
-					onclick={refreshReports}>Refresh history</button
+					onclick={refreshReports}
+					type="button">Refresh history</button
 				>
 			</div>
 		</div>
@@ -1173,6 +1362,7 @@
 						{evalModelErrors.length} model load error{evalModelErrors.length === 1 ? '' : 's'}; the
 						campaign continued.
 					</div>
+
 					{#each evalModelErrors as failure (`${failure.model}-${failure.stage}`)}
 						<div class="mt-1 text-xs text-muted-foreground">
 							{modelDisplayName(failure.model || 'unknown')} - {failure.error || 'load failed'} -
@@ -1181,28 +1371,39 @@
 					{/each}
 				</div>
 			{/if}
+
 			<div class="grid gap-3 md:grid-cols-5">
 				<div class="rounded-md border p-3">
 					<div class="text-xs text-muted-foreground">Pass</div>
+
 					<div class="mt-1 text-2xl font-semibold text-emerald-500">{evalPass}</div>
 				</div>
+
 				<div class="rounded-md border p-3">
 					<div class="text-xs text-muted-foreground">Fail</div>
+
 					<div class="mt-1 text-2xl font-semibold text-red-500">{evalFail}</div>
 				</div>
+
 				<div class="rounded-md border p-3">
 					<div class="text-xs text-muted-foreground">Guarded</div>
+
 					<div class="mt-1 text-2xl font-semibold text-amber-500">{evalGuarded}</div>
 				</div>
+
 				<div class="rounded-md border p-3">
 					<div class="text-xs text-muted-foreground">Score</div>
+
 					<div class="mt-1 text-2xl font-semibold">{Math.round((evalPass / evalTotal) * 100)}%</div>
 				</div>
+
 				<div class="rounded-md border p-3">
 					<div class="text-xs text-muted-foreground">Rows shown</div>
+
 					<div class="mt-1 text-2xl font-semibold">{displayEvalRows.length}</div>
 				</div>
 			</div>
+
 			<div class="mt-4 flex h-4 overflow-hidden rounded-full bg-red-500/25">
 				<div class="bg-emerald-500" style={'width: ' + (evalPass / evalTotal) * 100 + '%'}></div>
 			</div>
@@ -1212,40 +1413,56 @@
 					<thead class="sticky top-0 bg-background text-muted-foreground">
 						<tr>
 							<th class="px-3 py-2">Test</th>
+
 							<th class="px-3 py-2">Model</th>
+
 							<th class="px-3 py-2">Expected</th>
+
 							<th class="px-3 py-2">Got</th>
+
 							<th class="px-3 py-2">Think</th>
+
 							<th class="px-3 py-2">Answer</th>
+
 							<th class="px-3 py-2">Tok/s</th>
+
 							<th class="px-3 py-2">Status</th>
 						</tr>
 					</thead>
+
 					<tbody>
 						{#each displayEvalRows as row, index (`${row.model}-${row.id}-${index}`)}
 							<tr class="border-t align-top">
 								<td class="px-3 py-2">
 									<div class="font-medium">{row.title || row.id || 'case ' + (index + 1)}</div>
+
 									<div class="text-muted-foreground">
 										#{row.case_index ?? index + 1} · {row.source || 'DS4'} · {row.domain ||
 											'reasoning'} · {row.id}
 									</div>
 								</td>
+
 								<td class="px-3 py-2" title={normalizeModelName(row.model || '')}
 									>{modelDisplayName(row.model || '')}</td
 								>
+
 								<td class="px-3 py-2">{row.expected}</td>
+
 								<td class="px-3 py-2">{row.got}</td>
+
 								<td class="px-3 py-2">{num(row.reasoning_tokens)}</td>
+
 								<td class="px-3 py-2">{num(row.content_tokens)}</td>
+
 								<td class="px-3 py-2">{num(row.tokens_per_second).toFixed(1)}</td>
+
 								<td
-									title={row.generation_error || ''}
 									class={row.pass
 										? 'px-3 py-2 font-medium text-emerald-500'
 										: row.generation_status === 'guarded'
 											? 'px-3 py-2 font-medium text-amber-500'
 											: 'px-3 py-2 font-medium text-red-500'}
+									title={row.generation_error || ''}
 									>{row.pass
 										? 'PASS'
 										: row.generation_status === 'guarded'
@@ -1254,6 +1471,7 @@
 								>
 							</tr>
 						{/each}
+
 						{#if displayEvalRows.length === 0}
 							<tr><td class="px-3 py-6 text-muted-foreground" colspan="8">No eval rows yet.</td></tr
 							>
@@ -1266,8 +1484,10 @@
 				<div class="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
 					<div class="flex items-center gap-2">
 						<Trophy class="h-4 w-4" />
+
 						<div>
 							<h3 class="text-sm font-semibold">Model Report</h3>
+
 							<p class="text-xs text-muted-foreground">
 								Completed archive only · {archiveEvalReportCount} report{archiveEvalReportCount ===
 								1
@@ -1282,21 +1502,22 @@
 							class="inline-grid h-10 grid-cols-2 overflow-hidden rounded-md border bg-background text-sm"
 						>
 							<button
-								type="button"
 								class={reportMode === 'single'
 									? 'bg-primary px-3 text-primary-foreground'
 									: 'px-3 hover:bg-muted'}
 								onclick={() => (reportMode = 'single')}
+								type="button"
 							>
 								Single
 							</button>
+
 							<button
-								type="button"
 								class={reportMode === 'race'
 									? 'bg-primary px-3 text-primary-foreground disabled:opacity-50'
 									: 'px-3 hover:bg-muted disabled:opacity-50'}
 								disabled={reportModels.length < 2}
 								onclick={() => (reportMode = 'race')}
+								type="button"
 							>
 								Race
 							</button>
@@ -1318,17 +1539,18 @@
 								class="h-10 min-w-56 rounded-md border bg-background px-3 text-sm"
 							>
 								{#each reportModels as model (model)}
-									<option value={model} disabled={model === raceModelB}
+									<option disabled={model === raceModelB} value={model}
 										>{modelDisplayName(model)}</option
 									>
 								{/each}
 							</select>
+
 							<select
 								bind:value={raceModelB}
 								class="h-10 min-w-56 rounded-md border bg-background px-3 text-sm"
 							>
 								{#each reportModels as model (model)}
-									<option value={model} disabled={model === raceModelA}
+									<option disabled={model === raceModelA} value={model}
 										>{modelDisplayName(model)}</option
 									>
 								{/each}
@@ -1345,22 +1567,29 @@
 					<div class="mt-4 grid gap-3 md:grid-cols-4">
 						<div class="rounded-md border bg-background p-3">
 							<div class="text-xs text-muted-foreground">Model</div>
+
 							<div class="mt-1 truncate text-lg font-semibold" title={singleReportModel}>
 								{modelDisplayName(singleReportModel)}
 							</div>
 						</div>
+
 						<div class="rounded-md border bg-background p-3">
 							<div class="text-xs text-muted-foreground">Score</div>
+
 							<div class="mt-1 text-2xl font-semibold">{singleModelSummary?.score ?? 0}%</div>
 						</div>
+
 						<div class="rounded-md border bg-background p-3">
 							<div class="text-xs text-muted-foreground">Pass / total</div>
+
 							<div class="mt-1 text-2xl font-semibold">
 								{singleModelSummary?.pass ?? 0}/{singleModelSummary?.total ?? 0}
 							</div>
 						</div>
+
 						<div class="rounded-md border bg-background p-3">
 							<div class="text-xs text-muted-foreground">Avg tok/s</div>
+
 							<div class="mt-1 text-2xl font-semibold">
 								{num(singleModelSummary?.avg_tokens_per_second).toFixed(1)}
 							</div>
@@ -1372,17 +1601,24 @@
 							<thead class="bg-background text-muted-foreground">
 								<tr>
 									<th class="px-3 py-2">Sector</th>
+
 									<th class="px-3 py-2">Score</th>
+
 									<th class="px-3 py-2">Pass</th>
+
 									<th class="px-3 py-2">Fail</th>
+
 									<th class="px-3 py-2">Cases</th>
+
 									<th class="px-3 py-2">Avg tok/s</th>
 								</tr>
 							</thead>
+
 							<tbody>
 								{#each singleSectorRows as row (`${row.model}-${row.sector}`)}
 									<tr class="border-t">
 										<td class="px-3 py-2 font-medium">{row.sector}</td>
+
 										<td class="px-3 py-2">
 											<div class="flex items-center gap-2">
 												<div class="h-2 w-28 overflow-hidden rounded-full bg-red-500/20">
@@ -1391,12 +1627,17 @@
 														style={'width: ' + row.score + '%'}
 													></div>
 												</div>
+
 												<span>{row.score}%</span>
 											</div>
 										</td>
+
 										<td class="px-3 py-2 text-emerald-500">{row.pass}</td>
+
 										<td class="px-3 py-2 text-red-500">{row.fail}</td>
+
 										<td class="px-3 py-2">{row.total}</td>
+
 										<td class="px-3 py-2">{row.avg_tokens_per_second.toFixed(1)}</td>
 									</tr>
 								{/each}
@@ -1407,13 +1648,17 @@
 					<div class="mt-4 grid gap-3 md:grid-cols-3">
 						<div class="rounded-md border bg-background p-3">
 							<div class="text-xs text-muted-foreground">{modelDisplayName(raceModelA)}</div>
+
 							<div class="mt-1 text-2xl font-semibold">{raceModelSummaryA?.score ?? 0}%</div>
+
 							<div class="text-xs text-muted-foreground">
 								{raceModelSummaryA?.pass ?? 0}/{raceModelSummaryA?.total ?? 0} pass
 							</div>
 						</div>
+
 						<div class="rounded-md border bg-background p-3">
 							<div class="text-xs text-muted-foreground">Leader</div>
+
 							<div class="mt-1 truncate text-2xl font-semibold">
 								{#if (raceModelSummaryA?.score ?? 0) === (raceModelSummaryB?.score ?? 0)}
 									Tie
@@ -1423,15 +1668,19 @@
 									{modelDisplayName(raceModelB)}
 								{/if}
 							</div>
+
 							<div class="text-xs text-muted-foreground">
 								Delta {formatDelta(
 									(raceModelSummaryA?.score ?? 0) - (raceModelSummaryB?.score ?? 0)
 								)}
 							</div>
 						</div>
+
 						<div class="rounded-md border bg-background p-3">
 							<div class="text-xs text-muted-foreground">{modelDisplayName(raceModelB)}</div>
+
 							<div class="mt-1 text-2xl font-semibold">{raceModelSummaryB?.score ?? 0}%</div>
+
 							<div class="text-xs text-muted-foreground">
 								{raceModelSummaryB?.pass ?? 0}/{raceModelSummaryB?.total ?? 0} pass
 							</div>
@@ -1443,27 +1692,36 @@
 							<thead class="bg-background text-muted-foreground">
 								<tr>
 									<th class="px-3 py-2">Sector</th>
+
 									<th class="px-3 py-2">{modelDisplayName(raceModelA)}</th>
+
 									<th class="px-3 py-2">{modelDisplayName(raceModelB)}</th>
+
 									<th class="px-3 py-2">Delta</th>
+
 									<th class="px-3 py-2">Cases</th>
 								</tr>
 							</thead>
+
 							<tbody>
 								{#each raceSectorRows as row (row.sector)}
 									<tr class="border-t">
 										<td class="px-3 py-2 font-medium">{row.sector}</td>
+
 										<td class="px-3 py-2"
 											>{row.left?.score ?? 0}% · {row.left?.pass ?? 0}/{row.left?.total ?? 0}</td
 										>
+
 										<td class="px-3 py-2"
 											>{row.right?.score ?? 0}% · {row.right?.pass ?? 0}/{row.right?.total ?? 0}</td
 										>
+
 										<td
 											class={row.delta >= 0
 												? 'px-3 py-2 font-medium text-emerald-500'
 												: 'px-3 py-2 font-medium text-red-500'}>{formatDelta(row.delta)}</td
 										>
+
 										<td class="px-3 py-2">{row.left?.total ?? 0} / {row.right?.total ?? 0}</td>
 									</tr>
 								{/each}
@@ -1476,14 +1734,19 @@
 			<div class="grid gap-3 md:grid-cols-3">
 				<div class="rounded-md border p-3">
 					<div class="text-xs text-muted-foreground">Best prompt tok/s</div>
+
 					<div class="mt-1 text-2xl font-semibold">{bestPromptTps.toFixed(1)}</div>
 				</div>
+
 				<div class="rounded-md border p-3">
 					<div class="text-xs text-muted-foreground">Best decode tok/s</div>
+
 					<div class="mt-1 text-2xl font-semibold">{bestDecodeTps.toFixed(1)}</div>
 				</div>
+
 				<div class="rounded-md border p-3">
 					<div class="text-xs text-muted-foreground">Rows shown</div>
+
 					<div class="mt-1 text-2xl font-semibold">{displayBenchRows.length}</div>
 				</div>
 			</div>
@@ -1493,28 +1756,42 @@
 					<thead class="sticky top-0 bg-background text-muted-foreground">
 						<tr>
 							<th class="px-3 py-2">Ctx</th>
+
 							<th class="px-3 py-2">Model</th>
+
 							<th class="px-3 py-2">Prompt tok/s</th>
+
 							<th class="px-3 py-2">Decode tok/s</th>
+
 							<th class="px-3 py-2">Prompt sec</th>
+
 							<th class="px-3 py-2">Decode sec</th>
+
 							<th class="px-3 py-2">Gen tokens</th>
 						</tr>
 					</thead>
+
 					<tbody>
 						{#each displayBenchRows as row (`${row.model}-${row.ctx}`)}
 							<tr class="border-t">
 								<td class="px-3 py-2">{row.ctx}</td>
+
 								<td class="px-3 py-2" title={normalizeModelName(row.model || '')}
 									>{modelDisplayName(row.model || '')}</td
 								>
+
 								<td class="px-3 py-2">{num(row.prompt_tokens_per_second).toFixed(1)}</td>
+
 								<td class="px-3 py-2">{num(row.decode_tokens_per_second).toFixed(1)}</td>
+
 								<td class="px-3 py-2">{num(row.prompt_seconds).toFixed(2)}</td>
+
 								<td class="px-3 py-2">{num(row.decode_seconds).toFixed(2)}</td>
+
 								<td class="px-3 py-2">{num(row.gen_tokens)}</td>
 							</tr>
 						{/each}
+
 						{#if displayBenchRows.length === 0}
 							<tr
 								><td class="px-3 py-6 text-muted-foreground" colspan="7">No bench rows yet.</td></tr
