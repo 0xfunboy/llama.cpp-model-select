@@ -57,6 +57,41 @@ static bool origin_is_localhost(const std::string & origin) {
     }
 }
 
+static bool is_media_asset_request(const httplib::Request & req, const std::string & api_prefix) {
+    if (req.method != "GET") {
+        return false;
+    }
+    const std::string prefix = api_prefix + "/api/media/assets/";
+    return req.path.size() > prefix.size()
+        && req.path.compare(0, prefix.size(), prefix) == 0
+        && req.path.find('/', prefix.size()) == std::string::npos;
+}
+
+static bool is_public_media_asset_capability(const httplib::Request & req, const std::string & api_prefix) {
+    if (!is_media_asset_request(req, api_prefix)) {
+        return false;
+    }
+    const std::string prefix = api_prefix + "/api/media/assets/asset_";
+    return req.path.size() == prefix.size() + 32
+        && req.path.compare(0, prefix.size(), prefix) == 0
+        && req.path.find_first_not_of("0123456789abcdef", prefix.size()) == std::string::npos;
+}
+
+static bool is_public_media_preview_capability(const httplib::Request & req, const std::string & api_prefix) {
+    if (req.method != "GET") {
+        return false;
+    }
+    const std::string prefix = api_prefix + "/api/media/jobs/media_";
+    const std::string suffix = "/preview";
+    if (req.path.size() != prefix.size() + 32 + suffix.size()
+        || req.path.compare(0, prefix.size(), prefix) != 0
+        || req.path.compare(req.path.size() - suffix.size(), suffix.size(), suffix) != 0) {
+        return false;
+    }
+    return req.path.find_first_not_of("0123456789abcdef", prefix.size())
+        == req.path.size() - suffix.size();
+}
+
 // For Google Cloud Platform deployment compatibility
 struct gcp_params {
     bool enabled;
@@ -143,7 +178,11 @@ bool server_http_context::init(const common_params & params) {
     });
 
     srv->set_error_handler([](const httplib::Request &, httplib::Response & res) {
-        if (res.status == 404) {
+        // A routed proxy may deliberately return a streamed 404 response. Replacing its
+        // body here clears cpp-httplib's content provider while the response is already
+        // being streamed, which can terminate the server with std::bad_function_call.
+        // Only synthesize our generic JSON error when no handler supplied a response.
+        if (res.status == 404 && res.body.empty() && !res.content_provider_) {
             res.set_content(
                 safe_json_to_str(json {
                     {"error", {
@@ -156,6 +195,11 @@ bool server_http_context::init(const common_params & params) {
             );
         }
         // for other error codes, we skip processing here because it's already done by res->error()
+    });
+    srv->set_post_routing_handler([api_prefix = params.api_prefix](const httplib::Request & req, httplib::Response & res) {
+        if (is_media_asset_request(req, api_prefix) && res.status == 200 && res.has_header("Content-Range")) {
+            res.status = 206;
+        }
     });
 
     // set timeouts and change hostname and port
@@ -203,7 +247,7 @@ bool server_http_context::init(const common_params & params) {
         return endpoints;
     }();
 
-    auto middleware_validate_api_key = [api_keys = params.api_keys](const httplib::Request & req, httplib::Response & res) {
+    auto middleware_validate_api_key = [api_keys = params.api_keys, api_prefix = params.api_prefix](const httplib::Request & req, httplib::Response & res) {
         // If API key is not set, skip validation
         if (api_keys.empty()) {
             return true;
@@ -211,6 +255,11 @@ bool server_http_context::init(const common_params & params) {
 
         // If path is public or a UI asset, skip validation
         if (get_public_endpoints.count(req.path)) {
+            return true;
+        }
+
+        if (is_public_media_asset_capability(req, api_prefix)
+            || is_public_media_preview_capability(req, api_prefix)) {
             return true;
         }
 
