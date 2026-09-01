@@ -16,8 +16,11 @@
 #include "llama.h"
 #include "log.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <clocale>
+#include <cstdlib>
 #include <exception>
 #include <signal.h>
 #include <thread> // for std::thread::hardware_concurrency
@@ -87,6 +90,36 @@ static server_http_context::handler_t ex_wrapper(server_http_context::handler_t 
         }
         return res;
     };
+}
+
+static server_http_res_ptr media_proxy_request(const server_http_req & req, const std::string & method, const std::string & path) {
+    std::map<std::string, std::string> headers;
+    const char * media_token = std::getenv("STRIX_MEDIA_TOKEN");
+    if (media_token == nullptr || media_token[0] == '\0') {
+        throw std::runtime_error("STRIX_MEDIA_TOKEN is not configured");
+    }
+    headers["X-Strix-Media-Token"] = media_token;
+    for (const auto & [key, value] : req.headers) {
+        std::string lowered = key;
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        if (lowered == "range") {
+            headers["Range"] = value;
+        }
+    }
+    return std::make_unique<server_http_proxy>(
+            method,
+            "http",
+            "127.0.0.1",
+            9091,
+            path,
+            headers,
+            req.body,
+            req.files,
+            req.should_stop,
+            3600,
+            3600);
 }
 
 int llama_server(int argc, char ** argv) {
@@ -297,6 +330,37 @@ int llama_server(common_params & params, int argc, char ** argv) {
             return server_persistence::handle_archive_import(req);
         }));
     }
+
+    ctx_http.get("/api/media/status", ex_wrapper([](const server_http_req & req) {
+        return media_proxy_request(req, "GET", "/v1/status");
+    }));
+    ctx_http.get("/api/media/models", ex_wrapper([](const server_http_req & req) {
+        return media_proxy_request(req, "GET", "/v1/models");
+    }));
+    ctx_http.post("/api/media/jobs", ex_wrapper([](const server_http_req & req) {
+        return media_proxy_request(req, "POST", "/v1/jobs");
+    }));
+    ctx_http.get("/api/media/jobs/:id", ex_wrapper([](const server_http_req & req) {
+        return media_proxy_request(req, "GET", "/v1/jobs/" + req.get_param("id"));
+    }));
+    ctx_http.get("/api/media/jobs/:id/preview", ex_wrapper([](const server_http_req & req) {
+        return media_proxy_request(req, "GET", "/v1/jobs/" + req.get_param("id") + "/preview");
+    }));
+    ctx_http.post("/api/media/jobs/:id/cancel", ex_wrapper([](const server_http_req & req) {
+        return media_proxy_request(req, "POST", "/v1/jobs/" + req.get_param("id") + "/cancel");
+    }));
+    ctx_http.post("/api/media/assets/owners", ex_wrapper([](const server_http_req & req) {
+        return media_proxy_request(req, "POST", "/v1/assets/owners");
+    }));
+    ctx_http.del("/api/media/conversations/:id/assets", ex_wrapper([](const server_http_req & req) {
+        return media_proxy_request(req, "DELETE", "/v1/conversations/" + req.get_param("id") + "/assets");
+    }));
+    ctx_http.del("/api/media/messages/:id/assets", ex_wrapper([](const server_http_req & req) {
+        return media_proxy_request(req, "DELETE", "/v1/messages/" + req.get_param("id") + "/assets");
+    }));
+    ctx_http.get("/api/media/assets/:id", ex_wrapper([](const server_http_req & req) {
+        return media_proxy_request(req, "GET", "/v1/assets/" + req.get_param("id"));
+    }));
 
     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/v1/health",                ex_wrapper(routes.get_health)); // public endpoint (no API key check)
