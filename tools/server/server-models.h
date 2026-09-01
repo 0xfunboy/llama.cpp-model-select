@@ -11,10 +11,12 @@
 
 #include <mutex>
 #include <condition_variable>
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 
@@ -87,6 +89,7 @@ struct server_model_meta {
     int stop_timeout = 0; // seconds to wait before force-killing the model instance during shutdown
     mtmd_caps multimodal; // multimodal capabilities
     bool hidden = false; // hidden from GET /models, but still accept if requested
+    int active_requests = 0; // runtime snapshot populated by get_all_meta()
 
     bool is_ready() const {
         return status == SERVER_MODEL_STATUS_LOADED;
@@ -111,6 +114,10 @@ struct server_model_meta {
 struct server_models_routes;
 struct server_subproc;   // defined in server-models.cpp
 struct server_lru_sched; // defined in server-models.cpp
+
+struct server_model_safety_error : public std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
 
 struct server_models {
     friend struct server_models_routes;
@@ -210,7 +217,33 @@ private:
     // if true, add some delay to simulate works (useful for testing)
     bool debug_fake_timing = false;
 
+    // Enabled only by the Strix Halo launcher. CUDA and other backends keep
+    // the upstream behavior unless they explicitly opt in.
+    bool strix_guard_enabled = false;
+    std::string strix_gtt_used_path;
+    uint64_t strix_gtt_total = 0;
+    uint64_t strix_gtt_baseline = 0;
+    bool strix_gtt_baseline_initialized = false;
+    uint64_t strix_gtt_tolerance = 0;
+    uint64_t strix_min_headroom = 0;
+    uint64_t strix_runtime_overhead = 0;
+    int strix_gtt_wait_seconds = 0;
+    std::string strix_unsafe_model_once;
+    std::atomic<bool> strix_unsafe_model_consumed{false};
+    std::atomic<bool> strix_gpu_fault_latched{false};
+    std::mutex strix_guard_mutex;
+    std::string strix_gpu_fault_reason;
+
     void update_meta(const std::string & name, const server_model_meta & meta);
+
+    void init_strix_guard();
+    bool ensure_strix_gtt_telemetry();
+    void wait_for_strix_gtt_baseline(const std::string & reason);
+    void validate_strix_load(
+            const std::string & name,
+            const std::vector<std::string> & args,
+            const common_preset * preset = nullptr);
+    bool latch_strix_gpu_fault(const std::string & name, const std::string & line);
 
     // unload least recently used models if the limit is reached
     void unload_lru();
@@ -261,6 +294,13 @@ public:
     void load(const std::string & name, const load_options & opts);
     void unload(const std::string & name);
     void unload_all();
+
+    // Apply the same Strix Halo preflight to isolated benchmark processes.
+    void guard_external_load(const std::string & name, const std::vector<std::string> & args);
+
+    // Fatal GPU failures must abort the current test instead of advancing to
+    // the next row or retrying a queued model load.
+    static bool is_fatal_gpu_error(const std::string & text);
 
     struct update_status_args {
         server_model_status status;
@@ -331,6 +371,12 @@ struct server_models_routes {
     std::mutex switch_mutex;
     std::condition_variable switch_cv;
     bool switch_in_progress = false;
+    std::string switch_action;
+    std::string switch_target;
+    std::string switch_phase;
+    std::string switch_error;
+    int64_t switch_started_at_ms = 0;
+    int64_t switch_finished_at_ms = 0;
     std::mutex preset_mutex;
     server_models models;
     model_registry::index registry;
@@ -351,6 +397,9 @@ struct server_models_routes {
     }
 
     void init_routes();
+    void begin_switch_status(const std::string & action, const std::string & target);
+    void finish_switch_status(const std::string & phase, const std::string & error = {});
+    json get_switch_status();
     json scan_model_registry(bool refresh = false);
     // handlers using lambda function, so that they can capture `this` without `std::bind`
     server_http_context::handler_t get_router_props;
