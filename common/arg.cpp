@@ -4791,6 +4791,12 @@ void common_params_add_preset_options(std::vector<common_arg> & args) {
         [](common_params &, const std::string &) { /* unused */ }
     ).set_env(COMMON_ARG_PRESET_WORKER).set_preset_only());
 
+    args.push_back(common_arg(
+        {"strix-gpu-resident-mib"}, "MiB",
+        "in Strix Halo router mode, measured model bytes expected to remain in the Vulkan UMA pool",
+        [](common_params &, int) { /* unused */ }
+    ).set_env(COMMON_ARG_PRESET_STRIX_GPU_RESIDENT).set_preset_only());
+
     // args.push_back(common_arg(
     //     {"pin"},
     //     "in server router mode, do not unload this model if models_max is exceeded",

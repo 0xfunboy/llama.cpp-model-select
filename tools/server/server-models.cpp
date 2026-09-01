@@ -24,10 +24,13 @@
 #include <cstring>
 #include <cstdlib>
 #include <cctype>
+#include <cinttypes>
 #include <atomic>
 #include <chrono>
 #include <queue>
 #include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <random>
 #include <sstream>
 #include <cstring>
@@ -391,6 +394,243 @@ static std::vector<std::string> get_environment() {
     return env;
 }
 
+static bool read_uint64_file(const std::filesystem::path & path, uint64_t & value) {
+    std::ifstream input(path);
+    return input.good() && static_cast<bool>(input >> value);
+}
+
+static uint64_t read_mem_available_bytes() {
+#if defined(__linux__)
+    std::ifstream input("/proc/meminfo");
+    std::string key;
+    uint64_t value = 0;
+    std::string unit;
+    while (input >> key >> value >> unit) {
+        if (key == "MemAvailable:") {
+            return value * 1024;
+        }
+    }
+#endif
+    return 0;
+}
+
+static uint64_t env_mib_or(const char * name, uint64_t fallback_mib) {
+    const char * raw = std::getenv(name);
+    if (raw == nullptr || raw[0] == '\0') {
+        return fallback_mib * 1024 * 1024;
+    }
+    try {
+        return std::stoull(raw) * 1024 * 1024;
+    } catch (...) {
+        SRV_WRN("invalid %s=%s, using %" PRIu64 " MiB\n", name, raw, fallback_mib);
+        return fallback_mib * 1024 * 1024;
+    }
+}
+
+static int env_int_or(const char * name, int fallback) {
+    const char * raw = std::getenv(name);
+    if (raw == nullptr || raw[0] == '\0') {
+        return fallback;
+    }
+    try {
+        return std::stoi(raw);
+    } catch (...) {
+        SRV_WRN("invalid %s=%s, using %d\n", name, raw, fallback);
+        return fallback;
+    }
+}
+
+static bool env_truthy(const char * name) {
+    std::string value = common_get_env(name);
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return (char) std::tolower(c);
+    });
+    return value == "1" || value == "true" || value == "yes" || value == "on";
+}
+
+static std::pair<std::string, uint64_t> find_largest_gtt_pool() {
+#if defined(__linux__)
+    const std::string override_path = common_get_env("LLAMA_STRIX_GTT_USED_PATH");
+    if (!override_path.empty()) {
+        uint64_t total = 0;
+        const std::filesystem::path used_path(override_path);
+        if (read_uint64_file(used_path.parent_path() / "mem_info_gtt_total", total)) {
+            return {used_path.string(), total};
+        }
+        return {override_path, 0};
+    }
+
+    std::error_code ec;
+    uint64_t largest = 0;
+    std::string used_path;
+    for (const auto & entry : std::filesystem::directory_iterator("/sys/class/drm", ec)) {
+        if (ec) {
+            break;
+        }
+        const std::string card = entry.path().filename().string();
+        if (card.rfind("card", 0) != 0 || card.find('-') != std::string::npos) {
+            continue;
+        }
+        const auto device = entry.path() / "device";
+        uint64_t total = 0;
+        if (read_uint64_file(device / "mem_info_gtt_total", total) && total > largest) {
+            largest = total;
+            used_path = (device / "mem_info_gtt_used").string();
+        }
+    }
+    return {used_path, largest};
+#else
+    return {};
+#endif
+}
+
+static std::string lower_ascii(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return (char) std::tolower(c);
+    });
+    return value;
+}
+
+static bool arg_is(const std::string & arg, std::initializer_list<const char *> names) {
+    for (const char * name : names) {
+        if (arg == name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static std::vector<std::filesystem::path> local_artifacts_from_args(
+        const std::vector<std::string> & args,
+        std::string & model_path,
+        std::string & draft_path,
+        std::string & mmproj_path) {
+    std::vector<std::filesystem::path> paths;
+    for (size_t i = 0; i + 1 < args.size(); ++i) {
+        const std::string & arg = args[i];
+        if (arg_is(arg, {"-m", "--model"})) {
+            model_path = args[++i];
+            paths.emplace_back(model_path);
+        } else if (arg_is(arg, {"-md", "--model-draft"})) {
+            draft_path = args[++i];
+            paths.emplace_back(draft_path);
+        } else if (arg_is(arg, {"-mm", "--mmproj"})) {
+            mmproj_path = args[++i];
+            paths.emplace_back(mmproj_path);
+        } else if (arg_is(arg, {"--lora", "--lora-scaled"})) {
+            paths.emplace_back(args[++i]);
+        }
+    }
+    return paths;
+}
+
+static std::vector<std::filesystem::path> expand_gguf_shards(const std::filesystem::path & path) {
+    const std::string filename = path.filename().string();
+    const size_t of_pos = filename.rfind("-of-");
+    if (of_pos == std::string::npos) {
+        return {path};
+    }
+    const size_t shard_dash = filename.rfind('-', of_pos - 1);
+    const size_t total_start = of_pos + 4;
+    size_t total_end = total_start;
+    while (total_end < filename.size() && std::isdigit((unsigned char) filename[total_end])) {
+        ++total_end;
+    }
+    if (shard_dash == std::string::npos || shard_dash + 1 == of_pos || total_end == total_start) {
+        return {path};
+    }
+
+    try {
+        const int shard_count = std::stoi(filename.substr(total_start, total_end - total_start));
+        const int width = (int) (of_pos - shard_dash - 1);
+        if (shard_count <= 1 || width <= 0 || shard_count > 10000) {
+            return {path};
+        }
+        std::vector<std::filesystem::path> shards;
+        shards.reserve((size_t) shard_count);
+        const std::string prefix = filename.substr(0, shard_dash + 1);
+        const std::string total = filename.substr(total_start, total_end - total_start);
+        const std::string suffix = filename.substr(total_end);
+        for (int shard = 1; shard <= shard_count; ++shard) {
+            std::ostringstream name;
+            name << prefix << std::setw(width) << std::setfill('0') << shard
+                 << "-of-" << total << suffix;
+            shards.push_back(path.parent_path() / name.str());
+        }
+        return shards;
+    } catch (...) {
+        return {path};
+    }
+}
+
+static uint64_t local_artifact_bytes(const std::vector<std::filesystem::path> & artifacts) {
+    std::set<std::filesystem::path> unique_paths;
+    for (const auto & artifact : artifacts) {
+        for (const auto & shard : expand_gguf_shards(artifact)) {
+            unique_paths.insert(shard.lexically_normal());
+        }
+    }
+
+    uint64_t total = 0;
+    for (const auto & path : unique_paths) {
+        std::error_code ec;
+        const uint64_t size = std::filesystem::file_size(path, ec);
+        if (ec) {
+            throw server_model_safety_error("Strix Halo safety guard cannot size artifact: " + path.string());
+        }
+        total += size;
+    }
+    return total;
+}
+
+static bool has_positive_cpu_moe_offload(const std::vector<std::string> & args) {
+    for (size_t i = 0; i < args.size(); ++i) {
+        if (arg_is(args[i], {"-cmoe", "--cpu-moe"})) {
+            return true;
+        }
+        if (arg_is(args[i], {"-ncmoe", "--n-cpu-moe"}) && i + 1 < args.size()) {
+            try {
+                return std::stoi(args[i + 1]) > 0;
+            } catch (...) {
+                return false;
+            }
+        }
+    }
+    return false;
+}
+
+static bool uses_explicit_mmap(const std::vector<std::string> & args) {
+    for (size_t i = 0; i + 1 < args.size(); ++i) {
+        if (arg_is(args[i], {"-lm", "--load-mode"})) {
+            return args[i + 1] == "mmap";
+        }
+    }
+    return false;
+}
+
+static std::optional<uint64_t> strix_gpu_resident_bytes(const common_preset * preset) {
+    if (preset == nullptr) {
+        return std::nullopt;
+    }
+
+    std::string value;
+    if (!preset->get_option(COMMON_ARG_PRESET_STRIX_GPU_RESIDENT, value)) {
+        return std::nullopt;
+    }
+
+    try {
+        size_t parsed = 0;
+        const uint64_t mib = std::stoull(value, &parsed);
+        if (parsed != value.size() || mib == 0 || mib > UINT64_MAX / (1024ULL * 1024ULL)) {
+            throw std::invalid_argument("out of range");
+        }
+        return mib * 1024ULL * 1024ULL;
+    } catch (...) {
+        throw server_model_safety_error(
+                "invalid strix-gpu-resident-mib preset value '" + value + "'");
+    }
+}
+
 void server_model_meta::update_args(common_preset_context & ctx_preset, std::string bin_path) {
     // update params
     unset_reserved_args(preset, false);
@@ -450,6 +690,239 @@ void server_model_meta::update_caps() {
 // server_models
 //
 
+bool server_models::is_fatal_gpu_error(const std::string & text) {
+    const std::string lowered = lower_ascii(text);
+    return lowered.find("bo_va (-12)") != std::string::npos
+        || lowered.find("amdgpu_vm_validate() failed") != std::string::npos
+        || lowered.find("not enough memory for command submission") != std::string::npos
+        || lowered.find("device lost") != std::string::npos
+        || lowered.find("vk_error_device_lost") != std::string::npos;
+}
+
+void server_models::init_strix_guard() {
+    strix_guard_enabled = env_truthy("LLAMA_STRIX_MEMORY_GUARD");
+    if (!strix_guard_enabled) {
+        return;
+    }
+
+    strix_min_headroom = env_mib_or("LLAMA_STRIX_MIN_HEADROOM_MIB", 16 * 1024);
+    strix_runtime_overhead = env_mib_or("LLAMA_STRIX_RUNTIME_OVERHEAD_MIB", 2 * 1024);
+    strix_gtt_tolerance = env_mib_or("LLAMA_STRIX_GTT_TOLERANCE_MIB", 512);
+    strix_gtt_wait_seconds = std::max(1, env_int_or("LLAMA_STRIX_GTT_WAIT_SECONDS", 180));
+    strix_unsafe_model_once = common_get_env("LLAMA_STRIX_UNSAFE_MODEL_ONCE");
+
+    const char * baseline_raw = std::getenv("LLAMA_STRIX_GTT_BASELINE_MIB");
+    if (baseline_raw != nullptr && baseline_raw[0] != '\0') {
+        strix_gtt_baseline = env_mib_or("LLAMA_STRIX_GTT_BASELINE_MIB", 512);
+        strix_gtt_baseline_initialized = true;
+    }
+
+    if (!ensure_strix_gtt_telemetry()) {
+        SRV_WRN("%s", "Strix Halo safety guard is waiting for GTT telemetry; discovery will retry before each load\n");
+    }
+    if (!strix_unsafe_model_once.empty()) {
+        SRV_WRN("one unsafe load is armed for model '%s'; all other safety checks remain active\n",
+                strix_unsafe_model_once.c_str());
+    }
+}
+
+bool server_models::ensure_strix_gtt_telemetry() {
+    if (!strix_guard_enabled) {
+        return true;
+    }
+
+    std::lock_guard<std::mutex> lock(strix_guard_mutex);
+    uint64_t current = 0;
+    if (!strix_gtt_used_path.empty() && strix_gtt_total > 0
+            && read_uint64_file(strix_gtt_used_path, current)) {
+        return true;
+    }
+
+    const auto [used_path, total] = find_largest_gtt_pool();
+    if (used_path.empty() || total == 0 || !read_uint64_file(used_path, current)) {
+        return false;
+    }
+
+    strix_gtt_used_path = used_path;
+    strix_gtt_total = total;
+    if (!strix_gtt_baseline_initialized) {
+        const uint64_t baseline_cap = 4ULL * 1024 * 1024 * 1024;
+        strix_gtt_baseline = current <= baseline_cap ? current : 512ULL * 1024 * 1024;
+        strix_gtt_baseline_initialized = true;
+        if (current > baseline_cap) {
+            SRV_WRN("GTT was %.2f GiB during guard initialization; using a 0.50 GiB baseline\n",
+                    current / (1024.0 * 1024.0 * 1024.0));
+        }
+    }
+
+    SRV_INF("Strix Halo safety guard: GTT %.2f GiB, baseline %.2f GiB + %.2f GiB tolerance, headroom %.2f GiB, overhead %.2f GiB\n",
+            strix_gtt_total / (1024.0 * 1024.0 * 1024.0),
+            strix_gtt_baseline / (1024.0 * 1024.0 * 1024.0),
+            strix_gtt_tolerance / (1024.0 * 1024.0 * 1024.0),
+            strix_min_headroom / (1024.0 * 1024.0 * 1024.0),
+            strix_runtime_overhead / (1024.0 * 1024.0 * 1024.0));
+    return true;
+}
+
+void server_models::wait_for_strix_gtt_baseline(const std::string & reason) {
+    if (!strix_guard_enabled) {
+        return;
+    }
+    if (strix_gpu_fault_latched.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(strix_guard_mutex);
+        throw server_model_safety_error("GPU safety fault is latched; restart the router after checking the driver: "
+                + strix_gpu_fault_reason);
+    }
+    const auto telemetry_deadline = std::chrono::steady_clock::now()
+        + std::chrono::seconds(std::min(strix_gtt_wait_seconds, 10));
+    while (!ensure_strix_gtt_telemetry()) {
+        if (std::chrono::steady_clock::now() >= telemetry_deadline) {
+            throw server_model_safety_error("Strix Halo safety guard cannot discover GTT telemetry; load blocked");
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    const uint64_t target = strix_gtt_baseline + strix_gtt_tolerance;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(strix_gtt_wait_seconds);
+    bool announced = false;
+    while (true) {
+        uint64_t used = 0;
+        if (!read_uint64_file(strix_gtt_used_path, used)) {
+            if (!ensure_strix_gtt_telemetry() || !read_uint64_file(strix_gtt_used_path, used)) {
+                throw server_model_safety_error("Strix Halo safety guard lost GTT telemetry; load blocked");
+            }
+        }
+        if (used <= target) {
+            if (announced) {
+                SRV_INF("GTT returned to baseline for %s: %.2f GiB used\n",
+                        reason.c_str(), used / (1024.0 * 1024.0 * 1024.0));
+            }
+            return;
+        }
+        if (!announced) {
+            SRV_INF("waiting for GTT baseline before %s: %.2f GiB used, target <= %.2f GiB\n",
+                    reason.c_str(),
+                    used / (1024.0 * 1024.0 * 1024.0),
+                    target / (1024.0 * 1024.0 * 1024.0));
+            announced = true;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            throw server_model_safety_error(string_format(
+                    "GTT did not return to baseline within %d seconds; %s blocked",
+                    strix_gtt_wait_seconds, reason.c_str()));
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+}
+
+void server_models::validate_strix_load(
+        const std::string & name,
+        const std::vector<std::string> & args,
+        const common_preset * preset) {
+    if (!strix_guard_enabled) {
+        return;
+    }
+    if (strix_gpu_fault_latched.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(strix_guard_mutex);
+        throw server_model_safety_error("GPU safety fault is latched; model load blocked: " + strix_gpu_fault_reason);
+    }
+
+    std::string model_path;
+    std::string draft_path;
+    std::string mmproj_path;
+    const auto artifacts = local_artifacts_from_args(args, model_path, draft_path, mmproj_path);
+    const std::string q4_identity = lower_ascii(name + " " + model_path);
+    const bool huge_q4 = q4_identity.find("qwen3.8-flash-next") != std::string::npos
+        && (q4_identity.find("q4_k_xl") != std::string::npos
+            || q4_identity.find("q4-k-xl") != std::string::npos);
+    if (huge_q4 && !draft_path.empty() && !mmproj_path.empty()) {
+        throw server_model_safety_error(
+                "unsafe preset blocked: Qwen3.8 Flash Next Q4_K_XL cannot combine MTP and mmproj");
+    }
+
+    bool expected = false;
+    if (name == strix_unsafe_model_once
+            && strix_unsafe_model_consumed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        SRV_WRN("temporarily bypassing UMA headroom check for one load of '%s'\n", name.c_str());
+        notify_sse("unsafe_load_once", name, {
+            {"headroom_check", false},
+            {"remaining_uses", 0},
+        });
+        return;
+    }
+
+    uint64_t gtt_used = 0;
+    if (!ensure_strix_gtt_telemetry() || !read_uint64_file(strix_gtt_used_path, gtt_used)) {
+        throw server_model_safety_error("Strix Halo safety guard cannot read GTT usage; load blocked");
+    }
+    const uint64_t mem_available = read_mem_available_bytes();
+    if (mem_available == 0) {
+        throw server_model_safety_error("Strix Halo safety guard cannot read MemAvailable; load blocked");
+    }
+
+    const uint64_t artifact_bytes = local_artifact_bytes(artifacts);
+    uint64_t resident_bytes = artifact_bytes;
+    if (const auto configured = strix_gpu_resident_bytes(preset)) {
+        if (!has_positive_cpu_moe_offload(args) || !uses_explicit_mmap(args)) {
+            throw server_model_safety_error(
+                    "strix-gpu-resident-mib requires positive CPU MoE offload and explicit mmap loading");
+        }
+        if (*configured >= artifact_bytes) {
+            throw server_model_safety_error(
+                    "strix-gpu-resident-mib must be smaller than the local model artifacts");
+        }
+        resident_bytes = *configured;
+    }
+
+    const uint64_t required = resident_bytes + strix_runtime_overhead + strix_min_headroom;
+    const uint64_t gtt_free = strix_gtt_total > gtt_used ? strix_gtt_total - gtt_used : 0;
+    if (gtt_free < required || mem_available < required) {
+        throw server_model_safety_error(string_format(
+                "UMA safety margin for '%s' would fall below the configured %.2f GiB reserve: resident %.2f GiB of %.2f GiB artifacts + runtime %.2f GiB; GTT free %.2f GiB, RAM available %.2f GiB",
+                name.c_str(),
+                strix_min_headroom / (1024.0 * 1024.0 * 1024.0),
+                resident_bytes / (1024.0 * 1024.0 * 1024.0),
+                artifact_bytes / (1024.0 * 1024.0 * 1024.0),
+                strix_runtime_overhead / (1024.0 * 1024.0 * 1024.0),
+                gtt_free / (1024.0 * 1024.0 * 1024.0),
+                mem_available / (1024.0 * 1024.0 * 1024.0)));
+    }
+
+    SRV_INF("UMA preflight passed for %s: resident %.2f GiB of %.2f GiB artifacts, projected GTT headroom %.2f GiB, RAM headroom %.2f GiB\n",
+            name.c_str(),
+            resident_bytes / (1024.0 * 1024.0 * 1024.0),
+            artifact_bytes / (1024.0 * 1024.0 * 1024.0),
+            (gtt_free - resident_bytes - strix_runtime_overhead) / (1024.0 * 1024.0 * 1024.0),
+            (mem_available - resident_bytes - strix_runtime_overhead) / (1024.0 * 1024.0 * 1024.0));
+}
+
+void server_models::guard_external_load(const std::string & name, const std::vector<std::string> & args) {
+    wait_for_strix_gtt_baseline(name);
+    validate_strix_load(name, args);
+}
+
+bool server_models::latch_strix_gpu_fault(const std::string & name, const std::string & line) {
+    if (!strix_guard_enabled || !is_fatal_gpu_error(line)) {
+        return false;
+    }
+    bool expected = false;
+    if (!strix_gpu_fault_latched.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(strix_guard_mutex);
+        strix_gpu_fault_reason = string_strip(line);
+    }
+    SRV_ERR("fatal GPU error from %s; stopping child and blocking retries: %s\n",
+            name.c_str(), strix_gpu_fault_reason.c_str());
+    notify_sse("gpu_fault", name, {
+        {"fatal", true},
+        {"retry", false},
+        {"error", strix_gpu_fault_reason},
+    });
+    return true;
+}
+
 server_models::server_models(
         const common_params & params,
         int argc,
@@ -473,6 +946,7 @@ server_models::server_models(
     if (std::getenv("LLAMA_SERVER_WORKER") != nullptr) {
         LOG_INF("using external model worker binary: %s\n", bin_path.c_str());
     }
+    init_strix_guard();
     load_models();
     debug_fake_timing = !common_get_env("LLAMA_SERVER_DEBUG_FAKE_TIMING").empty();
 }
@@ -984,7 +1458,9 @@ std::vector<server_model_meta> server_models::get_all_meta() {
     std::vector<server_model_meta> result;
     result.reserve(mapping.size());
     for (const auto & [name, inst] : mapping) {
-        result.push_back(inst.meta);
+        auto meta = inst.meta;
+        meta.active_requests = inst.req_count;
+        result.push_back(std::move(meta));
     }
     return result;
 }
@@ -1030,6 +1506,9 @@ void server_models::load(const std::string & name, const load_options & opts) {
             throw std::runtime_error("model name=" + name + " is not found");
         }
         unload_lru();
+        if (opts.mode == SERVER_CHILD_MODE_NORMAL) {
+            wait_for_strix_gtt_baseline("loading model '" + name + "'");
+        }
     }
 
     std::unique_lock<std::mutex> lk(mutex);
@@ -1065,6 +1544,7 @@ void server_models::load(const std::string & name, const load_options & opts) {
     inst.meta.port        = common_http_get_free_port();
     inst.meta.status      = SERVER_MODEL_STATUS_LOADING;
     inst.meta.loaded_info = json{};
+    inst.meta.progress    = json{};
     inst.meta.last_used   = ggml_time_ms();
 
     if (inst.meta.port <= 0) {
@@ -1080,6 +1560,10 @@ void server_models::load(const std::string & name, const load_options & opts) {
         std::vector<std::string> child_args = inst.meta.args; // copy
         std::vector<std::string> child_env  = base_env; // copy
         child_env.push_back("LLAMA_SERVER_ROUTER_PORT=" + std::to_string(base_params.port));
+
+        if (opts.mode == SERVER_CHILD_MODE_NORMAL) {
+            validate_strix_load(name, child_args, &inst.meta.preset);
+        }
 
         if (opts.mode == SERVER_CHILD_MODE_DOWNLOAD) {
             inst.meta.status = SERVER_MODEL_STATUS_DOWNLOADING;
@@ -1127,6 +1611,12 @@ void server_models::load(const std::string & name, const load_options & opts) {
                     } else {
                         // forward log
                         LOG("[%5d] %s", port, buffer);
+                        if (child_mode == SERVER_CHILD_MODE_NORMAL
+                                && this->latch_strix_gpu_fault(name, str)) {
+                            child_proc->stopped.store(true, std::memory_order_release);
+                            child_proc->terminate();
+                            this->cv_stop.notify_all();
+                        }
                     }
                 }
             } else {
@@ -1513,10 +2003,15 @@ bool server_models::ensure_model_ready(const std::string & name, const std::func
             if (status == SERVER_MODEL_STATUS_UNLOADED && sched->try_claim(lk, name)) {
                 lk.unlock();
                 bool ok = true;
+                std::exception_ptr safety_error;
                 try {
                     SRV_INF("slot available, loading queued model name=%s\n", name.c_str());
                     load(name);
                     did_load = true;
+                } catch (const server_model_safety_error & e) {
+                    SRV_ERR("queued load of name=%s rejected by safety guard: %s\n", name.c_str(), e.what());
+                    safety_error = std::current_exception();
+                    ok = false;
                 } catch (const std::exception & e) {
                     // lost a race for the slot, stay in line and retry
                     SRV_WRN("queued load of name=%s did not go through: %s\n", name.c_str(), e.what());
@@ -1524,6 +2019,9 @@ bool server_models::ensure_model_ready(const std::string & name, const std::func
                 }
                 lk.lock();
                 sched->claim_done(lk, name, ok);
+                if (safety_error) {
+                    std::rethrow_exception(safety_error);
+                }
                 if (ok) {
                     queued = false; // entry is gone, the other waiters watch the status now
                 }
@@ -1550,13 +2048,21 @@ server_http_res_ptr server_models::proxy_request(const server_http_req & req, co
     if (!meta->is_running()) {
         throw std::invalid_argument("model name=" + name + " is not running");
     }
+    int active_requests = 0;
+    server_model_status activity_status = SERVER_MODEL_STATUS_UNLOADED;
     {
         std::unique_lock<std::mutex> lk(mutex);
         if (update_last_used) {
             mapping[name].meta.last_used = ggml_time_ms();
         }
         mapping[name].req_count++;
+        active_requests = mapping[name].req_count;
+        activity_status = mapping[name].meta.status;
     }
+    notify_sse("status_update", name, {
+        {"status", server_model_status_to_string(activity_status)},
+        {"active_requests", active_requests},
+    });
     if (debug_fake_timing) {
         // sleep after req_count++, so the model counts as busy while we wait here
         std::this_thread::sleep_for(std::chrono::seconds(2));
@@ -1585,14 +2091,22 @@ server_http_res_ptr server_models::proxy_request(const server_http_req & req, co
 
     proxy->cleanup = [this, name]() {
         bool went_idle = false;
+        int active_requests = 0;
+        server_model_status activity_status = SERVER_MODEL_STATUS_UNLOADED;
         {
             std::unique_lock<std::mutex> lk(mutex);
             auto it = mapping.find(name);
             if (it != mapping.end() && it->second.req_count > 0) {
                 it->second.req_count--;
                 went_idle = it->second.req_count == 0;
+                active_requests = it->second.req_count;
+                activity_status = it->second.meta.status;
             }
         }
+        notify_sse("status_update", name, {
+            {"status", server_model_status_to_string(activity_status)},
+            {"active_requests", active_requests},
+        });
         if (went_idle) {
             sched->on_model_idle(name);
         }
@@ -1870,6 +2384,41 @@ struct router_switch_guard {
         routes.switch_cv.notify_all();
     }
 };
+
+static int64_t wall_time_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+void server_models_routes::begin_switch_status(const std::string & action, const std::string & target) {
+    std::lock_guard<std::mutex> lk(switch_mutex);
+    switch_action = action;
+    switch_target = target;
+    switch_phase = "preparing";
+    switch_error.clear();
+    switch_started_at_ms = wall_time_ms();
+    switch_finished_at_ms = 0;
+}
+
+void server_models_routes::finish_switch_status(const std::string & phase, const std::string & error) {
+    std::lock_guard<std::mutex> lk(switch_mutex);
+    switch_phase = phase;
+    switch_error = error;
+    switch_finished_at_ms = wall_time_ms();
+}
+
+json server_models_routes::get_switch_status() {
+    std::lock_guard<std::mutex> lk(switch_mutex);
+    return {
+        {"active",      switch_in_progress},
+        {"action",      switch_action},
+        {"target",      switch_target},
+        {"phase",       switch_phase},
+        {"error",       switch_error},
+        {"started_at",  switch_started_at_ms},
+        {"finished_at", switch_finished_at_ms},
+    };
+}
 
 static void res_ok(std::unique_ptr<server_http_res> & res, const json & response_data) {
     res->status = 200;
@@ -2154,13 +2703,14 @@ void server_models_routes::init_routes() {
         if (least_cost_router::is_virtual_alias(name)) {
             const std::string requested_alias = name;
             const json registry_snapshot = scan_model_registry(false);
+            const model_registry::json registry_index = model_registry::json::parse(registry_snapshot.dump());
             std::vector<json> candidates;
             for (const auto & meta : models.get_all_meta()) {
                 std::string model_path;
                 meta.preset.get_option("LLAMA_ARG_MODEL", model_path);
                 candidates.push_back({
                     {"model", meta.name},
-                    {"artifact_id", model_registry::artifact_id_for_path(registry_snapshot, model_path)},
+                    {"artifact_id", model_registry::artifact_id_for_path(registry_index, model_path)},
                     {"resident", meta.is_running()},
                     {"vision", meta.multimodal.inp_vision},
                     {"audio", meta.multimodal.inp_audio},
@@ -2250,11 +2800,24 @@ void server_models_routes::init_routes() {
             return res;
         }
         router_switch_guard guard(*this);
-        if (auto wait_res = start_switch_or_wait(*this, req, guard)) {
-            return wait_res;
+        if (!guard.start()) {
+            res_err(res, format_error_response("model switch already in progress", ERROR_TYPE_UNAVAILABLE));
+            return res;
         }
-        models.load(meta->name);
-        res_ok(res, {{"success", true}});
+        begin_switch_status("load", meta->name);
+        try {
+            models.ensure_model_ready(meta->name);
+            auto final_meta = models.get_meta(meta->name);
+            if (!final_meta.has_value() || !final_meta->is_ready_or_sleep()) {
+                throw std::runtime_error("model did not become ready");
+            }
+        } catch (const std::exception & e) {
+            finish_switch_status("failed", e.what());
+            res_err(res, format_error_response(e.what(), ERROR_TYPE_UNAVAILABLE));
+            return res;
+        }
+        finish_switch_status("ready");
+        res_ok(res, {{"success", true}, {"model", meta->name}, {"status", "loaded"}});
         return res;
     };
 
@@ -2287,6 +2850,27 @@ void server_models_routes::init_routes() {
             if (meta.is_failed()) {
                 status["exit_code"] = meta.exit_code;
                 status["failed"]    = true;
+            }
+            if (meta.status == SERVER_MODEL_STATUS_LOADING
+                    && meta.progress.is_object()
+                    && meta.progress.contains("current")
+                    && meta.progress.contains("value")) {
+                status["progress"] = meta.progress;
+            }
+            status["stop_timeout_seconds"] = meta.stop_timeout;
+            status["active_requests"] = meta.active_requests;
+
+            try {
+                std::string model_path;
+                std::string draft_path;
+                std::string mmproj_path;
+                const auto artifacts = local_artifacts_from_args(
+                    meta.args, model_path, draft_path, mmproj_path);
+                if (!artifacts.empty()) {
+                    status["artifact_bytes"] = local_artifact_bytes(artifacts);
+                }
+            } catch (const std::exception &) {
+                // Remote and incomplete artifacts legitimately have no local size yet.
             }
 
             // pi coding agent multimodal compatibility
@@ -2336,9 +2920,36 @@ void server_models_routes::init_routes() {
             }
             models_json.push_back(model_info);
         }
+        json operation = get_switch_status();
+        if (json_value(operation, "active", false)) {
+            const std::string target = json_value(operation, "target", std::string());
+            const std::string action = json_value(operation, "action", std::string());
+            auto target_it = std::find_if(all_models.begin(), all_models.end(), [&target](const server_model_meta & meta) {
+                return meta.name == target;
+            });
+            if (action == "unload") {
+                operation["phase"] = target_it != all_models.end() && target_it->is_running()
+                    ? "unloading" : "finalizing";
+            } else if (target_it != all_models.end() && target_it->status == SERVER_MODEL_STATUS_LOADING) {
+                operation["phase"] = "loading";
+            } else if (target_it != all_models.end() && target_it->is_ready_or_sleep()) {
+                operation["phase"] = "finalizing";
+            } else {
+                const bool another_busy = std::any_of(all_models.begin(), all_models.end(), [&target](const server_model_meta & meta) {
+                    return meta.name != target && meta.is_running() && meta.active_requests > 0;
+                });
+                const bool another_running = std::any_of(all_models.begin(), all_models.end(), [&target](const server_model_meta & meta) {
+                    return meta.name != target && meta.is_running();
+                });
+                operation["phase"] = another_busy
+                    ? "waiting_for_requests"
+                    : another_running ? "unloading" : "preflight";
+            }
+        }
         res_ok(res, {
-            {"data", models_json},
-            {"object", "list"},
+            {"data",      models_json},
+            {"object",    "list"},
+            {"operation", operation},
         });
         return res;
     };
@@ -2383,50 +2994,55 @@ void server_models_routes::init_routes() {
             return res;
         }
         name = target->name;
+        begin_switch_status("switch", name);
 
-        std::vector<std::string> to_unload;
-        bool target_running = false;
-        for (const auto & meta : models.get_all_meta()) {
-            if (meta.name == name && meta.is_running()) {
-                target_running = true;
+        try {
+            std::vector<std::string> to_unload;
+            bool target_running = false;
+            for (const auto & meta : models.get_all_meta()) {
+                if (meta.name == name && meta.is_running()) {
+                    target_running = true;
+                }
+                if ((meta.is_running() || meta.status == SERVER_MODEL_STATUS_DOWNLOADING)
+                        && (reload || meta.name != name)) {
+                    to_unload.push_back(meta.name);
+                }
             }
-            if ((meta.is_running() || meta.status == SERVER_MODEL_STATUS_DOWNLOADING)
-                    && (reload || meta.name != name)) {
-                to_unload.push_back(meta.name);
-            }
-        }
 
-        for (const auto & model_name : to_unload) {
-            models.unload(model_name);
-        }
-        for (const auto & model_name : to_unload) {
-            models.wait(model_name, [](const server_model_meta & meta) {
-                return !meta.is_running() && meta.status != SERVER_MODEL_STATUS_DOWNLOADING;
+            for (const auto & model_name : to_unload) {
+                models.unload(model_name);
+            }
+            for (const auto & model_name : to_unload) {
+                models.wait(model_name, [](const server_model_meta & meta) {
+                    return !meta.is_running() && meta.status != SERVER_MODEL_STATUS_DOWNLOADING;
+                });
+            }
+
+            if (reload || !target_running) {
+                models.ensure_model_ready(name);
+            }
+
+            auto final_meta = models.get_meta(name);
+            const std::string final_status = final_meta.has_value()
+                ? server_model_status_to_string(final_meta->status)
+                : "missing";
+            if (!final_meta.has_value() || (!final_meta->is_ready() && final_meta->status != SERVER_MODEL_STATUS_SLEEPING)) {
+                throw std::runtime_error(string_format(
+                    "model '%s' did not become ready (status: %s)", name.c_str(), final_status.c_str()));
+            }
+
+            finish_switch_status("ready");
+            res_ok(res, {
+                {"success",  true},
+                {"model",    name},
+                {"status",   final_status},
+                {"reload",   reload},
+                {"unloaded", to_unload},
             });
+        } catch (const std::exception & e) {
+            finish_switch_status("failed", e.what());
+            res_err(res, format_error_response(e.what(), ERROR_TYPE_UNAVAILABLE));
         }
-
-        if (reload || !target_running) {
-            models.ensure_model_ready(name);
-        }
-
-        auto final_meta = models.get_meta(name);
-        const std::string final_status = final_meta.has_value()
-            ? server_model_status_to_string(final_meta->status)
-            : "missing";
-        if (!final_meta.has_value() || (!final_meta->is_ready() && final_meta->status != SERVER_MODEL_STATUS_SLEEPING)) {
-            res_err(res, format_error_response(
-                string_format("model '%s' did not become ready (status: %s)", name.c_str(), final_status.c_str()),
-                ERROR_TYPE_UNAVAILABLE));
-            return res;
-        }
-
-        res_ok(res, {
-            {"success",  true},
-            {"model",    name},
-            {"status",   final_status},
-            {"reload",   reload},
-            {"unloaded", to_unload},
-        });
         return res;
     };
 
@@ -2472,8 +3088,18 @@ void server_models_routes::init_routes() {
             res_err(res, format_error_response("model is not running", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
+        router_switch_guard guard(*this);
+        if (!guard.start()) {
+            res_err(res, format_error_response("model switch already in progress", ERROR_TYPE_UNAVAILABLE));
+            return res;
+        }
+        begin_switch_status("unload", model->name);
         models.unload(model->name);
-        res_ok(res, {{"success", true}});
+        models.wait(model->name, [](const server_model_meta & meta) {
+            return !meta.is_running() && meta.status != SERVER_MODEL_STATUS_DOWNLOADING;
+        });
+        finish_switch_status("idle");
+        res_ok(res, {{"success", true}, {"model", model->name}, {"status", "unloaded"}});
         return res;
     };
 

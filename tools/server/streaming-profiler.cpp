@@ -2,6 +2,7 @@
 
 #include "caliber-scoring.h"
 #include "server-common.h"
+#include "server-models.h"
 
 #include <cpp-httplib/httplib.h>
 #include <sheredom/subprocess.h>
@@ -316,6 +317,10 @@ class child_server {
                 std::lock_guard<std::mutex> lock(log_mutex_);
                 logs_ += buffer.data();
                 if (logs_.size() > 4 * 1024 * 1024) logs_.erase(0, logs_.size() - 4 * 1024 * 1024);
+                if (fatal_error_.empty() && server_models::is_fatal_gpu_error(buffer.data())) {
+                    fatal_error_ = string_strip(buffer.data());
+                    subprocess_terminate(&process_);
+                }
             }
         });
     }
@@ -327,6 +332,7 @@ class child_server {
     int pid() const { return process_id(process_); }
     bool alive() { return started_ && subprocess_alive(&process_); }
     std::string logs() const { std::lock_guard<std::mutex> lock(log_mutex_); return logs_; }
+    std::string fatal_error() const { std::lock_guard<std::mutex> lock(log_mutex_); return fatal_error_; }
 
     void stop() {
         if (!started_) return;
@@ -344,6 +350,7 @@ class child_server {
     bool started_ = false;
     mutable std::mutex log_mutex_;
     std::string logs_;
+    std::string fatal_error_;
     std::thread reader_;
 };
 
@@ -450,7 +457,13 @@ json profile(const json & item, const json & cfg, const std::filesystem::path & 
         if (response && response->status == 200) { ready = true; break; }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
-    if (!ready) throw std::runtime_error("isolated llama-server did not become ready: " + server.logs().substr(0, 2000));
+    if (!ready) {
+        const std::string fatal = server.fatal_error();
+        if (!fatal.empty()) {
+            throw server_model_safety_error("fatal GPU error; streaming benchmark stopped without retry: " + fatal);
+        }
+        throw std::runtime_error("isolated llama-server did not become ready: " + server.logs().substr(0, 2000));
+    }
     const double load_ms = elapsed_ms(load_started);
 
     const auto logical = split_args(item.value("extra_args", std::string()));
@@ -472,7 +485,13 @@ json profile(const json & item, const json & cfg, const std::filesystem::path & 
     const auto warmup_started = clock_type::now();
     const auto warmup = stream_request(client, warmup_request, cancelled);
     const double warmup_ms = elapsed_ms(warmup_started);
-    if (!warmup.ok) throw std::runtime_error("streaming warmup failed with HTTP " + std::to_string(warmup.status));
+    if (!warmup.ok) {
+        const std::string fatal = server.fatal_error();
+        if (!fatal.empty()) {
+            throw server_model_safety_error("fatal GPU error; streaming benchmark stopped without retry: " + fatal);
+        }
+        throw std::runtime_error("streaming warmup failed with HTTP " + std::to_string(warmup.status));
+    }
 
     std::atomic<bool> sampling{true};
     std::mutex samples_mutex;
@@ -515,7 +534,10 @@ json profile(const json & item, const json & cfg, const std::filesystem::path & 
         if (cancelled && cancelled()) break;
         const auto measured = stream_request(client, request, cancelled);
         if (!measured.ok) {
-            request_error = "streaming request failed with HTTP " + std::to_string(measured.status);
+            const std::string fatal = server.fatal_error();
+            request_error = fatal.empty()
+                ? "streaming request failed with HTTP " + std::to_string(measured.status)
+                : "fatal GPU error; streaming benchmark stopped without retry: " + fatal;
             break;
         }
         std::vector<double> itl;
@@ -550,7 +572,12 @@ json profile(const json & item, const json & cfg, const std::filesystem::path & 
     }
     sampling.store(false);
     sampler.join();
-    if (!request_error.empty()) throw std::runtime_error(request_error);
+    if (!request_error.empty()) {
+        if (server_models::is_fatal_gpu_error(request_error)) {
+            throw server_model_safety_error(request_error);
+        }
+        throw std::runtime_error(request_error);
+    }
 
     const json parsed_logs = caliber::parse_llama_server_stderr(server.logs());
     for (auto & run : runs) {
