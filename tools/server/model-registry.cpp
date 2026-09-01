@@ -154,8 +154,20 @@ std::string scan_signature(const std::vector<file_entry> & files, const std::vec
         hash = fnv_text(hash, std::to_string(file.mtime));
         hash = fnv_text(hash, file.partial ? "partial" : "complete");
     }
+    std::vector<std::string> configured_rows;
+    configured_rows.reserve(configured.size());
     for (const auto & model : configured) {
-        hash = fnv_text(hash, model.id + path_key(model.path) + model.status);
+        const std::array<std::string, 4> fields = {model.id, path_key(model.path), model.source, model.status};
+        std::string row;
+        for (const auto & field : fields) {
+            row += std::to_string(field.size()) + ":" + field;
+        }
+        configured_rows.push_back(std::move(row));
+    }
+    std::sort(configured_rows.begin(), configured_rows.end());
+    configured_rows.erase(std::unique(configured_rows.begin(), configured_rows.end()), configured_rows.end());
+    for (const auto & row : configured_rows) {
+        hash = fnv_text(hash, std::to_string(row.size()) + ":" + row);
     }
     return hex64(hash);
 }
@@ -196,6 +208,49 @@ std::vector<file_entry> discover_files(const std::vector<std::filesystem::path> 
 
 } // namespace
 
+bool is_media_generation_artifact(const json & artifact) {
+    const auto string_field = [&artifact](const char * key) {
+        const auto it = artifact.find(key);
+        return it != artifact.end() && it->is_string() ? it->get<std::string>() : std::string();
+    };
+    std::string path = string_field("primary_path");
+    if (path.empty()) path = string_field("path");
+    std::replace(path.begin(), path.end(), '\\', '/');
+    path = lower(path);
+    const auto path_has_segment = [&path](const std::string & segment) {
+        return path == segment ||
+               path.rfind(segment + "/", 0) == 0 ||
+               path.find("/" + segment + "/") != std::string::npos ||
+               ends_with_ci(path, "/" + segment);
+    };
+    if (path_has_segment("media") || path_has_segment("text_encoders")) return true;
+
+    json metadata = json::object();
+    const auto metadata_it = artifact.find("metadata");
+    if (metadata_it != artifact.end() && metadata_it->is_object()) metadata = *metadata_it;
+    std::string architecture;
+    const auto architecture_it = metadata.find("gguf_architecture");
+    if (architecture_it != metadata.end() && architecture_it->is_string()) {
+        architecture = lower(architecture_it->get<std::string>());
+    }
+    static const std::set<std::string> media_architectures = {
+        "flux", "hunyuan_video", "lumina2", "sd3", "sdxl", "stable_diffusion", "t5encoder", "wan",
+    };
+    if (media_architectures.count(architecture) > 0) return true;
+
+    const std::string identity = lower(
+        string_field("id") + " " +
+        string_field("model_id") + " " +
+        string_field("name") + " " +
+        std::filesystem::path(path).filename().string());
+    static const std::array<const char *, 9> media_markers = {
+        "fastwan", "hunyuan-video", "i2v", "ltx-video", "t2v", "ti2v", "wan2", "z-image", "zimage",
+    };
+    return std::any_of(media_markers.begin(), media_markers.end(), [&identity](const char * marker) {
+        return identity.find(marker) != std::string::npos;
+    });
+}
+
 json index::scan(const std::vector<std::filesystem::path> & roots, const std::vector<configured_model> & configured, bool refresh) {
     const auto discovered = discover_files(roots);
     const std::string signature = scan_signature(discovered, configured);
@@ -220,8 +275,8 @@ json index::scan(const std::vector<std::filesystem::path> & roots, const std::ve
         groups[group].push_back(file);
     }
 
-    std::map<std::string, configured_model> configured_by_path;
-    for (const auto & model : configured) configured_by_path[path_key(model.path)] = model;
+    std::map<std::string, std::set<std::string>> configured_by_path;
+    for (const auto & model : configured) configured_by_path[path_key(model.path)].insert(model.id);
     json artifacts = json::array();
     std::map<std::string, std::vector<size_t>> sampled_groups;
     for (auto & [_, files] : groups) {
@@ -282,7 +337,11 @@ json index::scan(const std::vector<std::filesystem::path> & roots, const std::ve
             const auto configured_it = configured_by_path.find(path_key(file.path));
             if (configured_it != configured_by_path.end()) {
                 is_configured = true;
-                configured_ids.push_back(configured_it->second.id);
+                for (const auto & configured_id : configured_it->second) {
+                    if (std::find(configured_ids.begin(), configured_ids.end(), configured_id) == configured_ids.end()) {
+                        configured_ids.push_back(configured_id);
+                    }
+                }
             }
         }
         json mmproj = nullptr;

@@ -145,12 +145,23 @@ static std::string run_command_capture(const std::filesystem::path & executable,
     });
     std::array<char, 4096> buffer{};
     std::string output;
+    std::string fatal_gpu_error;
     FILE * pipe = subprocess_stdout(&process);
-    while (fgets(buffer.data(), (int) buffer.size(), pipe) != nullptr) output += buffer.data();
+    while (fgets(buffer.data(), (int) buffer.size(), pipe) != nullptr) {
+        output += buffer.data();
+        if (fatal_gpu_error.empty() && server_models::is_fatal_gpu_error(buffer.data())) {
+            fatal_gpu_error = buffer.data();
+            subprocess_terminate(&process);
+        }
+    }
     done.store(true);
     timeout.join();
     subprocess_join(&process, &exit_code);
     subprocess_destroy(&process);
+    if (!fatal_gpu_error.empty()) {
+        throw server_model_safety_error("fatal GPU error; benchmark stopped without retry: "
+                + string_strip(fatal_gpu_error));
+    }
     return output;
 }
 
@@ -566,7 +577,16 @@ static bool use_streaming_profiler(const caliber_json & item, const caliber_json
     return caliber_json_value(item, "row_role", std::string()) == "candidate";
 }
 
-static caliber_json run_profile_item(const caliber_json & item, const caliber_json & cfg, const std::function<bool()> & cancelled) {
+static caliber_json run_profile_item(
+        const caliber_json & item,
+        const caliber_json & cfg,
+        const std::function<bool()> & cancelled,
+        server_models * models) {
+    if (models != nullptr) {
+        llama_bench_dims guard_dims;
+        const auto guard_args = llama_bench_args_for_item(item, cfg, guard_dims);
+        models->guard_external_load("Caliber benchmark", guard_args);
+    }
     if (use_streaming_profiler(item, cfg)) {
         return streaming_profiler::profile(item, cfg, current_executable_dir() / "llama-server", cancelled);
     }
@@ -622,6 +642,10 @@ static caliber_json report_summary(const caliber_json & report, const std::files
         {"model", caliber_json_value(report, "model", std::string())},
         {"plan_items", report.contains("plan") && report["plan"].is_array() ? report["plan"].size() : 0},
         {"rows", report.contains("rows") && report["rows"].is_array() ? report["rows"].size() : 0},
+        {"history_compatible", caliber_json_value(report, "history_compatible", false)},
+        {"stale", caliber_json_value(report, "stale", false)},
+        {"legacy", caliber_json_value(report, "legacy", false)},
+        {"compatibility_reasons", caliber_json_value(report, "compatibility_reasons", caliber_json::array())},
     };
 }
 
@@ -637,39 +661,50 @@ static bool is_legacy_invalid_llama_bench_row(const caliber_json & row) {
     return missing_ctx && (no_prompt_metric || first_run_is_prompt_only);
 }
 
-static caliber_json normalize_report_for_api(caliber_json report) {
-    if (!report.contains("rows") || !report["rows"].is_array()) return report;
+static caliber_json normalize_report_for_api(caliber_json report, const caliber_json & current_runtime) {
+    const caliber_json compatibility = caliber::report_history_compatibility(report, current_runtime);
+    const bool history_compatible = caliber_json_value(compatibility, "compatible", false);
+    report["history_compatible"] = history_compatible;
+    report["stale"] = caliber_json_value(compatibility, "stale", false);
+    report["legacy"] = caliber_json_value(compatibility, "legacy", false);
+    report["compatibility_reasons"] = caliber_json_value(compatibility, "reasons", caliber_json::array());
+    if (!history_compatible) report["automatic_fit_allowed"] = false;
+
     int invalid = 0;
     const std::string report_id = caliber_json_value(report, "id", std::string());
-    for (auto & row : report["rows"]) {
-        if (!row.is_object()) continue;
-        if (!report_id.empty()) row["report_id"] = report_id;
-        if (caliber_json_value(row, "benchmark_backend", std::string()) == "llama-bench") {
-            const int allocated = caliber_json_value(row, "benchmark_allocated_context_size", 0);
-            const int requested = caliber_json_value(row, "requested_context_size", 0);
-            const int reported = caliber_json_value(row, "ctx_size", 0);
-            if (allocated > 0) {
-                if (reported > 0 && reported != allocated) row["legacy_reported_context_size"] = reported;
-                row["ctx_size"] = allocated;
-                row["measured_context_size"] = allocated;
-                row["context_target_met"] = requested <= 0 || allocated >= requested;
-                row["context_measurement_kind"] = "synthetic-test-shape";
+    if (report.contains("rows") && report["rows"].is_array()) {
+        for (auto & row : report["rows"]) {
+            if (!row.is_object()) continue;
+            if (!report_id.empty()) row["report_id"] = report_id;
+            row["history_compatible"] = history_compatible;
+            if (!history_compatible) row["fit_eligible"] = false;
+            if (caliber_json_value(row, "benchmark_backend", std::string()) == "llama-bench") {
+                const int allocated = caliber_json_value(row, "benchmark_allocated_context_size", 0);
+                const int requested = caliber_json_value(row, "requested_context_size", 0);
+                const int reported = caliber_json_value(row, "ctx_size", 0);
+                if (allocated > 0) {
+                    if (reported > 0 && reported != allocated) row["legacy_reported_context_size"] = reported;
+                    row["ctx_size"] = allocated;
+                    row["measured_context_size"] = allocated;
+                    row["context_target_met"] = requested <= 0 || allocated >= requested;
+                    row["context_measurement_kind"] = "synthetic-test-shape";
+                }
+                row["memory_measurement_kind"] = "unavailable";
+                row["evidence_level"] = "synthetic-measured";
+                row["fit_eligible"] = false;
+                if (caliber_json_value(row, "run_count", 0) < 2 && caliber_json_value(row, "measurement_confidence", std::string()) == "reliable") {
+                    row["measurement_confidence"] = "provisional";
+                }
             }
-            row["memory_measurement_kind"] = "unavailable";
-            row["evidence_level"] = "synthetic-measured";
-            row["fit_eligible"] = false;
-            if (caliber_json_value(row, "run_count", 0) < 2 && caliber_json_value(row, "measurement_confidence", std::string()) == "reliable") {
-                row["measurement_confidence"] = "provisional";
+            if (is_legacy_invalid_llama_bench_row(row)) {
+                row["ok"] = false;
+                row["eval_tps"] = 0;
+                row["measurement_confidence"] = "invalid";
+                row["failure_reason"] = "legacy_invalid_llama_bench_prompt_row";
+                row["recommendation"] = "rerun-required";
+                row["recommendation_reason"] = "This row was produced before llama-bench prompt/generation rows were separated; rerun the benchmark.";
+                ++invalid;
             }
-        }
-        if (is_legacy_invalid_llama_bench_row(row)) {
-            row["ok"] = false;
-            row["eval_tps"] = 0;
-            row["measurement_confidence"] = "invalid";
-            row["failure_reason"] = "legacy_invalid_llama_bench_prompt_row";
-            row["recommendation"] = "rerun-required";
-            row["recommendation_reason"] = "This row was produced before llama-bench prompt/generation rows were separated; rerun the benchmark.";
-            ++invalid;
         }
     }
     if (invalid > 0) {
@@ -677,8 +712,10 @@ static caliber_json normalize_report_for_api(caliber_json report) {
         report["status_note"] = "Contains legacy invalid llama-bench rows; rerun required for comparison/FIT.";
     }
     std::vector<caliber_json> rows;
-    for (const auto & row : report["rows"]) {
-        if (row.is_object()) rows.push_back(row);
+    if (history_compatible && report.contains("rows") && report["rows"].is_array()) {
+        for (const auto & row : report["rows"]) {
+            if (row.is_object()) rows.push_back(row);
+        }
     }
     report["recommendations"] = caliber::build_recommendations(rows);
     report["recommendation_policy"] = {
@@ -694,6 +731,8 @@ struct server_caliber_advisor_routes::impl {
     server_models_routes & router;
     std::mutex jobs_mutex;
     std::map<std::string, std::shared_ptr<caliber_job>> jobs;
+    uint64_t job_counter = 0;
+    std::string active_job_id;
 
     explicit impl(server_models_routes & router) : router(router) {}
 
@@ -716,21 +755,35 @@ struct server_caliber_advisor_routes::impl {
         return snapshot_locked(job);
     }
 
+    std::shared_ptr<caliber_job> create_job(std::string & error) {
+        std::lock_guard<std::mutex> lock(jobs_mutex);
+        if (!active_job_id.empty()) {
+            error = "another Caliber campaign is already running";
+            return nullptr;
+        }
+
+        auto job = std::make_shared<caliber_job>();
+        const auto epoch_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+        do {
+            job->id = "caliber-" + std::to_string(epoch_us) + "-" + std::to_string(job_counter++);
+        } while (jobs.find(job->id) != jobs.end());
+        jobs[job->id] = job;
+        active_job_id = job->id;
+        return job;
+    }
+
+    void clear_active_job(const std::shared_ptr<caliber_job> & job) {
+        std::lock_guard<std::mutex> lock(jobs_mutex);
+        if (active_job_id == job->id) active_job_id.clear();
+    }
+
     std::shared_ptr<caliber_job> find_job(const std::string & id) {
         std::lock_guard<std::mutex> lock(jobs_mutex);
-        if (!id.empty()) {
-            auto it = jobs.find(id);
-            return it == jobs.end() ? nullptr : it->second;
-        }
-        std::shared_ptr<caliber_job> latest;
-        for (const auto & [_, job] : jobs) {
-            std::lock_guard<std::mutex> job_lock(job->mutex);
-            if (caliber_job_status_live(job->status) && !job->finished) {
-                return job;
-            }
-            latest = job;
-        }
-        return latest;
+        const std::string resolved_id = id.empty() ? active_job_id : id;
+        if (resolved_id.empty()) return nullptr;
+        auto it = jobs.find(resolved_id);
+        return it == jobs.end() ? nullptr : it->second;
     }
 
     void publish(const std::shared_ptr<caliber_job> & job, const std::string & event, caliber_json data) {
@@ -767,41 +820,55 @@ struct server_caliber_advisor_routes::impl {
             }
         }
         if (!requested_path.empty()) {
-            metas.push_back(caliber::read_gguf_plan_meta(requested_path));
+            caliber_json meta = caliber::read_gguf_plan_meta(requested_path);
+            const model_registry::json artifact = {
+                {"primary_path", requested_path},
+                {"metadata", model_registry::json::parse(meta.dump())},
+            };
+            if (!model_registry::is_media_generation_artifact(artifact)) metas.push_back(std::move(meta));
             return metas;
         }
         const caliber_json registry = caliber_from_common(router.scan_model_registry(false));
         if (!registry.contains("artifacts") || !registry["artifacts"].is_array()) return metas;
         for (const auto & artifact : registry["artifacts"]) {
-            if (!artifact.value("loadable", false)) continue;
+            const model_registry::json registry_artifact = model_registry::json::parse(artifact.dump());
+            if (!artifact.value("loadable", false) || model_registry::is_media_generation_artifact(registry_artifact)) continue;
             const std::string artifact_id = caliber_json_value(artifact, "artifact_id", std::string());
-            bool configured_match = false;
-            std::string configured_id;
+            std::vector<std::string> configured_ids;
             if (artifact.contains("configured_ids") && artifact["configured_ids"].is_array()) {
                 for (const auto & id : artifact["configured_ids"]) {
                     if (!id.is_string()) continue;
                     const std::string candidate = id.get<std::string>();
-                    if (configured_id.empty()) configured_id = candidate;
-                    if (candidate == requested || requested_models.count(candidate)) {
-                        configured_match = true;
-                        configured_id = candidate;
-                    }
+                    if (!candidate.empty()) configured_ids.push_back(candidate);
                 }
             }
-            if (!requested.empty() && requested != artifact_id && !configured_match) continue;
-            if (!requested_models.empty() && !requested_models.count(artifact_id) && !configured_match) continue;
-            caliber_json meta = caliber_json_value(artifact, "metadata", caliber_json::object());
-            if (!configured_id.empty()) {
-                meta["display_name"] = caliber_json_value(meta, "model", caliber_json_value(artifact, "name", configured_id));
-                meta["model"] = configured_id;
-                meta["configured_id"] = configured_id;
+
+            const bool has_filter = !requested.empty() || !requested_models.empty();
+            const bool artifact_selected = requested == artifact_id || requested_models.count(artifact_id) > 0;
+            std::vector<std::string> selected_configured_ids;
+            for (const auto & configured_id : configured_ids) {
+                if (!has_filter || configured_id == requested || requested_models.count(configured_id) > 0) {
+                    selected_configured_ids.push_back(configured_id);
+                }
             }
-            meta["path"] = caliber_json_value(artifact, "primary_path", std::string());
-            meta["artifact_id"] = artifact_id;
-            meta["model_id"] = caliber_json_value(artifact, "model_id", std::string());
-            meta["preset_id"] = caliber_json_value(artifact, "preset_id", std::string());
-            meta["mmproj"] = artifact.value("mmproj_path", caliber_json(nullptr));
-            metas.push_back(std::move(meta));
+            if (artifact_selected && selected_configured_ids.empty()) selected_configured_ids = configured_ids;
+            if (has_filter && !artifact_selected && selected_configured_ids.empty()) continue;
+            if (selected_configured_ids.empty()) selected_configured_ids.push_back("");
+
+            for (const auto & configured_id : selected_configured_ids) {
+                caliber_json meta = caliber_json_value(artifact, "metadata", caliber_json::object());
+                if (!configured_id.empty()) {
+                    meta["display_name"] = caliber_json_value(meta, "model", caliber_json_value(artifact, "name", configured_id));
+                    meta["model"] = configured_id;
+                    meta["configured_id"] = configured_id;
+                }
+                meta["path"] = caliber_json_value(artifact, "primary_path", std::string());
+                meta["artifact_id"] = artifact_id;
+                meta["model_id"] = caliber_json_value(artifact, "model_id", std::string());
+                meta["preset_id"] = caliber_json_value(artifact, "preset_id", std::string());
+                meta["mmproj"] = artifact.value("mmproj_path", caliber_json(nullptr));
+                metas.push_back(std::move(meta));
+            }
         }
         return metas;
     }
@@ -826,26 +893,38 @@ struct server_caliber_advisor_routes::impl {
             if (artifact.value("loadable", false)) ++ready; else ++unhealthy;
             if (artifact.contains("duplicate_of") && !artifact["duplicate_of"].is_null()) ++duplicates;
         }
-        int stale_reports = 0, legacy_reports = 0;
+        int stale_reports = 0, legacy_reports = 0, incompatible_reports = 0;
         caliber_json stale = caliber_json::array();
+        caliber_json incompatible = caliber_json::array();
         for (const auto & report : server_persistence::load_reports("caliber-advisor")) {
             const caliber_json report_json = caliber_from_common(report);
-            const caliber_json recorded = report_json.value("runtime_profile", caliber_json::object());
-            if (recorded.empty()) { ++legacy_reports; continue; }
-            const std::string recorded_commit = recorded.value("build", caliber_json::object()).value("commit", std::string());
-            const std::string current_commit = runtime.value("build", caliber_json::object()).value("commit", std::string());
-            const std::string recorded_driver = caliber_json_value(recorded, "gpu_driver", std::string());
-            const std::string current_driver = caliber_json_value(runtime, "gpu_driver", std::string());
-            caliber_json reasons = caliber_json::array();
-            if (!recorded_commit.empty() && recorded_commit != current_commit) reasons.push_back("llama.cpp build changed");
-            if (!recorded_driver.empty() && !current_driver.empty() && recorded_driver != current_driver) reasons.push_back("GPU driver changed");
-            if (!reasons.empty()) { ++stale_reports; stale.push_back({{"report_id", report.value("id", std::string())}, {"reasons", reasons}}); }
+            const caliber_json compatibility = caliber::report_history_compatibility(report_json, runtime);
+            const bool is_stale = caliber_json_value(compatibility, "stale", false);
+            const bool is_legacy = caliber_json_value(compatibility, "legacy", false);
+            const bool is_compatible = caliber_json_value(compatibility, "compatible", false);
+            const caliber_json reasons = caliber_json_value(compatibility, "reasons", caliber_json::array());
+            const std::string report_id = caliber_json_value(report_json, "id", std::string());
+            if (is_stale) {
+                ++stale_reports;
+                stale.push_back({{"report_id", report_id}, {"reasons", reasons}});
+            }
+            if (is_legacy) ++legacy_reports;
+            if (!is_compatible) {
+                ++incompatible_reports;
+                incompatible.push_back({
+                    {"report_id", report_id},
+                    {"stale", is_stale},
+                    {"legacy", is_legacy},
+                    {"reasons", reasons},
+                });
+            }
         }
         const bool state_writable = std::filesystem::exists(server_persistence::database_path()) && access(server_persistence::database_path().c_str(), W_OK) == 0;
         res_ok(res, {{"module", "caliber-advisor"}, {"reports_dir", reports_dir().string()}, {"default_cfg", default_plan_cfg()},
             {"runtime_profile", runtime}, {"doctor", {
                 {"ready_artifacts", ready}, {"unhealthy_artifacts", unhealthy}, {"duplicate_artifacts", duplicates},
-                {"stale_reports", stale_reports}, {"legacy_reports", legacy_reports}, {"stale", stale},
+                {"stale_reports", stale_reports}, {"legacy_reports", legacy_reports}, {"incompatible_reports", incompatible_reports},
+                {"stale", stale}, {"incompatible", incompatible},
                 {"state_database", server_persistence::database_path().string()}, {"state_writable", state_writable},
                 {"streaming_profiler_available", std::filesystem::exists(current_executable_dir() / "llama-server")},
                 {"synthetic_runner_available", std::filesystem::exists(current_executable_dir() / "llama-bench")},
@@ -861,36 +940,52 @@ struct server_caliber_advisor_routes::impl {
         if (registry.contains("artifacts") && registry["artifacts"].is_array()) {
             for (const auto & artifact : registry["artifacts"]) {
                 const bool loadable = artifact.value("loadable", false);
-                caliber_json tags = caliber_json::array();
-                caliber_json aliases = caliber_json::array();
+                const bool media_artifact = model_registry::is_media_generation_artifact(
+                        model_registry::json::parse(artifact.dump()));
+                std::vector<std::string> configured_ids;
                 if (artifact.contains("configured_ids") && artifact["configured_ids"].is_array()) {
                     for (const auto & configured_id : artifact["configured_ids"]) {
                         if (!configured_id.is_string()) continue;
-                        const auto meta = router.models.get_meta(configured_id.get<std::string>());
-                        if (!meta.has_value()) continue;
-                        for (const auto & tag : meta->tags) if (std::find(tags.begin(), tags.end(), tag) == tags.end()) tags.push_back(tag);
-                        for (const auto & alias : meta->aliases) if (std::find(aliases.begin(), aliases.end(), alias) == aliases.end()) aliases.push_back(alias);
+                        const std::string id = configured_id.get<std::string>();
+                        if (!id.empty()) configured_ids.push_back(id);
                     }
                 }
-                models.push_back({
-                    {"id", caliber_json_value(artifact, "artifact_id", std::string())},
-                    {"artifact_id", caliber_json_value(artifact, "artifact_id", std::string())},
-                    {"model_id", caliber_json_value(artifact, "model_id", std::string())},
-                    {"preset_id", caliber_json_value(artifact, "preset_id", std::string())},
-                    {"name", caliber_json_value(artifact, "name", std::string())},
-                    {"source", "registry"},
-                    {"status", caliber_json_value(artifact, "health", std::string())},
-                    {"loadable", loadable},
-                    {"configured", artifact.value("configured", false)},
-                    {"configured_ids", artifact.value("configured_ids", caliber_json::array())},
-                    {"tags", tags},
-                    {"aliases", aliases},
-                    {"path", loadable ? artifact.value("primary_path", caliber_json(nullptr)) : caliber_json(nullptr)},
-                    {"plan_meta", artifact.value("metadata", caliber_json::object())},
-                    {"missing_shards", artifact.value("missing_shards", caliber_json::array())},
-                    {"duplicate_of", artifact.value("duplicate_of", caliber_json(nullptr))},
-                    {"redundant_quantization", artifact.value("redundant_quantization", false)},
-                });
+                if (configured_ids.empty()) configured_ids.push_back("");
+                for (const auto & configured_id : configured_ids) {
+                    caliber_json tags = caliber_json::array();
+                    caliber_json aliases = caliber_json::array();
+                    if (!configured_id.empty()) {
+                        const auto meta = router.models.get_meta(configured_id);
+                        if (meta.has_value()) {
+                            for (const auto & tag : meta->tags) tags.push_back(tag);
+                            for (const auto & alias : meta->aliases) aliases.push_back(alias);
+                        }
+                    }
+                    const std::string artifact_id = caliber_json_value(artifact, "artifact_id", std::string());
+                    const bool benchmark_eligible = loadable && !media_artifact;
+                    models.push_back({
+                        {"id", configured_id.empty() ? artifact_id : configured_id},
+                        {"artifact_id", artifact_id},
+                        {"model_id", caliber_json_value(artifact, "model_id", std::string())},
+                        {"preset_id", caliber_json_value(artifact, "preset_id", std::string())},
+                        {"configured_id", configured_id.empty() ? caliber_json(nullptr) : caliber_json(configured_id)},
+                        {"name", configured_id.empty() ? caliber_json_value(artifact, "name", std::string()) : configured_id},
+                        {"source", "registry"},
+                        {"status", caliber_json_value(artifact, "health", std::string())},
+                        {"loadable", loadable},
+                        {"configured", !configured_id.empty()},
+                        {"configured_ids", configured_id.empty() ? caliber_json::array() : caliber_json::array({configured_id})},
+                        {"benchmark_eligible", benchmark_eligible},
+                        {"eligibility_reason", benchmark_eligible ? caliber_json(nullptr) : caliber_json(media_artifact ? "Media generation artifact" : "Artifact is not loadable")},
+                        {"tags", tags},
+                        {"aliases", aliases},
+                        {"path", loadable ? artifact.value("primary_path", caliber_json(nullptr)) : caliber_json(nullptr)},
+                        {"plan_meta", artifact.value("metadata", caliber_json::object())},
+                        {"missing_shards", artifact.value("missing_shards", caliber_json::array())},
+                        {"duplicate_of", artifact.value("duplicate_of", caliber_json(nullptr))},
+                        {"redundant_quantization", artifact.value("redundant_quantization", false)},
+                    });
+                }
             }
         }
         res_ok(res, {{"object", "list"}, {"data", models}});
@@ -910,11 +1005,11 @@ struct server_caliber_advisor_routes::impl {
         auto res = std::make_unique<server_http_res>();
         if (!require_admin_api_key(req, router.params, res)) return res;
         const caliber_json body = req.body.empty() ? caliber_json::object() : caliber_json::parse(req.body);
-        auto job = std::make_shared<caliber_job>();
-        job->id = slugify("caliber-" + isoish_timestamp() + "-" + std::to_string(jobs.size() + 1));
-        {
-            std::lock_guard<std::mutex> lock(jobs_mutex);
-            jobs[job->id] = job;
+        std::string error;
+        auto job = create_job(error);
+        if (!job) {
+            res_err(res, error, 409);
+            return res;
         }
         publish(job, "queued", caliber_json::object());
         std::thread([this, job, body]() {
@@ -931,6 +1026,7 @@ struct server_caliber_advisor_routes::impl {
                         job->status = "cancelled";
                         job->finished = true;
                     }
+                    clear_active_job(job);
                     publish(job, "cancelled", {{"message", "Campaign cancelled before start"}});
                     return;
                 }
@@ -964,7 +1060,7 @@ struct server_caliber_advisor_routes::impl {
                 const std::string model_name = payload["models"].is_array() && !payload["models"].empty()
                     ? caliber_json_value(payload["models"][0], "model", std::string("local"))
                     : std::string("local");
-                const std::string report_id = slugify(model_name + "-" + isoish_timestamp());
+                const std::string report_id = slugify(model_name + "-" + job->id);
                 caliber_json rows = caliber_json::array();
                 std::vector<caliber_json> winner_rows;
                 bool cancelled = false;
@@ -980,11 +1076,16 @@ struct server_caliber_advisor_routes::impl {
                     }
                     publish(job, "bench", {{"item", item_id}});
                     try {
-                        caliber_json row = run_profile_item(item, payload["cfg"], cancel_requested);
+                        caliber_json row = run_profile_item(item, payload["cfg"], cancel_requested, &router.models);
                         rows.push_back(row);
                         winner_rows.push_back(row);
                         publish(job, "row", {{"ok", true}, {"item", item_id}, {"eval_tps", caliber_json_value(row, "eval_tps", 0.0)}});
+                    } catch (const server_model_safety_error &) {
+                        throw;
                     } catch (const std::exception & e) {
+                        if (server_models::is_fatal_gpu_error(e.what())) {
+                            throw;
+                        }
                         caliber_json row = item;
                         const int requested_ctx = requested_context_for_item(item, payload["cfg"]);
                         row["ok"] = false;
@@ -1077,6 +1178,7 @@ struct server_caliber_advisor_routes::impl {
                     job->report_id = report_id;
                     job->current_item.clear();
                 }
+                clear_active_job(job);
                 publish(job, "report", {{"report_id", report_id}, {"plan_count", payload["plan"].size()}});
                 publish(job, cancelled ? "cancelled" : "done", {{"report_id", report_id}});
                 for (const auto & name : restore_models) {
@@ -1091,6 +1193,7 @@ struct server_caliber_advisor_routes::impl {
                     job->finished = true;
                     job->current_item.clear();
                 }
+                clear_active_job(job);
                 publish(job, "error", {{"error", e.what()}});
             }
             for (const auto & name : restore_models) {
@@ -1176,10 +1279,11 @@ struct server_caliber_advisor_routes::impl {
 
     server_http_res_ptr handle_reports(const server_http_req & req) {
         auto res = std::make_unique<server_http_res>();
+        const caliber_json runtime = current_runtime_profile();
         std::vector<caliber_json> report_items;
         for (const auto & report : server_persistence::load_reports("caliber-advisor")) {
             if (!report.is_object()) continue;
-            report_items.push_back(report_summary(caliber_from_common(report), {}));
+            report_items.push_back(report_summary(normalize_report_for_api(caliber_from_common(report), runtime), {}));
         }
         std::sort(report_items.begin(), report_items.end(), [](const caliber_json & a, const caliber_json & b) {
             return caliber_json_value(a, "created_at", std::string()) > caliber_json_value(b, "created_at", std::string());
@@ -1214,7 +1318,7 @@ struct server_caliber_advisor_routes::impl {
             res_err(res, "report not found", 404);
             return res;
         }
-        res_ok(res, normalize_report_for_api(report));
+        res_ok(res, normalize_report_for_api(report, current_runtime_profile()));
         return res;
     }
 
@@ -1239,6 +1343,7 @@ struct server_caliber_advisor_routes::impl {
 
     server_http_res_ptr handle_results(const server_http_req &) {
         auto res = std::make_unique<server_http_res>();
+        const caliber_json runtime = current_runtime_profile();
         caliber_json all_rows = caliber_json::array();
         caliber_json reports = caliber_json::array();
         std::vector<caliber_json> latest_rows;
@@ -1246,9 +1351,9 @@ struct server_caliber_advisor_routes::impl {
         std::string latest_report_id;
         for (const auto & stored_report : server_persistence::load_reports("caliber-advisor")) {
             try {
-                caliber_json report = normalize_report_for_api(caliber_from_common(stored_report));
+                caliber_json report = normalize_report_for_api(caliber_from_common(stored_report), runtime);
                 reports.push_back(report_summary(report, {}));
-                if (report.contains("rows") && report["rows"].is_array()) {
+                if (caliber_json_value(report, "history_compatible", false) && report.contains("rows") && report["rows"].is_array()) {
                     for (const auto & row : report["rows"]) all_rows.push_back(row);
                     const std::string created_at = caliber_json_value(report, "created_at", std::string());
                     if (created_at >= latest_created_at) {
@@ -1304,7 +1409,16 @@ struct server_caliber_advisor_routes::impl {
             res_err(res, "configure requires model/model_id");
             return res;
         }
-        const caliber_json report = caliber_from_common(server_persistence::load_report("caliber-advisor", report_id));
+        const caliber_json stored_report = caliber_from_common(server_persistence::load_report("caliber-advisor", report_id));
+        if (!stored_report.is_object()) {
+            res_err(res, "report not found", 404);
+            return res;
+        }
+        const caliber_json report = normalize_report_for_api(stored_report, current_runtime_profile());
+        if (!caliber_json_value(report, "history_compatible", false)) {
+            res_err(res, "configure requires a completed report from the current metric schema, recommendation policy, runtime build, and GPU driver", 403);
+            return res;
+        }
         caliber_json measured_row = nullptr;
         if (report.is_object() && report.contains("rows") && report["rows"].is_array()) {
             for (const auto & row : report["rows"]) {
