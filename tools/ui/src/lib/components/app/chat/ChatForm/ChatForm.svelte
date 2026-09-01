@@ -8,6 +8,7 @@
 		ChatFormInputFileInputInvisible,
 		ChatFormMcpResourcesList,
 		ChatFormPickers,
+		DialogGenerateMedia,
 		DialogMcpResourcesBrowser,
 		DialogMcpServers
 	} from '$lib/components/app';
@@ -194,6 +195,13 @@
 
 	// MCP Servers Dialog State
 	let isMcpServersDialogOpen = $state(false);
+	let isMediaDialogOpen = $state(false);
+	let mediaDialogKind = $state<'image' | 'video'>('image');
+
+	function openMediaDialog(kind: 'image' | 'video') {
+		mediaDialogKind = kind;
+		isMediaDialogOpen = true;
+	}
 
 	let currentConfig = $derived(settingsStore.config);
 
@@ -628,6 +636,8 @@
 				isReasoning={chatStore.isReasoning}
 				{isRecording}
 				onFileUpload={handleFileUpload}
+				onGenerateImage={() => openMediaDialog('image')}
+				onGenerateVideo={() => openMediaDialog('video')}
 				onMcpSettingsClick={() => (isMcpServersDialogOpen = true)}
 				onMicClick={handleMicClick}
 				{onStop}
@@ -669,3 +679,5 @@
 />
 
 <DialogMcpServers bind:open={isMcpServersDialogOpen} />
+
+<DialogGenerateMedia bind:open={isMediaDialogOpen} initialKind={mediaDialogKind} />

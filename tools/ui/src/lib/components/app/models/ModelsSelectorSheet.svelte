@@ -109,7 +109,7 @@
 					/>
 				{/if}
 
-				{#if ms.updating || ms.isLoadingModel}
+				{#if ms.updating || triggerLoading}
 					<Loader2 class="h-3 w-3.5 shrink-0 animate-spin" />
 				{:else}
 					<ChevronDown class="h-3 w-3.5 shrink-0" />

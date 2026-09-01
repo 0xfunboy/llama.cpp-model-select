@@ -15,7 +15,7 @@
 		ChatMessageAgenticTurnStats,
 		DatabaseMessage
 	} from '$lib/types';
-	import { deriveAgenticSections } from '$lib/utils';
+	import { deriveAgenticSections, hasCompletedGeneratedMediaBefore } from '$lib/utils';
 
 	interface Props {
 		message: DatabaseMessage;
@@ -181,7 +181,11 @@
 {#snippet renderSection(section: AgenticSection, index: number)}
 	{#if section.type === AgenticSectionType.TEXT}
 		<div class="agentic-text">
-			<MarkdownContent attachments={message?.extra} content={section.content} />
+			<MarkdownContent
+				attachments={message?.extra}
+				content={section.content}
+				suppressImages={hasCompletedGeneratedMediaBefore(sections, index)}
+			/>
 		</div>
 	{:else if section.type === AgenticSectionType.REASONING || section.type === AgenticSectionType.REASONING_PENDING}
 		<ChatMessageReasoningBlock
@@ -194,7 +198,7 @@
 		/>
 	{:else if section.type === AgenticSectionType.TOOL_CALL || section.type === AgenticSectionType.TOOL_CALL_PENDING || section.type === AgenticSectionType.TOOL_CALL_STREAMING}
 		<ChatMessageToolCallBlock
-			attachments={message?.extra}
+			attachments={section.toolResultExtras ?? message?.extra}
 			isExecuting={section.toolCallId !== undefined &&
 				section.toolCallId === currentlyExecutingToolCallId}
 			{isStreaming}

@@ -73,8 +73,8 @@ export class ModelsService {
 
 	/**
 	 * Load a model (ROUTER mode only).
-	 * Sends POST request to `/models/load`. Note: the endpoint returns success
-	 * before loading completes — use polling to await actual load status.
+	 * Sends POST request to `/models/load`. The router keeps the operation alive
+	 * until the worker is ready; SSE and /v1/models snapshots expose its progress.
 	 *
 	 * @param modelId - Model identifier to load
 	 * @param extraArgs - Optional additional arguments to pass to the model instance
@@ -214,8 +214,8 @@ export class ModelsService {
 
 	/**
 	 * Unload a model (ROUTER mode only).
-	 * Sends POST request to `/models/unload`. Note: the endpoint returns success
-	 * before unloading completes — use polling to await actual unload status.
+	 * Sends POST request to `/models/unload`. The router responds after the child
+	 * has stopped, while status snapshots keep page reloads informed.
 	 *
 	 * @param modelId - Model identifier to unload
 	 * @returns Unload response from the server
@@ -232,11 +232,13 @@ export class ModelsService {
 	 */
 	static async watchModelEvents(
 		signal: AbortSignal,
-		onEvent: (event: ApiModelsSseEvent) => void
+		onEvent: (event: ApiModelsSseEvent) => void,
+		onConnectionChange?: (state: 'connecting' | 'live' | 'reconnecting') => void
 	): Promise<void> {
 		const decoder = new TextDecoder();
 
 		while (!signal.aborted) {
+			onConnectionChange?.('connecting');
 			try {
 				const response = await fetch(`${base}${API_MODELS.SSE}`, {
 					headers: getAuthHeaders(),
@@ -244,6 +246,7 @@ export class ModelsService {
 				});
 
 				if (response.ok && response.body) {
+					onConnectionChange?.('live');
 					const reader = response.body.getReader();
 
 					let buffer = '';
@@ -272,6 +275,7 @@ export class ModelsService {
 
 			if (signal.aborted) return;
 
+			onConnectionChange?.('reconnecting');
 			await new Promise((resolve) => setTimeout(resolve, ModelsService.SSE_RECONNECT_MS));
 		}
 	}

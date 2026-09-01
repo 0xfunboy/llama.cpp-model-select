@@ -4,10 +4,12 @@
 		ChevronDown,
 		ChevronRight,
 		File,
+		Image,
 		Lightbulb,
 		LightbulbOff,
 		MessageSquare,
-		PencilRuler
+		PencilRuler,
+		Video
 	} from '@lucide/svelte';
 	import { McpLogo } from '$lib/components/app';
 	import { Checkbox } from '$lib/components/ui/checkbox';
@@ -80,6 +82,32 @@
 			</Sheet.Header>
 
 			<div class="flex flex-col gap-1 px-1.5 pb-2">
+				<button
+					class={sheetItemClass}
+					onclick={() => {
+						sheetOpen = false;
+						chatFormActions.onGenerateImage?.();
+					}}
+					type="button"
+				>
+					<Image class="{ICON_CLASS_DEFAULT} shrink-0" />
+
+					<span>Genera immagine</span>
+				</button>
+
+				<button
+					class={sheetItemClass}
+					onclick={() => {
+						sheetOpen = false;
+						chatFormActions.onGenerateVideo?.();
+					}}
+					type="button"
+				>
+					<Video class="{ICON_CLASS_DEFAULT} shrink-0" />
+
+					<span>Genera video</span>
+				</button>
+
 				{#if reasoning.modelSupportsThinking}
 					<Collapsible.Root
 						onOpenChange={(open) => (reasoningExpanded = open)}

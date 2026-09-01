@@ -30,6 +30,7 @@ export { contextStatsStore } from './chat/context-stats.svelte';
 
 // AGENTIC (multi-turn tool orchestration)
 export { agenticStore } from './agentic/index.svelte';
+export { mediaStore } from './media.svelte';
 
 // CONVERSATIONS
 export { conversationsStore } from './conversations/index.svelte';

@@ -204,16 +204,26 @@ class ModelsStore implements ModelPropsHost, ModelStatusHost {
 			const response = await ModelsService.listRouter();
 
 			this.routerModels = response.data;
+			this.status.reconcileSnapshot(response);
+			this.status.subscribe();
 			await this.props.fetchModalitiesForLoadedModels();
 
-			const visible = this.getVisibleModels();
+			const authoritativeTarget = response.operation?.active ? response.operation.target : null;
+			const targetOption = authoritativeTarget
+				? this.models.find((model) => model.model === authoritativeTarget)
+				: null;
 
-			if (visible.length === 1 && this.isModelLoaded(visible[0].model)) {
-				this.selectModelById(visible[0].id);
+			if (targetOption) {
+				await this.selectModelById(targetOption.id);
+			} else if (!this.selectedModelId) {
+				const loaded = this.getVisibleModels().filter((model) => this.isModelLoaded(model.model));
+
+				if (loaded.length === 1) await this.selectModelById(loaded[0].id);
 			}
 		} catch (error) {
 			console.warn('Failed to fetch router models:', error);
-			this.routerModels = [];
+			this.error =
+				error instanceof Error ? error.message : 'Failed to refresh backend model status';
 		}
 	}
 
@@ -427,13 +437,23 @@ class ModelsStore implements ModelPropsHost, ModelStatusHost {
 
 				this.routerModels = response.data;
 				this.models = this.buildModelOptions(response);
+				this.status.reconcileSnapshot(response);
+				this.status.subscribe();
 
 				await this.props.fetchModalitiesForLoadedModels();
 
 				const visible = this.getVisibleModels();
+				const authoritativeTarget = response.operation?.active ? response.operation.target : null;
+				const target = authoritativeTarget
+					? visible.find((model) => model.model === authoritativeTarget)
+					: null;
 
-				if (visible.length === 1 && this.isModelLoaded(visible[0].model)) {
-					this.selectModelById(visible[0].id);
+				if (target) {
+					await this.selectModelById(target.id);
+				} else {
+					const loaded = visible.filter((model) => this.isModelLoaded(model.model));
+
+					if (loaded.length === 1) await this.selectModelById(loaded[0].id);
 				}
 			} else {
 				this.models = await this.fetchModelModeInternal();

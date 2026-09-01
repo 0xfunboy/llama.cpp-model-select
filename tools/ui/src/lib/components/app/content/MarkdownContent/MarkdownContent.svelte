@@ -14,6 +14,7 @@
 	import { rehypeMermaidPre } from './plugins/rehype/mermaid-pre';
 	import { rehypeRtlSupport } from './plugins/rehype/rehype-rtl-support';
 	import { rehypeResolveAttachmentImages } from './plugins/rehype/resolve-attachment-images';
+	import { rehypeSuppressImages } from './plugins/rehype/suppress-images';
 	import { rehypeSvgPre } from './plugins/rehype/svg-pre';
 	import { rehypeRestoreTableHtml } from './plugins/rehype/table-html-restorer';
 	import { remarkLiteralHtml } from './plugins/remark/literal-html';
@@ -77,6 +78,8 @@
 		content: string;
 		class?: string;
 		disableMath?: boolean;
+		/** Hide Markdown images when a dedicated generated-media block owns the asset. */
+		suppressImages?: boolean;
 	}
 
 	interface MarkdownBlock {
@@ -85,7 +88,13 @@
 		contentHash?: string;
 	}
 
-	let { attachments, class: className = '', content, disableMath = false }: Props = $props();
+	let {
+		attachments,
+		class: className = '',
+		content,
+		disableMath = false,
+		suppressImages = false
+	}: Props = $props();
 
 	let containerRef = $state<HTMLDivElement>();
 	let renderedBlocks = $state<MarkdownBlock[]>([]);
@@ -143,11 +152,13 @@
 	// Garbage collected when component is destroyed (on conversation change)
 	const transformCache = new SvelteMap<string, string>();
 	let previousContent = '';
+	let previousSuppressImages: boolean | undefined;
 
 	const themeStyleId = `highlight-theme-${(window.idxThemeStyle = (window.idxThemeStyle ?? 0) + 1)}`;
 
 	let processor = $derived(() => {
 		void attachments;
+		void suppressImages;
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		let proc: any = remark().use(remarkGfm); // GitHub Flavored Markdown
 
@@ -164,7 +175,7 @@
 			proc = proc.use(rehypeKatex); // Render math using KaTeX
 		}
 
-		return proc
+		proc = proc
 			.use(rehypeHighlight, {
 				aliases: { [FileTypeText.XML]: [FileTypeText.SVELTE, FileTypeText.VUE] },
 				languages: lowlightAll
@@ -177,7 +188,11 @@
 			.use(rehypeEnhanceCodeBlocks) // Wrap code blocks with header and actions
 			.use(rehypeEnhanceMermaidBlocks) // Wrap mermaid blocks with header and actions
 			.use(rehypeEnhanceSvgBlocks) // Wrap svg blocks with header and actions
-			.use(rehypeResolveAttachmentImages, { attachments })
+			.use(rehypeResolveAttachmentImages, { attachments });
+
+		if (suppressImages) proc = proc.use(rehypeSuppressImages);
+
+		return proc
 			.use(rehypeRtlSupport) // Add bidirectional text support
 			.use(rehypeStringify, { allowDangerousHtml: true }); // Convert to HTML string
 	});
@@ -832,6 +847,15 @@
 	});
 
 	$effect(() => {
+		const nextSuppressImages = suppressImages;
+
+		if (previousSuppressImages !== undefined && nextSuppressImages !== previousSuppressImages) {
+			previousContent = '';
+			transformCache.clear();
+		}
+
+		previousSuppressImages = nextSuppressImages;
+
 		updateRenderedBlocks(content);
 	});
 

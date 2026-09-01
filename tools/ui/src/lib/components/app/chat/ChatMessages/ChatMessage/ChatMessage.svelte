@@ -295,7 +295,7 @@
 	}
 
 	function handleForkConversation(options: { name: string; includeAttachments: boolean }) {
-		chatActions.forkConversation(message, options);
+		chatActions.forkConversation(toolMessages[toolMessages.length - 1] ?? message, options);
 	}
 
 	function handleNavigateToSibling(siblingId: string) {

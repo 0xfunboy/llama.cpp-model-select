@@ -2,9 +2,10 @@
  * ModelStatusManager - Model load/unload operations and the /models/sse feed
  *
  * Owns the status feed subscription, load progress tracking, and the
- * awaiters that settle load/unload operations. The feed drives status and
- * progress, so it replaces any post-operation polling. Created and owned by
- * modelsStore; the host owns the router model rows the feed updates.
+ * awaiters that settle load/unload operations. SSE provides low-latency
+ * updates while authoritative /v1/models snapshots recover state after a
+ * refresh or feed interruption. Created and owned by modelsStore; the host
+ * owns the router model rows both paths update.
  */
 
 import { ServerModelsSseEventType, ServerModelStatus } from '$lib/enums';
@@ -30,10 +31,17 @@ export interface ModelStatusHost {
 	toDisplayName(id: string): string;
 }
 
+export type ModelBackendConnection = 'connecting' | 'live' | 'reconnecting' | 'stopped';
+
 export class ModelStatusManager {
+	backendOperation = $state<ApiRouterModelOperation | null>(null);
+	connection = $state<ModelBackendConnection>('stopped');
+	lastBackendSyncAt = $state(0);
 	private loadingStates = new SvelteMap<string, boolean>();
 	private loadProgress = new SvelteMap<string, ModelLoadProgress>();
-	// /models/sse feed state, the single source of truth for status and load progress
+	private loadStartedAt = new SvelteMap<string, number>();
+	private reconcileTimer: ReturnType<typeof setTimeout> | null = null;
+	// /models/sse feed state; periodic snapshots reconcile missed or stale events
 	private statusAbort: AbortController | null = null;
 	private statusReaderActive = false;
 	private statusWaiters = new SvelteMap<
@@ -56,8 +64,45 @@ export class ModelStatusManager {
 		return this.loadProgress.get(modelId) ?? null;
 	}
 
+	getLoadStartedAt(modelId: string): number | null {
+		if (this.backendOperation?.target === modelId && this.backendOperation.started_at > 0) {
+			return this.backendOperation.started_at;
+		}
+
+		return this.loadStartedAt.get(modelId) ?? null;
+	}
+
+	getTransitionModelId(): string | null {
+		if (this.backendOperation?.active && this.backendOperation.target) {
+			return this.backendOperation.target;
+		}
+
+		const loading = this.host.routerModels.find(
+			(model) => model.status.value === ServerModelStatus.LOADING
+		);
+
+		if (loading) return loading.id;
+
+		for (const [modelId, active] of this.loadingStates) {
+			if (active) return modelId;
+		}
+
+		return null;
+	}
+
+	hasActiveRequests(): boolean {
+		return this.host.routerModels.some((model) => (model.status.active_requests ?? 0) > 0);
+	}
+
 	isOperationInProgress(modelId: string): boolean {
-		return this.loadingStates.get(modelId) ?? false;
+		return (
+			(this.loadingStates.get(modelId) ?? false) ||
+			Boolean(this.backendOperation?.active && this.backendOperation.target === modelId)
+		);
+	}
+
+	isTransitionInProgress(): boolean {
+		return this.getTransitionModelId() !== null;
 	}
 
 	async load(modelId: string): Promise<void> {
@@ -65,8 +110,18 @@ export class ModelStatusManager {
 
 		if (this.loadingStates.get(modelId)) return;
 
+		const activeTarget = this.getTransitionModelId();
+
+		if (activeTarget && activeTarget !== modelId) {
+			throw new Error(
+				`The backend is already switching to ${this.host.toDisplayName(activeTarget)}`
+			);
+		}
+
 		this.loadingStates.set(modelId, true);
+		this.loadStartedAt.set(modelId, Date.now());
 		this.host.error = null;
+		this.requestReconcile();
 
 		// the feed drives completion, so it must be live before the request
 		this.subscribe();
@@ -82,11 +137,59 @@ export class ModelStatusManager {
 		} catch (error) {
 			this.rejectStatus(modelId, error instanceof Error ? error : new Error('load failed'));
 			this.host.error = error instanceof Error ? error.message : 'Failed to load model';
-			toast.error(`Failed to load model: ${this.host.toDisplayName(modelId)}`);
+			toast.error(this.host.error ?? `Failed to load ${this.host.toDisplayName(modelId)}`);
 
 			throw error;
 		} finally {
 			this.loadingStates.set(modelId, false);
+			this.requestReconcile();
+		}
+	}
+
+	/** Reconcile an authoritative /v1/models snapshot after startup, refresh or SSE loss. */
+	reconcileSnapshot(response: ApiRouterModelsListResponse): void {
+		this.backendOperation = response.operation ?? null;
+		this.lastBackendSyncAt = Date.now();
+
+		for (const model of response.data) {
+			const status = model.status.value;
+
+			if (status === ServerModelStatus.LOADING) {
+				if (!this.loadStartedAt.has(model.id)) {
+					const backendStarted =
+						response.operation?.target === model.id ? response.operation.started_at : 0;
+
+					this.loadStartedAt.set(model.id, backendStarted || Date.now());
+				}
+
+				if (model.status.progress) this.loadProgress.set(model.id, model.status.progress);
+			} else {
+				this.loadProgress.delete(model.id);
+				this.loadStartedAt.delete(model.id);
+			}
+
+			const failed =
+				status === ServerModelStatus.FAILED ||
+				Boolean(model.status.failed) ||
+				(status === ServerModelStatus.UNLOADED && (model.status.exit_code ?? 0) !== 0);
+
+			if (failed) {
+				this.rejectStatus(
+					model.id,
+					new Error(`Model failed with exit code ${model.status.exit_code ?? 'unknown'}`)
+				);
+			} else {
+				this.settleStatus(model.id, status);
+			}
+		}
+
+		const operation = response.operation;
+
+		if (operation?.phase === 'failed' && operation.target) {
+			const error = new Error(operation.error || 'Backend model switch failed');
+
+			this.host.error = error.message;
+			this.rejectStatus(operation.target, error);
 		}
 	}
 
@@ -101,7 +204,9 @@ export class ModelStatusManager {
 
 		this.statusReaderActive = true;
 		this.statusAbort = new AbortController();
+		this.connection = 'connecting';
 		void this.runStatusReader(this.statusAbort.signal);
+		this.scheduleReconcile(1000);
 	}
 
 	async unload(modelId: string): Promise<void> {
@@ -111,6 +216,7 @@ export class ModelStatusManager {
 
 		this.loadingStates.set(modelId, true);
 		this.host.error = null;
+		this.requestReconcile();
 
 		this.subscribe();
 
@@ -130,6 +236,7 @@ export class ModelStatusManager {
 			throw error;
 		} finally {
 			this.loadingStates.set(modelId, false);
+			this.requestReconcile();
 		}
 	}
 
@@ -140,7 +247,13 @@ export class ModelStatusManager {
 		this.statusReaderActive = false;
 		this.statusAbort?.abort();
 		this.statusAbort = null;
+
+		if (this.reconcileTimer) clearTimeout(this.reconcileTimer);
+
+		this.reconcileTimer = null;
 		this.loadProgress.clear();
+		this.loadStartedAt.clear();
+		this.connection = 'stopped';
 	}
 
 	/**
@@ -155,12 +268,16 @@ export class ModelStatusManager {
 
 		const status = data.status;
 
-		this.setRouterModelStatus(model, status);
+		this.setRouterModelStatus(model, data);
+		this.lastBackendSyncAt = Date.now();
 
 		if (status === ServerModelStatus.LOADING) {
+			if (!this.loadStartedAt.has(model)) this.loadStartedAt.set(model, Date.now());
+
 			if (data.progress) this.loadProgress.set(model, data.progress);
 		} else {
 			this.loadProgress.delete(model);
+			this.loadStartedAt.delete(model);
 		}
 
 		if (status === ServerModelStatus.LOADED) {
@@ -229,28 +346,65 @@ export class ModelStatusManager {
 		this.rejectStatus(modelId, new Error(`Model removed: ${this.host.toDisplayName(modelId)}`));
 	}
 
+	private requestReconcile(): void {
+		if (this.reconcileTimer) clearTimeout(this.reconcileTimer);
+
+		this.reconcileTimer = null;
+		this.scheduleReconcile(0);
+	}
+
 	/**
 	 * Read the feed and reconnect until unsubscribed.
 	 */
 	private async runStatusReader(signal: AbortSignal): Promise<void> {
-		await ModelsService.watchModelEvents(signal, (event) => this.applyStatusEvent(event));
+		await ModelsService.watchModelEvents(
+			signal,
+			(event) => this.applyStatusEvent(event),
+			(connection) => (this.connection = connection)
+		);
+	}
+
+	private scheduleReconcile(delay?: number): void {
+		if (!this.statusReaderActive || this.reconcileTimer) return;
+
+		this.reconcileTimer = setTimeout(
+			async () => {
+				this.reconcileTimer = null;
+
+				try {
+					await this.host.fetchRouterModels();
+				} finally {
+					this.scheduleReconcile(this.isTransitionInProgress() ? 1000 : 10000);
+				}
+			},
+			delay ?? (this.isTransitionInProgress() ? 1000 : 10000)
+		);
 	}
 
 	/**
 	 * Update one model row status in place, reassigning to trigger reactivity.
 	 */
-	private setRouterModelStatus(modelId: string, status: ServerModelStatus): void {
+	private setRouterModelStatus(modelId: string, data: ApiModelsSseData): void {
 		const idx = this.host.routerModels.findIndex((m) => m.id === modelId);
 
 		if (idx === -1) return;
 
 		const current = this.host.routerModels[idx];
-
-		if (current.status.value === status) return;
-
 		const next = [...this.host.routerModels];
 
-		next[idx] = { ...current, status: { ...current.status, value: status } };
+		next[idx] = {
+			...current,
+			status: {
+				...current.status,
+				active_requests: data.active_requests ?? current.status.active_requests,
+				exit_code: data.exit_code,
+				failed:
+					data.status === ServerModelStatus.FAILED ||
+					(data.status === ServerModelStatus.UNLOADED && (data.exit_code ?? 0) !== 0),
+				progress: data.progress,
+				value: data.status
+			}
+		};
 		this.host.routerModels = next;
 	}
 

@@ -10,7 +10,7 @@
 import { browser } from '$app/environment';
 import { goto } from '$app/navigation';
 import { ROUTES } from '$lib/constants';
-import { MessageRole } from '$lib/enums';
+import { AttachmentType, MessageRole } from '$lib/enums';
 import { ConversationTransferService } from '$lib/services/conversation-transfer.service';
 import { DatabaseService } from '$lib/services/database.service';
 import { MigrationService } from '$lib/services/migration.service';
@@ -20,6 +20,7 @@ import {
 	ConversationPreferences,
 	type ConversationsPreferencesHost
 } from '$lib/stores/conversations/preferences.svelte';
+import { mediaStore } from '$lib/stores/media.svelte';
 import { settingsStore } from '$lib/stores/settings/index.svelte';
 import { tabsStore } from '$lib/stores/tabs.svelte';
 import { filterByLeafNodeId, findLeafNode, generateConversationTitle } from '$lib/utils';
@@ -133,7 +134,9 @@ class ConversationsStore implements ConversationsPreferencesHost {
 			const activeWasDeleted =
 				this.activeConversation !== null && idsToRemove.has(this.activeConversation.id);
 
+			mediaStore.queueConversationCleanup([...idsToRemove]);
 			await DatabaseService.bulkDeleteConversations([...idsToRemove]);
+			await mediaStore.flushOwnershipOperations();
 
 			this.conversations = this.conversations.filter((c) => !idsToRemove.has(c.id));
 			this.notifyConversationsDeleted([...idsToRemove]);
@@ -281,7 +284,9 @@ class ConversationsStore implements ConversationsPreferencesHost {
 			const allConversations = await DatabaseService.getAllConversations();
 			const allIds = allConversations.map((c) => c.id);
 
+			mediaStore.queueConversationCleanup(allIds);
 			await DatabaseService.bulkDeleteConversations(allIds);
+			await mediaStore.flushOwnershipOperations();
 
 			this.clearActiveConversation();
 			this.conversations = [];
@@ -303,11 +308,9 @@ class ConversationsStore implements ConversationsPreferencesHost {
 	 */
 	async deleteConversation(convId: string, options?: { deleteWithForks?: boolean }): Promise<void> {
 		try {
-			await DatabaseService.deleteConversation(convId, options);
+			const idsToRemove = new SvelteSet([convId]);
 
 			if (options?.deleteWithForks) {
-				// Collect all descendants recursively
-				const idsToRemove = new SvelteSet([convId]);
 				const queue = [convId];
 
 				while (queue.length > 0) {
@@ -320,6 +323,15 @@ class ConversationsStore implements ConversationsPreferencesHost {
 						}
 					}
 				}
+			}
+
+			// Persist the privacy cleanup intent before deleting the only local
+			// record that knows which backend assets belong to this conversation.
+			mediaStore.queueConversationCleanup([...idsToRemove]);
+			await DatabaseService.deleteConversation(convId, options);
+			await mediaStore.flushOwnershipOperations();
+
+			if (options?.deleteWithForks) {
 				this.conversations = this.conversations.filter((c) => !idsToRemove.has(c.id));
 
 				if (this.activeConversation && idsToRemove.has(this.activeConversation.id)) {
@@ -429,6 +441,12 @@ class ConversationsStore implements ConversationsPreferencesHost {
 				options
 			);
 
+			if (options.includeAttachments) {
+				const clonedMessages = await DatabaseService.getConversationMessages(newConv.id);
+
+				await mediaStore.addAssetOwners(newConv.id, this.generatedMediaOwners(clonedMessages));
+			}
+
 			this.conversations = [newConv, ...this.conversations];
 
 			await goto(RouterService.chat(newConv.id));
@@ -462,6 +480,12 @@ class ConversationsStore implements ConversationsPreferencesHost {
 		data: ExportedConversations
 	): Promise<{ imported: DatabaseConversation[]; skipped: DatabaseConversation[] }> {
 		const result = await DatabaseService.importConversations(data);
+
+		for (const conversation of result.imported) {
+			const messages = await DatabaseService.getConversationMessages(conversation.id);
+
+			await mediaStore.addAssetOwners(conversation.id, this.generatedMediaOwners(messages));
+		}
 
 		await this.loadConversations();
 
@@ -742,6 +766,26 @@ class ConversationsStore implements ConversationsPreferencesHost {
 	 *
 	 *
 	 */
+
+	private generatedMediaOwners(
+		messages: DatabaseMessage[]
+	): Array<{ assetId: string; messageId: string }> {
+		const owners: Array<{ assetId: string; messageId: string }> = [];
+
+		for (const message of messages) {
+			for (const extra of message.extra ?? []) {
+				if (
+					extra.type === AttachmentType.GENERATED_MEDIA &&
+					extra.status === 'completed' &&
+					extra.assetId
+				) {
+					owners.push({ assetId: extra.assetId, messageId: message.id });
+				}
+			}
+		}
+
+		return owners;
+	}
 
 	private notifyConversationsDeleted(convIds: string[]): void {
 		if (convIds.length === 0) return;

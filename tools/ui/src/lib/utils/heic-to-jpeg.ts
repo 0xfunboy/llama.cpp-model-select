@@ -1,23 +1,22 @@
 import { IMAGE } from '$lib/constants';
 import { MimeTypeImage } from '$lib/enums';
+import heicToModuleUrl from 'heic-to/csp?url';
 
-// heic requires a relatively large decoder, in order to reduce primary bundle size
-// we lazily load this decoder from a CDN when needed, and cache it for future conversions
-const HEIC_TO_CDN_URL = 'https://cdn.jsdelivr.net/npm/heic-to@1.5.2/dist/heic-to.js';
+// HEIC needs a relatively large decoder. Vite emits it as a local, hashed asset;
+// the runtime import remains lazy without executing third-party CDN code in the
+// page that holds private attachments.
 
-interface HeicToModule {
-	heicTo(args: { blob: Blob; type: string; quality?: number }): Promise<Blob>;
-}
+type HeicToModule = typeof import('heic-to/csp');
 
 let modulePromise: Promise<HeicToModule> | null = null;
 
 /**
- * Lazily load the heic-to decoder from the CDN and cache it
+ * Lazily load the bundled local heic-to decoder and cache it
  * @returns Promise resolving to the heic-to module
  */
 function getHeicTo(): Promise<HeicToModule> {
 	if (!modulePromise) {
-		modulePromise = import(/* @vite-ignore */ HEIC_TO_CDN_URL) as Promise<HeicToModule>;
+		modulePromise = import(/* @vite-ignore */ heicToModuleUrl) as Promise<HeicToModule>;
 	}
 
 	return modulePromise;

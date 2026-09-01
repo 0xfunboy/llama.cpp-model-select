@@ -19,6 +19,7 @@ import { DatabaseService } from '$lib/services/database.service';
 import type { ChatProcessingStore } from '$lib/stores/chat/processing.svelte';
 // direct imports between stores, not via the barrel, to avoid circular deps
 import { conversationsStore } from '$lib/stores/conversations/index.svelte';
+import { mediaStore } from '$lib/stores/media.svelte';
 import type {
 	ChatMessagePromptProgress,
 	ChatMessageTimings,
@@ -288,7 +289,11 @@ export class ChatMessageFlows {
 				}
 			}
 
+			const deletedMessageIds = await DatabaseService.getMessageBranchIds(activeConv.id, messageId);
+
+			mediaStore.queueMessageCleanup(deletedMessageIds);
 			await DatabaseService.deleteMessageCascading(activeConv.id, messageId);
+			await mediaStore.flushOwnershipOperations();
 			await conversationsStore.refreshActiveMessages();
 
 			conversationsStore.updateConversationTimestamp();
@@ -539,8 +544,14 @@ export class ChatMessageFlows {
 
 		try {
 			const messagesToRemove = conversationsStore.activeMessages.slice(messageIndex);
+			const deletedMessageIds = await DatabaseService.getMessageBranchIds(
+				activeConv.id,
+				messagesToRemove[0].id
+			);
 
+			mediaStore.queueMessageCleanup(deletedMessageIds);
 			await DatabaseService.deleteMessageCascading(activeConv.id, messagesToRemove[0].id);
+			await mediaStore.flushOwnershipOperations();
 			conversationsStore.sliceActiveMessages(messageIndex);
 			conversationsStore.updateConversationTimestamp();
 			this.host.setChatLoading(activeConv.id, true);
@@ -651,8 +662,16 @@ export class ChatMessageFlows {
 
 			const messagesToRemove = conversationsStore.activeMessages.slice(messageIndex + 1);
 
-			if (messagesToRemove.length > 0)
+			if (messagesToRemove.length > 0) {
+				const deletedMessageIds = await DatabaseService.getMessageBranchIds(
+					activeConv.id,
+					messagesToRemove[0].id
+				);
+
+				mediaStore.queueMessageCleanup(deletedMessageIds);
 				await DatabaseService.deleteMessageCascading(activeConv.id, messagesToRemove[0].id);
+				await mediaStore.flushOwnershipOperations();
+			}
 
 			conversationsStore.sliceActiveMessages(messageIndex + 1);
 			conversationsStore.updateConversationTimestamp();

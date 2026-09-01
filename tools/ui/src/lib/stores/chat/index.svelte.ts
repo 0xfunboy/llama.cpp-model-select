@@ -11,6 +11,7 @@
 
 import { CWD_CLEARED_TEXT, SYSTEM_MESSAGE_PLACEHOLDER, TITLE_GENERATION } from '$lib/constants';
 import {
+	AttachmentType,
 	ErrorDialogType,
 	MessageRole,
 	MessageType,
@@ -27,6 +28,7 @@ import { chatProcessingStore } from '$lib/stores/chat/processing.svelte';
 import { type ChatStreamHost, ChatStreamManager } from '$lib/stores/chat/streams.svelte';
 import { conversationsStore } from '$lib/stores/conversations/index.svelte';
 import { mcpStore } from '$lib/stores/mcp/index.svelte';
+import { mediaStore } from '$lib/stores/media.svelte';
 import { modelsStore } from '$lib/stores/models/index.svelte';
 import { serverStore } from '$lib/stores/server.svelte';
 import { settingsStore } from '$lib/stores/settings/index.svelte';
@@ -48,6 +50,13 @@ import {
 	normalizeModelName
 } from '$lib/utils';
 import { SvelteMap } from 'svelte/reactivity';
+
+interface ChatSendOptions {
+	mediaModelSelection?: {
+		kind: 'image' | 'video';
+		model: string;
+	};
+}
 
 class ChatStore implements ChatStreamHost, ChatFlowsHost {
 	chatReasoningStates = new SvelteMap<string, boolean>();
@@ -275,6 +284,42 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 	/** Reset per-view state when (re)mounting the empty chat screen. */
 	clearUIState(): void {
 		this.currentResponse = '';
+	}
+
+	constructor() {
+		conversationsStore.onConversationsDeleted((convIds) => {
+			const activeConversationId = conversationsStore.activeConversation?.id;
+
+			for (const convId of convIds) {
+				const localStream = this.chatStreamingStates.get(convId);
+				const persistedStream = ChatService.getStreamState(convId);
+				const shouldCancelServer =
+					this.abortControllers.has(convId) ||
+					Boolean(localStream) ||
+					Boolean(persistedStream) ||
+					this.activity.isLocal(convId) ||
+					this.activity.isRemote(convId);
+				const model = localStream?.model ?? persistedStream?.model;
+
+				this.streams.cancelResumeRetry(convId);
+				this.clearPendingMessage(convId);
+				this.abortRequest(convId);
+
+				if (shouldCancelServer) void ChatService.cancelServerStream(convId, model);
+
+				ChatService.clearStreamState(convId);
+				this.cleanupStreaming(convId);
+
+				if (this.processing.activeConversationId === convId) {
+					this.processing.setActiveConversation(null);
+				}
+
+				if (!activeConversationId || activeConversationId === convId) {
+					this.currentResponse = '';
+					this.streamConnectionState = StreamConnectionState.STREAMING;
+				}
+			}
+		});
 	}
 
 	consumePendingDraft(): { message: string; files: ChatUploadedFile[] } | null {
@@ -613,13 +658,25 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		this.pendingDraftMessage = message;
 		this.pendingDraftFiles = [...files];
 	}
-	async sendMessage(content: string, extras?: DatabaseMessageExtra[]): Promise<void> {
+	async sendMessage(
+		content: string,
+		extras?: DatabaseMessageExtra[],
+		options: ChatSendOptions = {}
+	): Promise<void> {
 		if (!content.trim() && (!extras || extras.length === 0)) return;
 
 		const activeConv = conversationsStore.activeConversation;
+		const armMediaModelSelection = (conversationId: string): string | null => {
+			const selection = options.mediaModelSelection;
+
+			return selection
+				? mediaStore.armModelSelection(conversationId, selection.kind, selection.model)
+				: null;
+		};
 
 		// If agentic loop is running, inject as a steering message instead of starting a new flow
 		if (activeConv && agenticStore.isRunning(activeConv.id)) {
+			armMediaModelSelection(activeConv.id);
 			agenticStore.injectSteeringMessage(activeConv.id, content, extras);
 
 			return;
@@ -627,6 +684,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 		// If non-agentic streaming is active, queue as a pending message to send after completion
 		if (activeConv && this.isChatLoadingInternal(activeConv.id)) {
+			armMediaModelSelection(activeConv.id);
 			this.injectPendingMessage(activeConv.id, content, extras);
 
 			return;
@@ -649,6 +707,8 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		const currentConv = conversationsStore.activeConversation;
 
 		if (!currentConv) return;
+
+		const mediaSelectionToken = armMediaModelSelection(currentConv.id);
 
 		this.showErrorDialog(null);
 		this.setChatLoading(currentConv.id, true);
@@ -738,6 +798,10 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 				message: error instanceof Error ? error.message : 'Unknown error',
 				type: dialogType
 			});
+		} finally {
+			if (mediaSelectionToken) {
+				mediaStore.clearModelSelection(currentConv.id, mediaSelectionToken);
+			}
 		}
 	}
 
@@ -795,15 +859,23 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		const streamStateForStop = this.chatStreamingStates.get(convId);
 		const modelForStop = streamStateForStop?.model ?? ChatService.getStreamState(convId)?.model;
 
-		void ChatService.cancelServerStream(convId, modelForStop);
-		// an explicit stop leaves nothing to resume and kills a pending resume retry
-		ChatService.clearStreamState(convId);
+		// Block every completion follow-up before aborting the local reader. In agentic mode an
+		// abort still calls onFlowComplete so partial output can be persisted; without the signal
+		// guards below that callback used to start pre-encode and LLM title requests after Stop.
 		this.streams.cancelResumeRetry(convId);
+		this.cancelPreEncode();
+		this.clearPendingMessage(convId);
 		this.abortRequest(convId);
+
+		// Wait until the explicit server-side cancellation has been acknowledged. Dropping only
+		// the browser socket is intentionally insufficient for resumable streams, whose worker
+		// keeps running across disconnects.
+		await ChatService.cancelServerStream(convId, modelForStop);
+		// An explicit stop leaves nothing to resume.
+		ChatService.clearStreamState(convId);
 		this.setChatLoading(convId, false);
 		this.clearChatStreaming(convId);
 		this.processing.setState(convId, null);
-		this.clearPendingMessage(convId);
 	}
 
 	async streamChatCompletion(
@@ -945,7 +1017,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 						toolCwd,
 						type: MessageType.TEXT
 					},
-					currentMessageId
+					lastCreatedInFlow
 				);
 
 				// mirror into the active store and move the node pointer only when this
@@ -1061,6 +1133,11 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 
 				cleanupStreamingState();
 
+				// AgenticStore deliberately invokes onFlowComplete on abort to persist partial
+				// output. Stop is not a successful completion: do not run callbacks, pre-encode,
+				// title generation or any other request that would reacquire the model slot.
+				if (abortController.signal.aborted) return;
+
 				if (onComplete) onComplete(streamedContent);
 
 				if (serverStore.isRouterMode) modelsStore.fetchRouterModels().catch(console.error);
@@ -1109,7 +1186,8 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 				content: string,
 				extras?: DatabaseMessageExtra[]
 			) => {
-				// Persist latest content + merged extras; mirror into the active
+				// Persist latest content and replace matching generated-media jobs while
+				// preserving unrelated attachments on the same tool result.
 				// store so the chat view sees live updates for streaming tools
 				// (e.g. exec_shell_command). The existing tool message node
 				// pointer stays put - the renderer is already scoped to it.
@@ -1118,7 +1196,22 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 				if (extras) {
 					const idx = conversationsStore.findMessageIndex(messageId);
 					const existing = idx >= 0 ? (conversationsStore.activeMessages[idx]?.extra ?? []) : [];
-					const merged = [...existing, ...extras];
+					const merged = [...existing];
+
+					for (const extra of extras) {
+						if (extra.type === AttachmentType.GENERATED_MEDIA) {
+							const match = merged.findIndex(
+								(candidate) =>
+									candidate.type === AttachmentType.GENERATED_MEDIA &&
+									candidate.jobId === extra.jobId
+							);
+
+							if (match >= 0) merged[match] = extra;
+							else merged.push(extra);
+						} else if (!merged.includes(extra)) {
+							merged.push(extra);
+						}
+					}
 
 					updates.extra = merged;
 				}
@@ -1152,10 +1245,22 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			});
 
 			if (agenticResult.handled) {
+				// The agentic loop returns handled=true after a deliberate abort. Its completion
+				// callback already saved the partial turn; no post-completion work may be launched.
+				if (abortController.signal.aborted) return;
+
 				// Generate LLM based title for new conversations after agentic flow completes
 				if (firstUserMessageContent) {
-					await this.generateTitleWithLLM(firstUserMessageContent, streamedContent, convId);
+					await this.generateTitleWithLLM(
+						firstUserMessageContent,
+						streamedContent,
+						convId,
+						effectiveModel,
+						abortController.signal
+					);
 				}
+
+				if (abortController.signal.aborted) return;
 
 				// Check if there's a pending steering message to re-send
 				const pending = agenticStore.consumePendingSteeringMessage(convId);
@@ -1207,15 +1312,27 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 					await conversationsStore.updateCurrentNode(currentMessageId);
 					cleanupStreamingState();
 
+					if (abortController.signal.aborted) return;
+
 					if (onComplete) await onComplete(content);
+
+					if (abortController.signal.aborted) return;
 
 					if (serverStore.isRouterMode) modelsStore.fetchRouterModels().catch(console.error);
 
 					// Generate LLM based title for new conversations (avoids stale reference
 					// issue when user switches conversations while streaming)
 					if (firstUserMessageContent) {
-						await this.generateTitleWithLLM(firstUserMessageContent, streamedContent, convId);
+						await this.generateTitleWithLLM(
+							firstUserMessageContent,
+							streamedContent,
+							convId,
+							effectiveModel,
+							abortController.signal
+						);
 					}
+
+					if (abortController.signal.aborted) return;
 
 					// Check if there's a pending message queued during streaming
 					const pending = this.consumePendingMessage(convId);
@@ -1285,11 +1402,15 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 	private async generateTitleWithLLM(
 		userContent: string,
 		assistantContent: string,
-		convId: string
+		convId: string,
+		model?: string | null,
+		signal?: AbortSignal
 	): Promise<void> {
+		if (signal?.aborted) return;
+
 		const effectiveModel =
-			serverStore.isRouterMode && modelsStore.selectedModelName
-				? modelsStore.selectedModelName
+			serverStore.isRouterMode && (model || modelsStore.selectedModelName)
+				? model || modelsStore.selectedModelName
 				: undefined;
 		const configValue = settingsStore.config;
 		const titlePromptTemplate =
@@ -1304,9 +1425,9 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 			content: titlePrompt,
 			role: MessageRole.USER
 		};
-		const titleResponse = await ChatService.generateTitle(titleMessage, effectiveModel);
+		const titleResponse = await ChatService.generateTitle(titleMessage, effectiveModel, signal);
 
-		if (!titleResponse) {
+		if (signal?.aborted || !titleResponse) {
 			return;
 		}
 

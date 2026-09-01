@@ -334,6 +334,8 @@ export interface ChatFormActionsContext {
 	readonly hasVideoModality: boolean;
 	readonly hasVisionModality: boolean;
 	onFileUpload?: () => void;
+	onGenerateImage?: () => void;
+	onGenerateVideo?: () => void;
 	onSystemPromptClick?: () => void;
 	onMcpSettingsClick?: () => void;
 }
