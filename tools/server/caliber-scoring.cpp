@@ -845,6 +845,76 @@ json build_recommendations(const std::vector<json> & results, const winner_polic
     return out;
 }
 
+json report_history_compatibility(const json & report, const json & current_runtime) {
+    bool stale = false;
+    bool legacy = false;
+    json reasons = json::array();
+
+    if (str_value(report, "status") != "completed") {
+        reasons.push_back("report did not complete successfully");
+    }
+
+    if (!has_key(report, "metric_schema_version")) {
+        legacy = true;
+        reasons.push_back("metric schema version is missing");
+    } else if (int_value(report, "metric_schema_version", -1) != METRIC_SCHEMA_VERSION) {
+        stale = true;
+        reasons.push_back("metric schema version changed");
+    }
+
+    const json policy = has_key(report, "recommendation_policy") && report.at("recommendation_policy").is_object()
+        ? report.at("recommendation_policy")
+        : json::object();
+    if (!has_key(policy, "version")) {
+        legacy = true;
+        reasons.push_back("recommendation policy version is missing");
+    } else if (int_value(policy, "version", -1) != RECOMMENDATION_POLICY_VERSION) {
+        stale = true;
+        reasons.push_back("recommendation policy version changed");
+    }
+
+    const json recorded_runtime = has_key(report, "runtime_profile") && report.at("runtime_profile").is_object()
+        ? report.at("runtime_profile")
+        : json::object();
+    if (recorded_runtime.empty()) {
+        legacy = true;
+        reasons.push_back("runtime profile is missing");
+    } else {
+        const json recorded_build = has_key(recorded_runtime, "build") && recorded_runtime.at("build").is_object()
+            ? recorded_runtime.at("build")
+            : json::object();
+        const json current_build = has_key(current_runtime, "build") && current_runtime.at("build").is_object()
+            ? current_runtime.at("build")
+            : json::object();
+        const std::string recorded_commit = str_value(recorded_build, "commit");
+        const std::string current_commit = str_value(current_build, "commit");
+        if (recorded_commit.empty()) {
+            legacy = true;
+            reasons.push_back("llama.cpp build commit is missing");
+        } else if (current_commit.empty()) {
+            stale = true;
+            reasons.push_back("current llama.cpp build commit is unavailable");
+        } else if (recorded_commit != current_commit) {
+            stale = true;
+            reasons.push_back("llama.cpp build changed");
+        }
+
+        const std::string recorded_driver = str_value(recorded_runtime, "gpu_driver");
+        const std::string current_driver = str_value(current_runtime, "gpu_driver");
+        if (!recorded_driver.empty() && !current_driver.empty() && recorded_driver != current_driver) {
+            stale = true;
+            reasons.push_back("GPU driver changed");
+        }
+    }
+
+    return {
+        {"compatible", reasons.empty()},
+        {"stale", stale},
+        {"legacy", legacy},
+        {"reasons", reasons},
+    };
+}
+
 std::map<std::string, json> derive_memory_policies(const std::vector<json> & rows, double vram_total_mib, const memory_policy_options & options) {
     const double shared_threshold = options.shared_threshold_mib;
     const double shared_minor = options.shared_minor_upper_mib;

@@ -32,5 +32,6 @@ class index {
 };
 
 std::string artifact_id_for_path(const json & registry, const std::string & path);
+bool is_media_generation_artifact(const json & artifact);
 
 } // namespace model_registry

@@ -284,6 +284,42 @@ void test_recommendations() {
             "recommendation explains selection");
 }
 
+void test_report_history_compatibility() {
+    const json runtime = {
+        {"build", {{"commit", "current-build"}}},
+        {"gpu_driver", "driver-1"},
+    };
+    const json report = {
+        {"status", "completed"},
+        {"metric_schema_version", caliber::METRIC_SCHEMA_VERSION},
+        {"recommendation_policy", {{"version", caliber::RECOMMENDATION_POLICY_VERSION}}},
+        {"runtime_profile", runtime},
+    };
+
+    json compatibility = caliber::report_history_compatibility(report, runtime);
+    require_eq(compatibility.at("compatible"), true, "current completed report is compatible");
+    require_eq(compatibility.at("stale"), false, "current report is not stale");
+    require_eq(compatibility.at("legacy"), false, "current report is not legacy");
+
+    json stale_report = report;
+    stale_report["runtime_profile"]["build"]["commit"] = "old-build";
+    compatibility = caliber::report_history_compatibility(stale_report, runtime);
+    require_eq(compatibility.at("compatible"), false, "old build report is incompatible");
+    require_eq(compatibility.at("stale"), true, "old build report is stale");
+    require_eq(compatibility.at("legacy"), false, "old build report is not legacy");
+
+    compatibility = caliber::report_history_compatibility({{"status", "completed"}}, runtime);
+    require_eq(compatibility.at("compatible"), false, "metadata-free report is incompatible");
+    require_eq(compatibility.at("legacy"), true, "metadata-free report is legacy");
+
+    json incomplete_report = report;
+    incomplete_report["status"] = "cancelled";
+    compatibility = caliber::report_history_compatibility(incomplete_report, runtime);
+    require_eq(compatibility.at("compatible"), false, "cancelled report is incompatible");
+    require_eq(compatibility.at("stale"), false, "cancelled current report is not stale");
+    require_eq(compatibility.at("legacy"), false, "cancelled current report is not legacy");
+}
+
 void test_result_core() {
     require(caliber::median({42}) == 42, "single median");
     require(caliber::median({12, 7, 10}) == 10, "odd median");
@@ -378,6 +414,7 @@ int main() {
     test_winner_policy();
     test_memory_policy();
     test_recommendations();
+    test_report_history_compatibility();
     test_result_core();
     if (failures != 0) {
         std::cerr << failures << " caliber scoring test(s) failed\n";

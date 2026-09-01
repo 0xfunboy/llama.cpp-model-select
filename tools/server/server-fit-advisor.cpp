@@ -53,10 +53,6 @@ static constexpr const char * FIT_CATALOG_URL =
     "https://raw.githubusercontent.com/AlexsJones/llmfit/main/llmfit-core/data/hf_models.json";
 static constexpr size_t FIT_MAX_DOWNLOAD_EVENTS = 2000;
 
-#ifndef LLAMA_DS4_REPORTS_DIR
-#define LLAMA_DS4_REPORTS_DIR "tools/ui/static/reports"
-#endif
-
 struct fit_download_file {
     std::string filename;
     std::string url;
@@ -1674,6 +1670,7 @@ static fit_json router_installed_index(server_models_routes & router) {
             {"hf_repo", repo.empty() ? nullptr : fit_json(repo)},
             {"source", server_model_source_to_string(meta.source)},
             {"status", server_model_status_to_string(meta.status)},
+            {"configured", true},
             {"tags", meta.tags},
             {"runtime", runtime_name.empty() ? "llama.cpp" : runtime_name},
             {"configured_context_length", configured_ctx},
@@ -1709,6 +1706,7 @@ static fit_json router_installed_index(server_models_routes & router) {
             {"loadable", artifact.value("loadable", false)},
             {"model_size_bytes", artifact.value("total_size", 0.0)},
             {"quant", infer_gguf_quant(path)},
+            {"metadata", artifact.value("metadata", fit_json::object())},
         });
     }
     return installed;
@@ -1720,7 +1718,7 @@ static fit_json local_catalog_models(const fit_json & installed) {
     for (const auto & item : installed) {
         const std::string path = fit_json_value(item, "path", std::string());
         const std::string id = fit_json_value(item, "id", std::string());
-        if (path.empty() || id.empty() || !ends_with_ci(path, ".gguf") || seen_paths.count(path) > 0) {
+        if (path.empty() || id.empty() || !ends_with_ci(path, ".gguf") || seen_paths.count(path) > 0 || model_registry::is_media_generation_artifact(item)) {
             continue;
         }
         seen_paths.insert(path);
@@ -1763,6 +1761,8 @@ static fit_json local_catalog_models(const fit_json & installed) {
             {"architecture", architecture},
             {"is_moe", is_qwen4exp || lower_id.find("moe") != std::string::npos},
             {"_local_configured", true},
+            {"_local_artifact_id", fit_json_value(item, "artifact_id", std::string())},
+            {"_local_path", path},
             {"local_size_bytes", fit_json_value(item, "model_size_bytes", 0.0)},
             {"local_draft_size_bytes", fit_json_value(item, "draft_size_bytes", 0.0)},
             {"has_mtp", fit_json_value(item, "has_mtp", false)},
@@ -1782,25 +1782,9 @@ struct fit_bench_calibration {
 
 static std::map<std::string, fit_bench_calibration> load_bench_calibrations(int target_ctx) {
     std::map<std::string, fit_bench_calibration> out;
-    std::vector<std::filesystem::directory_entry> reports;
-    std::error_code ec;
-    const std::filesystem::path root(LLAMA_DS4_REPORTS_DIR);
-    if (!std::filesystem::exists(root, ec)) {
-        return out;
-    }
-    for (std::filesystem::directory_iterator it(root, std::filesystem::directory_options::skip_permission_denied, ec), end;
-         !ec && it != end; it.increment(ec)) {
-        if (it->is_regular_file(ec) && it->path().filename().string().rfind("ds4-bench-", 0) == 0 && it->path().extension() == ".json") {
-            reports.push_back(*it);
-        }
-    }
-    std::sort(reports.begin(), reports.end(), [](const auto & a, const auto & b) {
-        std::error_code aec, bec;
-        return a.last_write_time(aec) > b.last_write_time(bec);
-    });
-    for (const auto & entry : reports) {
+    for (const auto & stored_report : server_persistence::load_reports("ds4-bench")) {
         try {
-            const json report = json::parse(read_text_file(entry.path()));
+            const json report = json::parse(stored_report.dump());
             if (!report.contains("results") || !report["results"].is_array()) continue;
             std::map<std::string, std::vector<json>> rows_by_model;
             for (const auto & row : report["results"]) {
@@ -1812,7 +1796,7 @@ static std::map<std::string, fit_bench_calibration> load_bench_calibrations(int 
                 if (out.count(model) > 0 || rows.empty()) continue;
                 fit_bench_calibration calibration;
                 calibration.low_tps = std::numeric_limits<double>::max();
-                calibration.report_id = json_value(report, "id", entry.path().stem().string());
+                calibration.report_id = json_value(report, "id", std::string("DS4-Bench"));
                 int best_distance = std::numeric_limits<int>::max();
                 for (const auto & row : rows) {
                     const int ctx = json_value(row, "ctx", 0);
@@ -1918,21 +1902,27 @@ static fit_json first_gguf_source(const fit_json & model) {
 }
 
 static fit_json find_installed(const fit_json & installed, const fit_json & model, const std::string & repo, const std::string & quant) {
-    const std::string id = fit_json_value(model, "name", std::string());
-    const std::string id_slug = slugify(id);
-    const std::string repo_quant = repo.empty() ? "" : repo + ":" + quant;
+    const std::string local_artifact_id = fit_json_value(model, "_local_artifact_id", std::string());
+    const std::string local_path = fit_json_value(model, "_local_path", std::string());
+    const std::string repo_quant = repo.empty() || quant.empty() ? "" : repo + ":" + quant;
+    const auto equal_nonempty = [](const std::string & left, const std::string & right) {
+        return !left.empty() && !right.empty() && left == right;
+    };
+    const auto equal_nonempty_path = [](const std::string & left, const std::string & right) {
+        return !left.empty() && !right.empty() && std::filesystem::path(left).lexically_normal() == std::filesystem::path(right).lexically_normal();
+    };
     for (const auto & item : installed) {
         const std::string installed_id = fit_json_value(item, "id", std::string());
+        const std::string artifact_id = fit_json_value(item, "artifact_id", std::string());
         const std::string path = fit_json_value(item, "path", std::string());
         const std::string hf_repo = fit_json_value(item, "hf_repo", std::string());
-        if (installed_id == id || installed_id == repo || installed_id == repo_quant || hf_repo == repo_quant || hf_repo == repo) {
+        if (equal_nonempty_path(path, local_path) ||
+            equal_nonempty(artifact_id, local_artifact_id) ||
+            equal_nonempty(installed_id, repo) ||
+            equal_nonempty(installed_id, repo_quant) ||
+            equal_nonempty(hf_repo, repo_quant) ||
+            equal_nonempty(hf_repo, repo)) {
             return item;
-        }
-        if (!path.empty()) {
-            const std::string basename = lower_copy(std::filesystem::path(path).filename().string());
-            if (contains_ci(basename, id_slug) || (!repo.empty() && contains_ci(basename, slugify(repo)))) {
-                return item;
-            }
         }
     }
     return fit_json::object();
@@ -2266,7 +2256,7 @@ static fit_json analyze_catalog_model(
     const std::string repo = fit_json_value(source, "repo", std::string());
     const std::string download_ref = repo.empty() ? "" : repo + ":" + quant;
     const fit_json installed_match = find_installed(installed, model, repo, quant);
-    const bool configured_entry = installed_match.is_object() && !installed_match.empty();
+    const bool configured_entry = installed_match.is_object() && !installed_match.empty() && fit_json_value(installed_match, "configured", true);
     const std::filesystem::path target_dir = default_download_dir(router, repo, id);
     const fit_json download_job = download_snapshot_for_model(id, download_ref);
     const std::string job_status = download_job.is_object() ? fit_json_value(download_job, "status", std::string()) : std::string();

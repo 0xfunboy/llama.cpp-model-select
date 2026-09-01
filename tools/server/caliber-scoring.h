@@ -59,6 +59,7 @@ std::map<std::string, json> group_winners(const std::vector<json> & results, win
 winner_profile winner_profile_from_string(const std::string & profile);
 json build_recommendation(const std::vector<json> & results, winner_profile profile, const winner_policy_options & options = {});
 json build_recommendations(const std::vector<json> & results, const winner_policy_options & options = {});
+json report_history_compatibility(const json & report, const json & current_runtime);
 
 struct memory_policy_options {
     double shared_threshold_mib = 500.0;

@@ -1576,7 +1576,8 @@ struct server_ds4_routes::impl {
                 std::string model_path;
                 meta->preset.get_option("LLAMA_ARG_MODEL", model_path);
                 const json registry = router.scan_model_registry(false);
-                const std::string artifact_id = model_registry::artifact_id_for_path(registry, model_path);
+                const model_registry::json registry_index = model_registry::json::parse(registry.dump());
+                const std::string artifact_id = model_registry::artifact_id_for_path(registry_index, model_path);
                 report["artifacts"][resolved] = artifact_id.empty() ? json(nullptr) : json(artifact_id);
 
                 int model_pass = 0;
@@ -2253,11 +2254,12 @@ void server_ds4_routes::init_routes() {
             }
         }
         const json registry = p->router.scan_model_registry(reload);
+        const model_registry::json registry_index = model_registry::json::parse(registry.dump());
         std::set<std::string> represented_artifacts;
         for (const auto & meta : p->router.models.get_all_meta()) {
             std::string model_path;
             meta.preset.get_option("LLAMA_ARG_MODEL", model_path);
-            const std::string artifact_id = model_registry::artifact_id_for_path(registry, model_path);
+            const std::string artifact_id = model_registry::artifact_id_for_path(registry_index, model_path);
             json artifact = json::object();
             if (registry.contains("artifacts") && registry["artifacts"].is_array()) {
                 for (const auto & candidate : registry["artifacts"]) {
@@ -2290,7 +2292,7 @@ void server_ds4_routes::init_routes() {
                     {"loadable", artifact.value("loadable", false)},
                     {"configured", false},
                     {"evaluator_eligible", false},
-                    {"eligibility_reason", "Downloaded GGUF has no runtime preset. Configure it in Library before evaluation."},
+                    {"eligibility_reason", "Downloaded GGUF has no runtime preset. Configure it in Models before evaluation."},
                     {"evaluated", false},
                     {"evaluation_cases", 0},
                     {"source", "registry"},
@@ -2331,6 +2333,7 @@ void server_ds4_routes::init_routes() {
             for (const auto & report : server_persistence::load_reports(module)) {
                 if (!report.is_object()) continue;
                 const ds4_json report_json = ds4_json::parse(report.dump());
+                const ds4_json summary = ds4_json::parse(json_value(report, "summary", json::object()).dump());
                 if (module == "ds4-eval") eval_reports.push_back(report_json);
                 reports.push_back({
                     {"id", json_value(report, "id", std::string())},
@@ -2341,7 +2344,7 @@ void server_ds4_routes::init_routes() {
                     {"created_at", json_value(report, "created_at", std::string())},
                     {"updated_at", json_value(report, "updated_at", std::string())},
                     {"model_selector", json_value(report, "model_selector", std::string())},
-                    {"summary", json_value(report, "summary", json::object())},
+                    {"summary", summary},
                 });
             }
         }
