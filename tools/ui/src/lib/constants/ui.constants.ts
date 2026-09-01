@@ -1,7 +1,7 @@
-import { Gauge, Package, Search, Settings, SquarePen } from '@lucide/svelte';
+import { ROUTES } from './routes.constants';
+import { Package, Search, Settings, Sparkles, SquarePen } from '@lucide/svelte';
 import { SidebarAction, ToolSource } from '$lib/enums';
 import type { DesktopIconStripItem } from '$lib/types';
-import { ROUTES } from './routes.constants';
 
 export const FORK_TREE_DEPTH_PADDING = 8;
 export const SYSTEM_MESSAGE_PLACEHOLDER = 'System message';
@@ -63,10 +63,16 @@ export const SIDEBAR_ACTIONS_ITEMS: DesktopIconStripItem[] = [
 	},
 	{ icon: Search, keys: ['cmd', 'k'], tooltip: 'Search' },
 	{
-		icon: Gauge,
-		tooltip: 'Local LLM Autopilot',
-		route: ROUTES.AUTOPILOT,
-		activeRouteId: '/caliber-advisor'
+		activeRouteId: '/fit-advisor',
+		icon: Package,
+		route: ROUTES.FIT_ADVISOR,
+		tooltip: 'Models'
+	},
+	{
+		activeRouteId: '/caliber-advisor',
+		icon: Sparkles,
+		route: ROUTES.CALIBER_ADVISOR,
+		tooltip: 'Optimize'
 	},
 	{
 		action: SidebarAction.SETTINGS,
