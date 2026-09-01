@@ -1,18 +1,18 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
-	import { Database, Download, Upload, Trash2 } from '@lucide/svelte';
 	import SettingsChatImportExportSection from './SettingsChatImportExportSection.svelte';
+	import { Database, Download, Trash2, Upload } from '@lucide/svelte';
 	import {
 		DialogConfirmation,
 		DialogConversationSelection,
 		DialogExportSettings
 	} from '$lib/components/app';
 	import SettingsGroup from '$lib/components/app/settings/SettingsGroup.svelte';
-	import { ArchiveService, type ArchiveStatus } from '$lib/services/archive.service';
 	import { ConversationSelectionMode, FileExtensionText, HtmlInputType } from '$lib/enums';
 	import { ConversationTransferService } from '$lib/services';
+	import { ArchiveService, type ArchiveStatus } from '$lib/services/archive.service';
 	import { conversationsStore, settingsStore } from '$lib/stores';
 	import { createMessageCountMap } from '$lib/utils';
+	import { onMount } from 'svelte';
 	import { fade } from 'svelte/transition';
 	import { toast } from 'svelte-sonner';
 
@@ -293,15 +293,19 @@
 	async function handleArchiveImport() {
 		try {
 			const input = document.createElement('input');
+
 			input.type = HtmlInputType.FILE;
 			input.accept = FileExtensionText.JSON;
 			input.onchange = async (e) => {
 				const file = (e.target as HTMLInputElement)?.files?.[0];
+
 				if (!file) return;
+
 				archiveBusy = true;
 				try {
 					const archive = JSON.parse(await file.text()) as Record<string, unknown>;
 					const result = await ArchiveService.importArchive(archive);
+
 					await refreshArchiveStatus();
 					toast.success(
 						`Archive imported: ${result.reports} reports, ${result.downloads} downloads`
@@ -377,29 +381,39 @@
 		<div class="grid gap-4 rounded-lg border border-border/50 bg-card p-4">
 			<div class="flex items-start gap-3">
 				<Database class="mt-0.5 h-5 w-5 text-muted-foreground" />
+
 				<div class="grid gap-2">
 					<h4 class="m-0 text-sm font-medium">Server archive</h4>
+
 					<p class="m-0 text-sm text-muted-foreground">
 						Back up Fit Advisor recommendations, download states, FIT configurations, Caliber
 						reports, and DS4 Eval results.
 					</p>
+
 					{#if archiveStatus}
 						<div
 							class="grid gap-2 rounded-md border border-border/50 bg-muted/30 p-3 text-xs text-muted-foreground"
 						>
 							<div class="break-all">DB: {archiveStatus.database_path}</div>
+
 							<div class="flex flex-wrap gap-x-4 gap-y-1">
 								<span>{archiveStatus.reports} reports</span>
+
 								<span>{archiveStatus.results} result rows</span>
+
 								<span>{archiveStatus.best_results} best rows</span>
+
 								<span>{archiveStatus.downloads} downloads</span>
+
 								<span>{archiveStatus.fit_recommendations} fit recommendations</span>
+
 								<span>{archiveStatus.configurations} configurations</span>
 							</div>
 						</div>
 					{/if}
 				</div>
 			</div>
+
 			<div class="flex flex-wrap gap-2">
 				<button
 					class="inline-flex h-10 items-center gap-2 rounded-md border px-3 text-sm hover:bg-muted disabled:opacity-50"
@@ -409,6 +423,7 @@
 					<Download class="h-4 w-4" />
 					Export archive
 				</button>
+
 				<button
 					class="inline-flex h-10 items-center gap-2 rounded-md border px-3 text-sm hover:bg-muted disabled:opacity-50"
 					disabled={archiveBusy}
@@ -417,6 +432,7 @@
 					<Upload class="h-4 w-4" />
 					Import archive
 				</button>
+
 				<button
 					class="inline-flex h-10 items-center gap-2 rounded-md border px-3 text-sm hover:bg-muted disabled:opacity-50"
 					disabled={archiveBusy}

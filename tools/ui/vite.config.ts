@@ -16,7 +16,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const browserBaseConfig: any = {
 	enabled: true,
-	instances: [{ browser: 'chromium' }],
+	instances: [{ browser: 'chromium', headless: true }],
 	provider: playwright({
 		launchOptions: {
 			args: ['--no-sandbox']
@@ -60,8 +60,8 @@ export default defineConfig(({ mode }) => {
 				'Cross-Origin-Opener-Policy': 'same-origin'
 			},
 			proxy: {
-				'/cors-proxy': SERVER_ORIGIN,
 				'/api': SERVER_ORIGIN,
+				'/cors-proxy': SERVER_ORIGIN,
 				'/models': SERVER_ORIGIN,
 				'/props': SERVER_ORIGIN,
 				'/slots': SERVER_ORIGIN,

@@ -223,6 +223,7 @@ export interface FitAdvisorDownloadResponse {
 function parseSseBlock(block: string): FitAdvisorDownloadEvent | null {
 	let event = 'message';
 	let data = '';
+
 	for (const line of block.split('\n')) {
 		if (line.startsWith('event:')) {
 			event = line.slice(6).trim();
@@ -230,28 +231,71 @@ function parseSseBlock(block: string): FitAdvisorDownloadEvent | null {
 			data += line.slice(5).trim();
 		}
 	}
+
 	if (!data) {
 		return null;
 	}
+
 	return {
-		event,
-		data: JSON.parse(data) as FitAdvisorDownloadJob
+		data: JSON.parse(data) as FitAdvisorDownloadJob,
+		event
 	};
 }
 
 function queryString(query: FitAdvisorModelsQuery): string {
 	const params = new URLSearchParams();
+
 	for (const [key, value] of Object.entries(query)) {
 		if (value === undefined || value === null || value === '') continue;
+
 		params.set(key, String(value));
 	}
 	const text = params.toString();
+
 	return text ? `?${text}` : '';
 }
 
 export class FitAdvisorService {
-	static system(): Promise<FitAdvisorSystem> {
-		return apiFetch<FitAdvisorSystem>('/api/fit-advisor/system', { authOnly: true });
+	static configure(model: FitAdvisorModel, loadNow = false): Promise<FitAdvisorConfigureResponse> {
+		return apiPost<FitAdvisorConfigureResponse, FitAdvisorConfigureRequest>(
+			'/api/fit-advisor/configure',
+			{
+				alias: model.name,
+				ctx_size: model.effective_context_length,
+				gpu_mode: model.gpu_mode,
+				hf_ref: model.download?.hf_ref,
+				load_now: loadNow,
+				local_path: model.local_path ?? model.download_progress?.local_path ?? null,
+				model_id: model.id,
+				preset: model.preset,
+				quant: model.quant,
+				repo: model.download?.repo,
+				tags: [
+					model.parameter_count || `${model.params_b.toFixed(1)}B`,
+					model.quant,
+					model.fit_level,
+					model.use_case
+				],
+				target_dir: model.download?.target_dir ?? model.target_dir
+			}
+		);
+	}
+
+	static download(model: FitAdvisorModel): Promise<FitAdvisorDownloadResponse> {
+		return apiPost<FitAdvisorDownloadResponse, Record<string, unknown>>(
+			'/api/fit-advisor/download',
+			{
+				hf_ref: model.download?.hf_ref,
+				model_id: model.id,
+				quant: model.quant,
+				repo: model.download?.repo,
+				target_dir: model.download?.target_dir ?? model.target_dir
+			}
+		);
+	}
+
+	static listDownloads(): Promise<FitAdvisorDownloadsResponse> {
+		return apiFetch<FitAdvisorDownloadsResponse>('/api/fit-advisor/downloads', { authOnly: true });
 	}
 
 	static models(query: FitAdvisorModelsQuery = {}): Promise<FitAdvisorModelsResponse> {
@@ -265,23 +309,6 @@ export class FitAdvisorService {
 			'/api/fit-advisor/catalog/refresh',
 			{}
 		);
-	}
-
-	static download(model: FitAdvisorModel): Promise<FitAdvisorDownloadResponse> {
-		return apiPost<FitAdvisorDownloadResponse, Record<string, unknown>>(
-			'/api/fit-advisor/download',
-			{
-				model_id: model.id,
-				hf_ref: model.download?.hf_ref,
-				repo: model.download?.repo,
-				quant: model.quant,
-				target_dir: model.download?.target_dir ?? model.target_dir
-			}
-		);
-	}
-
-	static listDownloads(): Promise<FitAdvisorDownloadsResponse> {
-		return apiFetch<FitAdvisorDownloadsResponse>('/api/fit-advisor/downloads', { authOnly: true });
 	}
 
 	static async streamDownloads(
@@ -302,28 +329,36 @@ export class FitAdvisorService {
 				'Fit Advisor download stream failed: ' + response.status + ' ' + response.statusText
 			);
 		}
+
 		if (!response.body) {
 			throw new Error('Fit Advisor download stream is empty');
 		}
 
 		const reader = response.body.getReader();
 		const decoder = new TextDecoder();
+
 		let buffer = '';
 
 		for (;;) {
 			const { done, value } = await reader.read();
+
 			if (done) {
 				break;
 			}
+
 			buffer += decoder.decode(value, { stream: true });
 			for (;;) {
 				const index = buffer.indexOf('\n\n');
+
 				if (index === -1) {
 					break;
 				}
+
 				const block = buffer.slice(0, index);
+
 				buffer = buffer.slice(index + 2);
 				const parsed = parseSseBlock(block);
+
 				if (parsed) {
 					onEvent(parsed);
 				}
@@ -331,36 +366,17 @@ export class FitAdvisorService {
 		}
 
 		const tail = buffer.trim();
+
 		if (tail) {
 			const parsed = parseSseBlock(tail);
+
 			if (parsed) {
 				onEvent(parsed);
 			}
 		}
 	}
 
-	static configure(model: FitAdvisorModel, loadNow = false): Promise<FitAdvisorConfigureResponse> {
-		return apiPost<FitAdvisorConfigureResponse, FitAdvisorConfigureRequest>(
-			'/api/fit-advisor/configure',
-			{
-				model_id: model.id,
-				local_path: model.local_path ?? model.download_progress?.local_path ?? null,
-				hf_ref: model.download?.hf_ref,
-				repo: model.download?.repo,
-				quant: model.quant,
-				target_dir: model.download?.target_dir ?? model.target_dir,
-				gpu_mode: model.gpu_mode,
-				ctx_size: model.effective_context_length,
-				alias: model.name,
-				tags: [
-					model.parameter_count || `${model.params_b.toFixed(1)}B`,
-					model.quant,
-					model.fit_level,
-					model.use_case
-				],
-				preset: model.preset,
-				load_now: loadNow
-			}
-		);
+	static system(): Promise<FitAdvisorSystem> {
+		return apiFetch<FitAdvisorSystem>('/api/fit-advisor/system', { authOnly: true });
 	}
 }

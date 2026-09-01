@@ -151,6 +151,7 @@ export interface Ds4BenchRequest {
 
 function parseSseBlock(block: string): Ds4Event | null {
 	let event = 'message';
+
 	const dataLines: string[] = [];
 
 	for (const line of block.split(/\r?\n/)) {
@@ -167,30 +168,23 @@ function parseSseBlock(block: string): Ds4Event | null {
 
 	try {
 		return {
-			event,
-			data: JSON.parse(dataLines.join('\n')) as Ds4Event['data']
+			data: JSON.parse(dataLines.join('\n')) as Ds4Event['data'],
+			event
 		};
 	} catch {
 		return {
-			event,
-			data: { text: dataLines.join('\n') }
+			data: { text: dataLines.join('\n') },
+			event
 		};
 	}
 }
 
 export class Ds4Service {
-	static listModels(reload = false): Promise<Ds4ModelsResponse> {
-		return apiFetch<Ds4ModelsResponse>(`/api/ds4/models${reload ? '?reload=1' : ''}`, {
-			authOnly: true
+	static deleteReport(id: string): Promise<Ds4DeleteReportResponse> {
+		return apiFetch<Ds4DeleteReportResponse>(`/api/ds4/reports/${encodeURIComponent(id)}`, {
+			authOnly: true,
+			method: 'DELETE'
 		});
-	}
-
-	static runEval(body: Ds4EvalRequest): Promise<Ds4JobStartResponse> {
-		return apiPost<Ds4JobStartResponse, Ds4EvalRequest>('/api/ds4/run-eval', body);
-	}
-
-	static runBench(body: Ds4BenchRequest): Promise<Ds4JobStartResponse> {
-		return apiPost<Ds4JobStartResponse, Ds4BenchRequest>('/api/ds4/run-bench', body);
 	}
 
 	static getActiveJob(kind?: 'eval' | 'bench'): Promise<Ds4ActiveJobResponse> {
@@ -213,17 +207,6 @@ export class Ds4Service {
 		});
 	}
 
-	static stopJob(id?: string): Promise<Ds4JobSnapshot> {
-		return apiPost<Ds4JobSnapshot, { cmd: string; id?: string }>('/api/ds4/run-eval', {
-			cmd: 'stop',
-			...(id ? { id } : {})
-		});
-	}
-
-	static listReports(): Promise<Ds4ReportsResponse> {
-		return apiFetch<Ds4ReportsResponse>('/api/ds4/reports', { authOnly: true });
-	}
-
 	static getReport(id: string): Promise<Ds4Report> {
 		return apiFetch<Ds4Report>('/api/ds4/report', {
 			authOnly: true,
@@ -234,10 +217,28 @@ export class Ds4Service {
 		});
 	}
 
-	static deleteReport(id: string): Promise<Ds4DeleteReportResponse> {
-		return apiFetch<Ds4DeleteReportResponse>(`/api/ds4/reports/${encodeURIComponent(id)}`, {
-			authOnly: true,
-			method: 'DELETE'
+	static listModels(reload = false): Promise<Ds4ModelsResponse> {
+		return apiFetch<Ds4ModelsResponse>(`/api/ds4/models${reload ? '?reload=1' : ''}`, {
+			authOnly: true
+		});
+	}
+
+	static listReports(): Promise<Ds4ReportsResponse> {
+		return apiFetch<Ds4ReportsResponse>('/api/ds4/reports', { authOnly: true });
+	}
+
+	static runBench(body: Ds4BenchRequest): Promise<Ds4JobStartResponse> {
+		return apiPost<Ds4JobStartResponse, Ds4BenchRequest>('/api/ds4/run-bench', body);
+	}
+
+	static runEval(body: Ds4EvalRequest): Promise<Ds4JobStartResponse> {
+		return apiPost<Ds4JobStartResponse, Ds4EvalRequest>('/api/ds4/run-eval', body);
+	}
+
+	static stopJob(id?: string): Promise<Ds4JobSnapshot> {
+		return apiPost<Ds4JobSnapshot, { cmd: string; id?: string }>('/api/ds4/run-eval', {
+			cmd: 'stop',
+			...(id ? { id } : {})
 		});
 	}
 
@@ -260,29 +261,37 @@ export class Ds4Service {
 		if (!response.ok) {
 			throw new Error('DS4 event stream failed: ' + response.status + ' ' + response.statusText);
 		}
+
 		if (!response.body) {
 			throw new Error('DS4 event stream is empty');
 		}
 
 		const reader = response.body.getReader();
 		const decoder = new TextDecoder();
+
 		let buffer = '';
 
 		for (;;) {
 			const { done, value } = await reader.read();
+
 			if (done) {
 				break;
 			}
+
 			buffer += decoder.decode(value, { stream: true });
 
 			for (;;) {
 				const index = buffer.indexOf('\n\n');
+
 				if (index === -1) {
 					break;
 				}
+
 				const block = buffer.slice(0, index);
+
 				buffer = buffer.slice(index + 2);
 				const parsed = parseSseBlock(block);
+
 				if (parsed) {
 					onEvent(parsed);
 				}
@@ -290,8 +299,10 @@ export class Ds4Service {
 		}
 
 		const tail = buffer.trim();
+
 		if (tail) {
 			const parsed = parseSseBlock(tail);
+
 			if (parsed) {
 				onEvent(parsed);
 			}

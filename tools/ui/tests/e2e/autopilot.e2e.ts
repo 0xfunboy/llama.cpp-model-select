@@ -423,16 +423,24 @@ test('guided flow exposes one qualified answer and three alternatives', async ({
 	).toBeChecked();
 	await expect(page.getByText(/All new selects configured models/)).toBeVisible();
 	await expect(page.getByText(/evaluated: select manually to retest/)).toBeVisible();
-	await expect(page.getByText(/not evaluated yet/)).toBeVisible();
+	await expect(
+		page
+			.locator('label')
+			.filter({ hasText: 'Mistral New' })
+			.getByText(/not evaluated yet/)
+	).toBeVisible();
 	await page.getByRole('button', { exact: true, name: 'Performance' }).click();
 	await expect(page.getByRole('heading', { name: 'Context Benchmark' })).toBeVisible();
 	await page.getByRole('button', { exact: true, name: 'Archive' }).click();
-	await expect(page.getByText(/Caliber performance/)).toBeVisible();
-	await expect(page.getByText(/DS4 quality/)).toBeVisible();
+	const caliberArchiveRow = page
+		.locator('.reports-table .table-row')
+		.filter({ hasText: 'Caliber performance' });
 	const ds4ArchiveRow = page
 		.locator('.reports-table .table-row')
 		.filter({ hasText: 'DS4 quality' });
 
+	await expect(caliberArchiveRow).toBeVisible();
+	await expect(ds4ArchiveRow).toBeVisible();
 	await ds4ArchiveRow.getByRole('button', { exact: true, name: 'Open' }).click();
 	await expect(page.getByRole('heading', { name: 'Use-case Evaluator' })).toBeVisible();
 	await expect(

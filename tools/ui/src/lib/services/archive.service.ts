@@ -24,20 +24,19 @@ export interface ArchiveImportResponse {
 }
 
 export class ArchiveService {
-	static status(): Promise<ArchiveStatus> {
-		return apiFetch<ArchiveStatus>('/api/archive/status', { authOnly: true });
-	}
-
 	static async exportArchive(): Promise<void> {
 		const response = await fetch(base + '/api/archive/export', {
 			headers: getAuthHeaders()
 		});
+
 		if (!response.ok) {
 			throw new Error('Archive export failed: ' + response.status + ' ' + response.statusText);
 		}
+
 		const blob = await response.blob();
 		const url = URL.createObjectURL(blob);
 		const a = document.createElement('a');
+
 		a.href = url;
 		a.download = `llm-model-select-archive-${new Date().toISOString().slice(0, 10)}.json`;
 		document.body.appendChild(a);
@@ -48,5 +47,9 @@ export class ArchiveService {
 
 	static importArchive(archive: Record<string, unknown>): Promise<ArchiveImportResponse> {
 		return apiPost<ArchiveImportResponse, Record<string, unknown>>('/api/archive/import', archive);
+	}
+
+	static status(): Promise<ArchiveStatus> {
+		return apiFetch<ArchiveStatus>('/api/archive/status', { authOnly: true });
 	}
 }
